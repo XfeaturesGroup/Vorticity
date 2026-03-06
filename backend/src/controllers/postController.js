@@ -108,7 +108,7 @@ export const PostController = {
         if (!post) return errorResp("Пост не найден", corsHeaders, 404);
         if (post.user_id !== user.id) return errorResp("Нет прав на удаление", corsHeaders, 403);
 
-        await env.DB.prepare("DELETE FROM Posts WHERE id = ?").bind(postId).run();
+        await env.DB.prepare("DELETE FROM Posts WHERE id = ? AND user_id = ?").bind(postId, user.id).run();
         return jsonResp({ success: true }, corsHeaders);
     },
 
@@ -128,8 +128,8 @@ export const PostController = {
         if (!post) return errorResp("Пост не найден", corsHeaders, 404);
         if (post.user_id !== user.id) return errorResp("Нет прав на редактирование", corsHeaders, 403);
 
-        await env.DB.prepare("UPDATE Posts SET content = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
-            .bind(content, postId)
+        await env.DB.prepare("UPDATE Posts SET content = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?")
+            .bind(content, postId, user.id)
             .run();
 
         return jsonResp({ success: true }, corsHeaders);

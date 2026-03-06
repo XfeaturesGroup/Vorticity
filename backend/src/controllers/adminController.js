@@ -13,7 +13,8 @@ export const AdminController = {
     },
 
     async getStats(request, env) {
-        if (!(await AdminController.checkAdmin(request, env))) return errorResp("Access Denied", corsHeaders, 403);
+        const admin = await AdminController.checkAdmin(request, env);
+        if (!admin) return errorResp("Access Denied", corsHeaders, 403);
 
         const users = await env.DB.prepare("SELECT COUNT(*) as c FROM Users").first();
         const posts = await env.DB.prepare("SELECT COUNT(*) as c FROM Posts").first();
@@ -29,7 +30,8 @@ export const AdminController = {
     },
 
     async getUsers(request, env) {
-        if (!(await AdminController.checkAdmin(request, env))) return errorResp("Access Denied", corsHeaders, 403);
+        const admin = await AdminController.checkAdmin(request, env);
+        if (!admin) return errorResp("Access Denied", corsHeaders, 403);
 
         const url = new URL(request.url);
         const page = parseInt(url.searchParams.get('page')) || 1;
@@ -53,7 +55,8 @@ export const AdminController = {
     },
 
     async updateUser(request, env) {
-        if (!(await AdminController.checkAdmin(request, env))) return errorResp("Access Denied", corsHeaders, 403);
+        const admin = await AdminController.checkAdmin(request, env);
+        if (!admin) return errorResp("Access Denied", corsHeaders, 403);
 
         const url = new URL(request.url);
         const targetId = parseInt(url.pathname.split('/')[3]);
@@ -91,7 +94,8 @@ export const AdminController = {
     },
 
     async deleteUser(request, env) {
-        if (!(await AdminController.checkAdmin(request, env))) return errorResp("Access Denied", corsHeaders, 403);
+        const admin = await AdminController.checkAdmin(request, env);
+        if (!admin) return errorResp("Access Denied", corsHeaders, 403);
 
         const url = new URL(request.url);
         const targetId = parseInt(url.pathname.split('/')[3]);
@@ -119,7 +123,8 @@ export const AdminController = {
     },
 
     async deleteContent(request, env) {
-        if (!(await AdminController.checkAdmin(request, env))) return errorResp("Access Denied", corsHeaders, 403);
+        const admin = await AdminController.checkAdmin(request, env);
+        if (!admin) return errorResp("Access Denied", corsHeaders, 403);
 
         const url = new URL(request.url);
         const isPost = url.pathname.includes('/posts/');
@@ -136,7 +141,8 @@ export const AdminController = {
 
     async getMedia(request, env) {
         try {
-            if (!(await AdminController.checkAdmin(request, env))) return errorResp("Access Denied", corsHeaders, 403);
+            const admin = await AdminController.checkAdmin(request, env);
+            if (!admin) return errorResp("Access Denied", corsHeaders, 403);
 
             const url = new URL(request.url);
             const cursor = url.searchParams.get('cursor');
@@ -183,7 +189,8 @@ export const AdminController = {
     },
 
     async deleteMedia(request, env) {
-        if (!(await AdminController.checkAdmin(request, env))) return errorResp("Access Denied", corsHeaders, 403);
+        const admin = await AdminController.checkAdmin(request, env);
+        if (!admin) return errorResp("Access Denied", corsHeaders, 403);
 
         const url = new URL(request.url);
         const key = url.pathname.replace('/admin/media/', '');
@@ -197,7 +204,8 @@ export const AdminController = {
     },
 
     async replaceMedia(request, env) {
-        if (!(await AdminController.checkAdmin(request, env))) return errorResp("Access Denied", corsHeaders, 403);
+        const admin = await AdminController.checkAdmin(request, env);
+        if (!admin) return errorResp("Access Denied", corsHeaders, 403);
 
         const url = new URL(request.url);
         const key = url.pathname.replace('/admin/media/', '');

@@ -3,7 +3,7 @@ export async function hashPasswordV2(password) {
     const passwordBuffer = new TextEncoder().encode(password);
     const baseKey = await crypto.subtle.importKey("raw", passwordBuffer, "PBKDF2", false, ["deriveBits"]);
     const derivedBits = await crypto.subtle.deriveBits(
-        { name: "PBKDF2", salt, iterations: 100000, hash: "SHA-256" },
+        { name: "PBKDF2", salt: salt, iterations: 100000, hash: "SHA-256" },
         baseKey, 256
     );
     const hashArray = new Uint8Array(derivedBits);
@@ -13,22 +13,24 @@ export async function hashPasswordV2(password) {
 }
 
 export async function verifyPassword(password, storedHash) {
-    if (storedHash.startsWith('$v2$')) {
-        const [, , saltHex, originalHashHex] = storedHash.split('$');
-        const salt = new Uint8Array(saltHex.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
-        const passwordBuffer = new TextEncoder().encode(password);
-        const baseKey = await crypto.subtle.importKey("raw", passwordBuffer, "PBKDF2", false, ["deriveBits"]);
-        const derivedBits = await crypto.subtle.deriveBits(
-            { name: "PBKDF2", salt, iterations: 100000, hash: "SHA-256" },
-            baseKey, 256
-        );
-        const currentHashHex = [...new Uint8Array(derivedBits)].map(b => b.toString(16).padStart(2, '0')).join('');
-        return currentHashHex === originalHashHex;
+    if (!storedHash.startsWith('$v2$')) {
+        return false;
     }
-    const msgBuffer = new TextEncoder().encode(password);
-    const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer);
-    const oldHash = [...new Uint8Array(hashBuffer)].map(b => b.toString(16).padStart(2, '0')).join('');
-    return oldHash === storedHash;
+    const parts = storedHash.split('$');
+    if (parts.length !== 4) return false;
+
+    const saltHex = parts[2];
+    const originalHashHex = parts[3];
+
+    const salt = new Uint8Array(saltHex.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
+    const passwordBuffer = new TextEncoder().encode(password);
+    const baseKey = await crypto.subtle.importKey("raw", passwordBuffer, "PBKDF2", false, ["deriveBits"]);
+    const derivedBits = await crypto.subtle.deriveBits(
+        { name: "PBKDF2", salt: salt, iterations: 100000, hash: "SHA-256" },
+        baseKey, 256
+    );
+    const currentHashHex = [...new Uint8Array(derivedBits)].map(b => b.toString(16).padStart(2, '0')).join('');
+    return currentHashHex === originalHashHex;
 }
 
 export function generateBase32Secret(length = 16) {

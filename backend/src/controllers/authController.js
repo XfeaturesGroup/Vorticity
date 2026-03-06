@@ -88,15 +88,6 @@ export const AuthController = {
             await env.DB.prepare("UPDATE Users SET failed_login_attempts = 0, locked_until = NULL WHERE id = ?").bind(user.id).run();
         }
 
-        if (!user.password_hash.startsWith('$v2$')) {
-            try {
-                const newHash = await hashPasswordV2(password);
-                await env.DB.prepare("UPDATE Users SET password_hash = ? WHERE id = ?").bind(newHash, user.id).run();
-            } catch (err) {
-                console.error("Ошибка при миграции пароля на v2:", err);
-            }
-        }
-
         if (user.is_2fa_enabled) {
             if (!code) {
                 return jsonResp({ require2fa: true }, corsHeaders, 200);

@@ -187,7 +187,7 @@ export const ChatController = {
 
         if (message.sender_id !== user.id) return errorResp("Forbidden", corsHeaders, 403);
 
-        await env.DB.prepare("DELETE FROM Messages WHERE id = ?").bind(messageId).run();
+        await env.DB.prepare("DELETE FROM Messages WHERE id = ? AND sender_id = ?").bind(messageId, user.id).run();
         return jsonResp({ success: true }, corsHeaders);
     },
 
@@ -205,7 +205,7 @@ export const ChatController = {
 
         if (message.sender_id !== user.id) return errorResp("Forbidden", corsHeaders, 403);
 
-        await env.DB.prepare("UPDATE Messages SET content = ?, is_edited = 1 WHERE id = ?").bind(content, messageId).run();
+        await env.DB.prepare("UPDATE Messages SET content = ?, is_edited = 1 WHERE id = ? AND sender_id = ?").bind(content, messageId, user.id).run();
         return jsonResp({ success: true }, corsHeaders);
     },
 
