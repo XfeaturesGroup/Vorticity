@@ -1,0 +1,12 @@
+name = "vorticity-backend"
+main = "src/index.js"
+compatibility_date = "2026-02-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "xfeatures-vorticity"
+database_id = "735a4c99-bc4e-4baa-938a-d13908985315"
+
+[[r2_buckets]]
+binding = 'IMAGES_BUCKET'
+bucket_name = 'vorticity-images'
