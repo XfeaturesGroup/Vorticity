@@ -12,5 +12,5 @@ binding = 'IMAGES_BUCKET'
 bucket_name = 'vorticity-images'
 
 [vars]
-IDM_URL = "http://localhost:8787"
+IDM_URL = "https://account.xfeatures.net"
 OAUTH_CLIENT_ID = "xf_9116480c21a94a849a1182717e35f335"

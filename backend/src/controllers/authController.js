@@ -9,7 +9,7 @@ export const AuthController = {
                 return errorResp("Отсутствуют необходимые параметры OAuth", corsHeaders, 400);
             }
 
-            const idmUrl = env.IDM_URL || 'http://localhost:8787';
+            const idmUrl = env.IDM_URL || 'https://account.xfeatures.net';
             const clientId = env.OAUTH_CLIENT_ID || 'xf_9116480c21a94a849a1182717e35f335';
 
             // 1. Exchange code for access token

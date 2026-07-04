@@ -40,7 +40,7 @@ const API_URL = import.meta.env.PROD
     ? 'https://vorticity-backend.xfeatures.workers.dev'
     : 'http://localhost:8787';
 
-const IDM_URL = 'http://localhost:8787';
+const IDM_URL = 'https://account.xfeatures.net';
 const OAUTH_CLIENT_ID = 'xf_9116480c21a94a849a1182717e35f335';
 
 const TiltCard = ({ children, className }) => {
@@ -468,7 +468,7 @@ function AppContent({ user, setUser, isLoading, logout, pendingRequestsCount }) 
                                         Для доступа к Vorticity необходим аккаунт Xfeatures с подтвержденной почтой.
                                     </p>
                                     <CyberButton type="button" onClick={handleLoginClick} disabled={isAuthLoading}>
-                                        {isAuthLoading ? 'PROCESSING...' : 'LOGIN WITH XFEATURES ID'}
+                                        {isAuthLoading ? 'PROCESSING...' : 'LOGIN WITH XFEATURESACCOUNT'}
                                     </CyberButton>
                                 </div>
                             </div>
