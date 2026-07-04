@@ -17,7 +17,6 @@ Copyright (c) 2026 XfeaturesGroup. All Rights Reserved.
 */
 import { jsonResp, errorResp, corsHeaders } from '../utils/response';
 import { getUserByToken } from '../utils/auth';
-import { hashPasswordV2 } from '../utils/crypto';
 import { isValidEmail, isValidUsername } from '../utils/validators';
 
 export const AdminController = {
@@ -94,11 +93,7 @@ export const AdminController = {
         if (typeof is_admin !== 'undefined') { updates.push("is_admin = ?"); params.push(is_admin); }
         if (typeof account_type !== 'undefined') { updates.push("account_type = ?"); params.push(account_type); }
 
-        if (password) {
-            const hash = await hashPasswordV2(password);
-            updates.push("password_hash = ?");
-            params.push(hash);
-        }
+
 
         if (updates.length === 0) return errorResp("Нет данных для обновления", corsHeaders, 400);
 
