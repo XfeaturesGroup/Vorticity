@@ -16,6 +16,7 @@ export const AuthController = {
             const tokenParams = new URLSearchParams();
             tokenParams.set('grant_type', 'authorization_code');
             tokenParams.set('client_id', clientId);
+            tokenParams.set('client_secret', env.OAUTH_CLIENT_SECRET);
             tokenParams.set('code', code);
             tokenParams.set('redirect_uri', redirect_uri);
             tokenParams.set('code_verifier', code_verifier);
@@ -107,7 +108,13 @@ export const AuthController = {
 
             return jsonResp({
                 token: sessionToken,
-                user: user
+                user: {
+                    id: userId,
+                    username: user.username,
+                    email: user.email,
+                    display_name: user.display_name,
+                    avatar_url: user.avatar_url
+                }
             }, corsHeaders);
 
         } catch (err) {
