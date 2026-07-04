@@ -9,22 +9,21 @@ export const AuthController = {
                 return errorResp("Отсутствуют необходимые параметры OAuth", corsHeaders, 400);
             }
 
-            const idmUrl = env.IDM_URL || 'https://account.xfeatures.net';
+            const idmApiUrl = env.IDM_API_URL || 'https://auth.xfeatures.net';
             const clientId = env.OAUTH_CLIENT_ID || 'xf_9116480c21a94a849a1182717e35f335';
 
             // 1. Exchange code for access token
-            const tokenParams = new URLSearchParams();
-            tokenParams.set('grant_type', 'authorization_code');
-            tokenParams.set('client_id', clientId);
-            tokenParams.set('client_secret', (env.OAUTH_CLIENT_SECRET || '').trim());
-            tokenParams.set('code', code);
-            tokenParams.set('redirect_uri', redirect_uri);
-            tokenParams.set('code_verifier', code_verifier);
-
-            const tokenRes = await fetch(`${idmUrl}/oauth/token`, {
+            const tokenRes = await fetch(`${idmApiUrl}/oauth/token`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                body: tokenParams.toString()
+                body: new URLSearchParams({
+                    grant_type: 'authorization_code',
+                    client_id: clientId,
+                    client_secret: (env.OAUTH_CLIENT_SECRET || '').trim(),
+                    code: code,
+                    redirect_uri: redirect_uri,
+                    code_verifier: code_verifier
+                })
             });
 
             if (!tokenRes.ok) {
@@ -37,7 +36,7 @@ export const AuthController = {
             const accessToken = tokenData.access_token;
 
             // 2. Fetch User Info
-            const userInfoRes = await fetch(`${idmUrl}/oauth/userinfo`, {
+            const userInfoRes = await fetch(`${idmApiUrl}/oauth/userinfo`, {
                 headers: { 'Authorization': `Bearer ${accessToken}` }
             });
 
