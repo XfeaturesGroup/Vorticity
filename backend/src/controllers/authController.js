@@ -16,7 +16,7 @@ export const AuthController = {
             const tokenParams = new URLSearchParams();
             tokenParams.set('grant_type', 'authorization_code');
             tokenParams.set('client_id', clientId);
-            tokenParams.set('client_secret', env.OAUTH_CLIENT_SECRET);
+            tokenParams.set('client_secret', (env.OAUTH_CLIENT_SECRET || '').trim());
             tokenParams.set('code', code);
             tokenParams.set('redirect_uri', redirect_uri);
             tokenParams.set('code_verifier', code_verifier);
@@ -24,7 +24,7 @@ export const AuthController = {
             const tokenRes = await fetch(`${idmUrl}/oauth/token`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                body: tokenParams
+                body: tokenParams.toString()
             });
 
             if (!tokenRes.ok) {
