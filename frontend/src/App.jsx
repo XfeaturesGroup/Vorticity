@@ -28,16 +28,20 @@ import { AnimatePresence, motion } from 'framer-motion';
 import { BrowserRouter as Router, Routes, Route, Navigate, useNavigate, useLocation } from 'react-router-dom';
 import { Search as SearchPage } from "./components/Search";
 import { Settings as SettingsPage } from "./components/Settings";
-import { Search, Users, Menu, Home, User, Settings, LogOut, ShieldAlert, Flame, MessageCircle } from 'lucide-react';
+import { Search, Users, Menu, Home, User, Settings, LogOut, ShieldAlert, MessageCircle } from 'lucide-react';
 
 import {
     generateKeyPair, exportPublicKey, encryptPrivateKeyForCloud,
-    decryptPrivateKeyFromCloud, savePrivateKey, getPrivateKey
+    decryptPrivateKeyFromCloud, savePrivateKey
 } from "./utils/crypto";
+import { generateCodeChallenge, generateCodeVerifier } from "./utils/oauth";
 
 const API_URL = import.meta.env.PROD
     ? 'https://vorticity-backend.xfeatures.workers.dev'
     : 'http://localhost:8787';
+
+const IDM_URL = 'http://localhost:8787';
+const OAUTH_CLIENT_ID = 'xf_9116480c21a94a849a1182717e35f335';
 
 const TiltCard = ({ children, className }) => {
     const cardRef = useRef(null);
@@ -177,17 +181,152 @@ const AdminRoute = ({ user, children }) => {
     return children;
 };
 
+function OAuthCallback({ setUser }) {
+    const [status, setStatus] = useState("Вход в систему...");
+    const [pinMode, setPinMode] = useState(null);
+    const [pin, setPin] = useState('');
+    const [tempData, setTempData] = useState(null);
+    const [error, setError] = useState('');
+    const navigate = useNavigate();
+
+    useEffect(() => {
+        const processCode = async () => {
+            const params = new URLSearchParams(window.location.search);
+            const code = params.get('code');
+            const state = params.get('state');
+            const errorParam = params.get('error');
+
+            if (errorParam) {
+                setError("Ошибка авторизации: " + errorParam);
+                return;
+            }
+            if (!code) return;
+
+            const savedState = localStorage.getItem('oauth_state');
+            if (state !== savedState) {
+                setError("Ошибка безопасности (State mismatch)");
+                return;
+            }
+
+            const code_verifier = localStorage.getItem('code_verifier');
+            
+            try {
+                const res = await fetch(`${API_URL}/auth/oauth/callback`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ 
+                        code, 
+                        code_verifier, 
+                        redirect_uri: window.location.origin + '/oauth/callback' 
+                    })
+                });
+
+                if (!res.ok) {
+                    const data = await res.json();
+                    throw new Error(data.error || "Ошибка при обмене кода");
+                }
+
+                const data = await res.json();
+                setStatus("Проверка хранилища E2E...");
+                
+                const cloudRes = await fetch(`${API_URL}/keys/cloud`, { headers: { 'Authorization': data.token } });
+                let hasCloudKey = false;
+                if (cloudRes.ok) {
+                    const cloudData = await cloudRes.json();
+                    if (cloudData.encryptedPrivateKey) hasCloudKey = true;
+                }
+                
+                setTempData(data);
+                setPinMode(hasCloudKey ? 'enter' : 'create');
+                
+            } catch (err) {
+                setError(err.message);
+            }
+        };
+
+        if (!pinMode && !error) {
+            processCode();
+        }
+    }, [pinMode, error]);
+
+    const handlePinSubmit = async (e) => {
+        e.preventDefault();
+        if (pin.length !== 6) return;
+        setError('');
+        setStatus(pinMode === 'enter' ? "Расшифровка хранилища..." : "Создание хранилища...");
+        
+        try {
+            const salt = tempData.user.id.toString();
+            
+            if (pinMode === 'enter') {
+                const cloudRes = await fetch(`${API_URL}/keys/cloud`, { headers: { 'Authorization': tempData.token } });
+                const cloudData = await cloudRes.json();
+                const decryptedKey = await decryptPrivateKeyFromCloud(cloudData.encryptedPrivateKey, pin, salt);
+                if (!decryptedKey) throw new Error("Неверный PIN-код");
+                await savePrivateKey(tempData.user.id, decryptedKey);
+            } else {
+                const pair = await generateKeyPair();
+                const pubJWK = await exportPublicKey(pair.publicKey);
+                const encryptedForCloud = await encryptPrivateKeyForCloud(pair.privateKey, pin, salt);
+
+                const initRes = await fetch(`${API_URL}/keys/init`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': tempData.token },
+                    body: JSON.stringify({ publicKey: pubJWK, encryptedPrivateKey: encryptedForCloud })
+                });
+                if (!initRes.ok) throw new Error("Ошибка инициализации хранилища");
+                await savePrivateKey(tempData.user.id, pair.privateKey);
+            }
+
+            localStorage.setItem('token', tempData.token);
+            setUser(tempData.user);
+            navigate('/');
+        } catch (err) {
+            setError(err.message);
+            setStatus('');
+        }
+    };
+
+    return (
+        <div className="flex flex-col items-center pt-20">
+            <TiltCard className="max-w-md w-full mx-auto">
+                <div className="bg-zinc-950/80 backdrop-blur-md border border-white/10 rounded-2xl p-8 shadow-2xl text-center">
+                    <h2 className="text-xl font-bold uppercase tracking-widest mb-6 border-b border-white/10 pb-4">
+                        Vault E2E
+                    </h2>
+                    
+                    {error ? (
+                        <div className="text-red-500 mb-4 text-sm">{error}</div>
+                    ) : pinMode ? (
+                        <form onSubmit={handlePinSubmit} className="space-y-4">
+                            <p className="text-sm text-zinc-400 mb-4">
+                                {pinMode === 'create' ? "Создайте 6-значный PIN-код для защиты чатов (E2E)" : "Введите ваш 6-значный PIN-код от Vault"}
+                            </p>
+                            <CyberInput
+                                id="vaultPin"
+                                type="password"
+                                placeholder="000000"
+                                value={pin}
+                                onChange={(e) => setPin(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                            />
+                            {status && <p className="text-zinc-400 text-xs">{status}</p>}
+                            <CyberButton type="submit" disabled={pin.length !== 6}>
+                                ПОДТВЕРДИТЬ
+                            </CyberButton>
+                        </form>
+                    ) : (
+                        <div className="text-zinc-300 animate-pulse text-sm">{status}</div>
+                    )}
+                </div>
+            </TiltCard>
+        </div>
+    );
+}
+
 function App() {
     const [user, setUser] = useState(null);
     const [pendingRequestsCount, setPendingRequestsCount] = useState(0);
-    const [authView, setAuthView] = useState('login');
-    const [errorMsg, setErrorMsg] = useState('');
-    const [isSubmitting, setIsSubmitting] = useState(false);
     const [isLoading, setIsLoading] = useState(true);
-    const [formData, setFormData] = useState({ username: '', display_name: '', email: '', password: '' });
-    const [require2FA, setRequire2FA] = useState(false);
-    const [code2FA, setCode2FA] = useState('');
-
 
     useEffect(() => {
         const checkAuth = async () => {
@@ -258,84 +397,6 @@ function App() {
         return () => window.removeEventListener('focus', handleFocus);
     }, [user]);
 
-    const handleChange = (e) => setFormData({ ...formData, [e.target.name]: e.target.value });
-
-    const syncE2EKeys = async (userId, username, password, token) => {
-        try {
-            const salt = userId.toString();
-            let privKey = await getPrivateKey(userId);
-
-            const res = await fetch(`${API_URL}/keys/cloud`, { headers: { 'Authorization': token } });
-            if (res.ok) {
-                const { encryptedPrivateKey } = await res.json();
-
-                if (encryptedPrivateKey) {
-                    if (!privKey) {
-                        const decryptedKey = await decryptPrivateKeyFromCloud(encryptedPrivateKey, password, salt);
-                        if (decryptedKey) {
-                            await savePrivateKey(userId, decryptedKey);
-                        }
-                    }
-                    return;
-                }
-            }
-
-            const pair = await generateKeyPair();
-            const pubJWK = await exportPublicKey(pair.publicKey);
-            const encryptedForCloud = await encryptPrivateKeyForCloud(pair.privateKey, password, salt);
-
-            const initRes = await fetch(`${API_URL}/keys/init`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'Authorization': token },
-                body: JSON.stringify({ publicKey: pubJWK, encryptedPrivateKey: encryptedForCloud })
-            });
-
-            if (initRes.ok) {
-                await savePrivateKey(userId, pair.privateKey);
-            }
-        } catch (err) {
-            console.error("Ошибка синхронизации E2EE:", err);
-        }
-    };
-
-    const handleAuth = async (e) => {
-        e.preventDefault();
-        setErrorMsg('');
-        setIsSubmitting(true);
-        try {
-            const payload = { ...formData };
-            if (require2FA) payload.code = code2FA;
-
-            const res = await fetch(`${API_URL}${authView === 'register' ? '/register' : '/login'}`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            });
-            const data = await res.json();
-
-            if (res.ok && data.require2fa) {
-                setRequire2FA(true);
-                setIsSubmitting(false);
-                return;
-            }
-
-            if (!res.ok) throw new Error(data.error);
-
-            await syncE2EKeys(data.id, payload.username, payload.password, data.token);
-
-            localStorage.setItem('token', data.token);
-            setUser(data);
-            setRequire2FA(false);
-            setCode2FA('');
-
-            setFormData({ username: '', display_name: '', email: '', password: '' });
-        } catch (err) {
-            setErrorMsg(err.message);
-        } finally {
-            setIsSubmitting(false);
-        }
-    };
-
     const logout = () => { localStorage.removeItem('token'); setUser(null); };
 
     return (
@@ -344,33 +405,37 @@ function App() {
                 user={user}
                 setUser={setUser}
                 isLoading={isLoading}
-                authView={authView}
-                setAuthView={setAuthView}
-                errorMsg={errorMsg}
-                setErrorMsg={setErrorMsg}
-                isSubmitting={isSubmitting}
-                formData={formData}
-                handleChange={handleChange}
-                handleAuth={handleAuth}
                 logout={logout}
                 pendingRequestsCount={pendingRequestsCount}
-                require2FA={require2FA}
-                setRequire2FA={setRequire2FA}
-                code2FA={code2FA}
-                setCode2FA={setCode2FA}
             />
         </Router>
     );
 }
 
-function AppContent({
-    user, setUser, isLoading, authView, setAuthView,
-    errorMsg, setErrorMsg, isSubmitting, formData,
-    handleChange, handleAuth, logout, pendingRequestsCount,
-    require2FA, setRequire2FA, code2FA, setCode2FA
-    }) {
+function AppContent({ user, setUser, isLoading, logout, pendingRequestsCount }) {
     const location = useLocation();
     const [isFullScreenChat, setIsFullScreenChat] = useState(false);
+    const [isAuthLoading, setIsAuthLoading] = useState(false);
+
+    const handleLoginClick = async () => {
+        setIsAuthLoading(true);
+        const verifier = generateCodeVerifier();
+        localStorage.setItem('code_verifier', verifier);
+        const challenge = await generateCodeChallenge(verifier);
+        const state = generateCodeVerifier();
+        localStorage.setItem('oauth_state', state);
+        
+        const url = new URL(`${IDM_URL}/oauth/authorize`);
+        url.searchParams.set('client_id', OAUTH_CLIENT_ID);
+        url.searchParams.set('redirect_uri', window.location.origin + '/oauth/callback');
+        url.searchParams.set('response_type', 'code');
+        url.searchParams.set('code_challenge', challenge);
+        url.searchParams.set('code_challenge_method', 'S256');
+        url.searchParams.set('state', state);
+        url.searchParams.set('scope', 'openid profile email');
+
+        window.location.href = url.toString();
+    };
 
     return (
         <div className="min-h-screen w-full flex flex-col items-center bg-black text-white relative overflow-x-hidden p-4">
@@ -383,82 +448,50 @@ function AppContent({
                 isLoading ? "opacity-0" : "opacity-100",
                 isFullScreenChat && "mt-0 max-w-full p-0 h-[100dvh] md:mt-10 md:max-w-2xl md:p-4 md:h-auto"
             )}>
-                {}
-                <div className="text-center mb-10 hidden md:block">
-                    <h1 className="text-5xl font-bold tracking-tighter mb-2">Vorticity</h1>
-                    <div className="h-1 w-20 mx-auto bg-red-600 rounded-full shadow-[0_0_15px_red]" />
-                </div>
-
-                {}
-                {!isFullScreenChat && (
-                     <div className="text-center mb-10 md:hidden block">
+                
+                {(!isFullScreenChat && location.pathname !== '/oauth/callback') && (
+                     <div className="text-center mb-10">
                         <h1 className="text-5xl font-bold tracking-tighter mb-2">Vorticity</h1>
                         <div className="h-1 w-20 mx-auto bg-red-600 rounded-full shadow-[0_0_15px_red]" />
                     </div>
                 )}
 
-                {!user ? (
+                {!user && location.pathname !== '/oauth/callback' ? (
                     <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }}>
                         <TiltCard className="max-w-md mx-auto">
                             <div className="bg-zinc-950/80 backdrop-blur-md border border-white/10 rounded-2xl p-8 shadow-2xl">
-                                <form onSubmit={handleAuth} className="space-y-4">
+                                <div className="space-y-4">
                                     <h2 className="text-xl font-bold text-center uppercase tracking-widest mb-6 border-b border-white/10 pb-4">
-                                        {require2FA ? 'Двухфакторная защита' : (authView === 'login' ? 'Авторизация' : 'Регистрация')}
+                                        Аутентификация
                                     </h2>
-
-                                    {!require2FA ? (
-                                        <>
-                                            {authView === 'register' && <CyberInput id="display_name" placeholder="Отображаемое имя" value={formData.display_name} onChange={handleChange} />}
-                                            {authView === 'register' && <CyberInput id="email" type="email" placeholder="Email" value={formData.email} onChange={handleChange} />}
-                                            <CyberInput id="username" placeholder="Логин" value={formData.username} onChange={handleChange} />
-                                            <CyberInput id="password" type="password" placeholder="Пароль" value={formData.password} onChange={handleChange} />
-                                        </>
-                                    ) : (
-                                        <div className="space-y-4">
-                                            <p className="text-center text-sm text-zinc-400">Введите 6-значный код из Authenticator</p>
-                                            <CyberInput
-                                                id="code2FA"
-                                                type="text"
-                                                placeholder="000000"
-                                                value={code2FA}
-                                                onChange={(e) => setCode2FA(e.target.value.replace(/\D/g, '').slice(0, 6))}
-                                            />
-                                        </div>
-                                    )}
-
-                                    {errorMsg && <p className="text-red-500 text-xs text-center">{errorMsg}</p>}
-
-                                    <CyberButton type="submit" disabled={isSubmitting || (require2FA && code2FA.length !== 6)}>
-                                        {isSubmitting ? 'PROCESSING...' : (require2FA ? 'ПОДТВЕРДИТЬ' : (authView === 'login' ? 'ENTER SYSTEM' : 'REGISTER'))}
+                                    <p className="text-sm text-zinc-400 text-center mb-6">
+                                        Для доступа к Vorticity необходим аккаунт Xfeatures с подтвержденной почтой.
+                                    </p>
+                                    <CyberButton type="button" onClick={handleLoginClick} disabled={isAuthLoading}>
+                                        {isAuthLoading ? 'PROCESSING...' : 'LOGIN WITH XFEATURES ID'}
                                     </CyberButton>
-
-                                    {!require2FA ? (
-                                        <button type="button" className="w-full text-center text-xs text-zinc-500 hover:text-red-400 mt-4 uppercase tracking-wider" onClick={() => setAuthView(authView === 'login' ? 'register' : 'login')}>
-                                            {authView === 'login' ? '[ Create New Identity ]' : '[ Return to Login ]'}
-                                        </button>
-                                    ) : (
-                                        <button type="button" className="w-full text-center text-xs text-zinc-500 hover:text-red-400 mt-4 uppercase tracking-wider" onClick={() => setRequire2FA(false)}>
-                                            [ Cancel Login ]
-                                        </button>
-                                    )}
-                                </form>
+                                </div>
                             </div>
                         </TiltCard>
                     </motion.div>
                 ) : (
                     <div className={cn("pb-32", isFullScreenChat && "pb-0 h-full md:pb-32 md:h-auto")}>
                         <Routes>
-                            <Route path="/" element={<Feed user={user} API_URL={API_URL} />} />
-                            <Route path="/search" element={<SearchPage API_URL={API_URL} />} />
-                            <Route path="/chats" element={<ChatsPage currentUser={user} API_URL={API_URL} setIsFullScreenChat={setIsFullScreenChat} />} />
-                            <Route path="/friends" element={<Friends API_URL={API_URL} />} />
-                            <Route path="/user/:username" element={<UserProfile currentUser={user} API_URL={API_URL} />} />
-                            <Route path="/settings" element={<SettingsPage user={user} API_URL={API_URL} onUpdateUser={(updatedFields) => setUser({ ...user, ...updatedFields })}/>}/>
+                            {!user && <Route path="/oauth/callback" element={<OAuthCallback setUser={setUser} />} />}
+                            {user && (
+                                <>
+                                    <Route path="/" element={<Feed user={user} API_URL={API_URL} />} />
+                                    <Route path="/search" element={<SearchPage API_URL={API_URL} />} />
+                                    <Route path="/chats" element={<ChatsPage currentUser={user} API_URL={API_URL} setIsFullScreenChat={setIsFullScreenChat} />} />
+                                    <Route path="/friends" element={<Friends API_URL={API_URL} />} />
+                                    <Route path="/user/:username" element={<UserProfile currentUser={user} API_URL={API_URL} />} />
+                                    <Route path="/settings" element={<SettingsPage user={user} API_URL={API_URL} onUpdateUser={(updatedFields) => setUser({ ...user, ...updatedFields })}/>}/>
 
-                            <Route path="/admin" element={<AdminRoute user={user}><AdminDashboard user={user} /></AdminRoute>} />
-                            <Route path="/admin/users" element={<AdminRoute user={user}><AdminUsers /></AdminRoute>} />
-                            <Route path="/admin/media" element={<AdminRoute user={user}><AdminMedia /></AdminRoute>} />
-
+                                    <Route path="/admin" element={<AdminRoute user={user}><AdminDashboard user={user} /></AdminRoute>} />
+                                    <Route path="/admin/users" element={<AdminRoute user={user}><AdminUsers /></AdminRoute>} />
+                                    <Route path="/admin/media" element={<AdminRoute user={user}><AdminMedia /></AdminRoute>} />
+                                </>
+                            )}
                             <Route path="*" element={<Navigate to="/" />} />
                         </Routes>
                     </div>

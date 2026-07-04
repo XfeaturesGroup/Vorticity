@@ -18,26 +18,20 @@ Copyright (c) 2026 XfeaturesGroup. All Rights Reserved.
 import { Router } from 'itty-router';
 import { corsHeaders, errorResp } from './utils/response';
 import { ImageController } from './controllers/imageController';
-import { AuthController } from './controllers/authController';
 import { PostController } from './controllers/postController';
 import { UserController } from './controllers/userController';
 import { AdminController } from './controllers/adminController';
 import { FriendController } from './controllers/friendController';
 import { ChatController } from './controllers/chatController';
+import { AuthController } from './controllers/authController';
 
 const router = Router();
 
 router.options('*', () => new Response(null, { headers: corsHeaders }));
 
 router.get('/images/*', ImageController.fetch);
+router.post('/auth/oauth/callback', AuthController.oauthCallback);
 
-router.post('/register', AuthController.register);
-router.post('/login', AuthController.login);
-router.get('/me', AuthController.me);
-router.post('/change-password', AuthController.changePassword);
-router.post('/auth/2fa/generate', AuthController.generate2FA);
-router.post('/auth/2fa/enable', AuthController.enable2FA);
-router.post('/auth/2fa/disable', AuthController.disable2FA);
 
 router.get('/posts', PostController.list);
 router.post('/posts', PostController.create);

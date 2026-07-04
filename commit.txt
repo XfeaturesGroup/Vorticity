@@ -1,0 +1,5 @@
+Update 2026.1.03: OAuth2 IDM Migration
+
+- Auth Refactor: Migrated from local authentication to central XfeaturesAccount IDM via OAuth2.
+- E2EE Keys: Implemented 6-digit Vault PIN approach to securely manage end-to-end encryption keys without relying on legacy passwords.
+- Database: Handled user mapping by verified email, updating existing records seamlessly.
