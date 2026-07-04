@@ -187,10 +187,13 @@ function OAuthCallback({ setUser }) {
     const [pin, setPin] = useState('');
     const [tempData, setTempData] = useState(null);
     const [error, setError] = useState('');
+    const hasFetched = useRef(false);
     const navigate = useNavigate();
 
     useEffect(() => {
         const processCode = async () => {
+            if (hasFetched.current) return;
+            hasFetched.current = true;
             const params = new URLSearchParams(window.location.search);
             const code = params.get('code');
             const state = params.get('state');
@@ -222,8 +225,8 @@ function OAuthCallback({ setUser }) {
                 });
 
                 if (!res.ok) {
-                    const data = await res.json();
-                    throw new Error(data.error || "Ошибка при обмене кода");
+                    const errData = await res.json();
+                    throw new Error(errData.error || "Ошибка при обмене кода");
                 }
 
                 const data = await res.json();

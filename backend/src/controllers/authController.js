@@ -30,7 +30,7 @@ export const AuthController = {
             if (!tokenRes.ok) {
                 const errText = await tokenRes.text();
                 console.error("Token exchange failed:", errText);
-                return errorResp("Ошибка при обмене токена авторизации", corsHeaders, 400);
+                return errorResp(`Ошибка IDM: ${errText}`, corsHeaders, 400);
             }
 
             const tokenData = await tokenRes.json();
