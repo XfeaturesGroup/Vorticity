@@ -5,7 +5,7 @@ import { corsHeaders, errorResp, jsonResp } from "./response";
 import { verifyGroth16 } from "./zk-wasm";
 import { verifyBlindSig } from "./blindsig-wasm";
 import { CURRENT_ISSUER_PK_PEM } from "./issuer-keys";
-import { VK_HEX, PUBLIC_INPUTS_HEX, hexToBytes, mintCapability, verifyCapability } from "./session";
+import { VK_HEX, hexToBytes, buildPublicInputsBytes, mintCapability, verifyCapability } from "./session";
 
 export { MerkleTreeDO } from "./durable-objects/MerkleTreeDO";
 export { QueueDO } from "./durable-objects/QueueDO";
@@ -114,22 +114,35 @@ router.post("/membership/insert", async (request: IRequest, env: Env) => {
 });
 
 // Flow 2 (docs/04): prove membership in zero knowledge -> mint a session capability. The client sends
-// a real Groth16 proof (bytes), the merkleRoot it's proving against, and a one-time nullifier. We run
-// the REAL verifier in WASM (zk.rs via zk-wasm.ts); on `true`, we spend the nullifier (one session per
-// proof) and mint a signed capability. See session.ts for the honest scope note on the fixed vector.
+// a REAL Groth16 proof (bytes) for the REAL Semaphore v4 circuit, plus the four values it commits to
+// as public inputs: `merkleRoot`, `nullifier`, `message`, `scope` (see session.ts's header comment
+// for why this order, and for the R21 "real circuit, test-only trusted setup" scope note). We run the
+// REAL verifier in WASM (zk.rs via zk-wasm.ts) against public inputs BUILT FROM the caller's own
+// values — no longer a fixed shared vector — and additionally check `merkleRoot` against
+// MerkleTreeDO's actual CURRENT root before trusting it: a valid proof alone only proves "some root
+// existed for which I have a witness", not that it's the current tree state (a stale replay would
+// otherwise still verify). On success we spend the nullifier (one session per proof) and mint a
+// signed capability, unchanged from before.
 router.post("/auth/session", async (request: IRequest, env: Env) => {
   const origin = request.headers.get("Origin");
-  let body: { proof?: unknown; merkleRoot?: unknown; nullifier?: unknown };
+  let body: { proof?: unknown; merkleRoot?: unknown; nullifier?: unknown; message?: unknown; scope?: unknown };
   try {
     body = await request.json();
   } catch {
     return errorResp("Invalid JSON body", origin, 400);
   }
   if (typeof body.proof !== "string") return errorResp("Missing proof (base64)", origin, 400);
-  if (typeof body.nullifier !== "string" || !HEX64_RE.test(body.nullifier)) {
-    return errorResp("nullifier must be a 64-char lowercase hex (32-byte) value", origin, 400);
+  for (const [name, value] of Object.entries({
+    merkleRoot: body.merkleRoot,
+    nullifier: body.nullifier,
+    message: body.message,
+    scope: body.scope,
+  })) {
+    if (typeof value !== "string" || !HEX64_RE.test(value)) {
+      return errorResp(`${name} must be a 64-char lowercase hex (32-byte) value`, origin, 400);
+    }
   }
-  const merkleRoot = typeof body.merkleRoot === "string" ? body.merkleRoot : "n/a";
+  const { merkleRoot, nullifier, message, scope } = body as { merkleRoot: string; nullifier: string; message: string; scope: string };
 
   let proofBytes: Uint8Array;
   try {
@@ -138,9 +151,25 @@ router.post("/auth/session", async (request: IRequest, env: Env) => {
     return errorResp("proof is not valid base64", origin, 400);
   }
 
-  const ok = verifyGroth16(hexToBytes(VK_HEX), proofBytes, hexToBytes(PUBLIC_INPUTS_HEX));
+  // Cheap check first, before the Groth16 pairing work: reject a stale/unrelated root outright.
+  const rootRes = await merkleStub(env).fetch(new Request("https://do/root"));
+  if (!rootRes.ok) return errorResp(`MerkleTreeDO root fetch failed (${rootRes.status})`, origin, 502);
+  const { merkleRoot: currentRoot } = (await rootRes.json()) as { merkleRoot: string };
+  if (merkleRoot !== currentRoot) {
+    console.log(`[Session] merkleRoot mismatch: claimed ${merkleRoot.slice(0, 16)}… vs current ${currentRoot.slice(0, 16)}…`);
+    return errorResp("merkleRoot does not match the current membership tree root", origin, 409);
+  }
+
+  let publicInputsBytes: Uint8Array;
+  try {
+    publicInputsBytes = buildPublicInputsBytes(merkleRoot, nullifier, message, scope);
+  } catch (err) {
+    return errorResp(`Invalid public inputs: ${(err as Error).message}`, origin, 400);
+  }
+
+  const ok = verifyGroth16(hexToBytes(VK_HEX), proofBytes, publicInputsBytes);
   console.log(
-    `[Session] zk_verify_groth16_bytes -> ${ok} (proof ${proofBytes.length}B, merkleRoot ${merkleRoot.slice(0, 16)}…, nullifier ${body.nullifier.slice(0, 16)}…)`,
+    `[Session] zk_verify_groth16_bytes -> ${ok} (proof ${proofBytes.length}B, merkleRoot ${merkleRoot.slice(0, 16)}…, nullifier ${nullifier.slice(0, 16)}…)`,
   );
   if (!ok) return errorResp("ZK proof verification failed", origin, 401);
 
@@ -149,7 +178,7 @@ router.post("/auth/session", async (request: IRequest, env: Env) => {
     new Request("https://do/nullifier/spend", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ nullifier: body.nullifier }),
+      body: JSON.stringify({ nullifier }),
     }),
   );
   if (spendRes.status === 409) {
@@ -157,8 +186,8 @@ router.post("/auth/session", async (request: IRequest, env: Env) => {
   }
   if (!spendRes.ok) return errorResp(`nullifier spend failed (${spendRes.status})`, origin, 502);
 
-  const capability = await mintCapability(env.SESSION_SIGNING_KEY, body.nullifier);
-  console.log(`[Session] Capability issued (nullifier ${body.nullifier.slice(0, 16)}…): ${capability.slice(0, 24)}…`);
+  const capability = await mintCapability(env.SESSION_SIGNING_KEY, nullifier);
+  console.log(`[Session] Capability issued (nullifier ${nullifier.slice(0, 16)}…): ${capability.slice(0, 24)}…`);
   return jsonResp({ capability }, origin);
 });
 

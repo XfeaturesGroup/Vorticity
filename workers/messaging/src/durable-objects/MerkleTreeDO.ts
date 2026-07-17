@@ -10,10 +10,21 @@
 //   - `nullifiers`: the Semaphore ZK SESSION nullifier (Flow 2, `/auth/session`) — one anonymous
 //     session per member per epoch. Different flow, different data, deliberately not reused.
 //
-// SCOPE (Phase 2 pass): this stores commitments and computes a REAL-but-mock root — the running
-// SHA-256 over the ordered commitment list, not yet a Lean Incremental Merkle Tree with Poseidon
-// (that's the remaining Semaphore-circuit work in docs/06). It is authoritative, deterministic, and
-// deduplicating, which is enough to wire Flow 1 + Flow 2 end to end. The nullifier sets are real and
+// ROOT COMPUTATION (R21, 2026-07): a REAL LeanIMT (Lean Incremental Merkle Tree) with Poseidon2,
+// matching Semaphore v4's actual circuit exactly — see the real, official circom source
+// (github.com/semaphore-protocol/semaphore/packages/circuits/src/semaphore.circom, `BinaryMerkleRoot`
+// template) and `@zk-kit/lean-imt`'s reference TS implementation, which we use here VERBATIM (not
+// re-implemented) via the official `@zk-kit/lean-imt` + `poseidon-lite` npm packages — both pure
+// TS/BigInt, no native/WASM dependency, so no Rust/WASM involvement is needed for this DO at all.
+// LeanIMT differs from a fixed-depth IMT: depth grows with leaf count, and a node with only one
+// child takes that child's value unchanged (no zero-padding hash) — this is exactly what makes a
+// REAL client-generated Semaphore proof's `merkleProofLength`/`merkleRoot` match what this DO
+// computes; a fixed-depth or differently-hashed tree would never agree with the real circuit.
+// Superseded the earlier SHA-256-over-the-list placeholder (see git history) — that could never have
+// matched a real proof's public `merkleRoot` regardless of how correct the ZK verifier itself was.
+// Rebuilds the tree from the full commitment list on every query — simple and correct at this scale;
+// incrementally persisting tree state is a future optimization, not required for correctness.
+// SCOPE (Phase 2 pass): commitments/nullifier tables are unchanged. The nullifier sets are real and
 // enforce one-spend semantics. Single global instance for now (addressed by "global"), like AliasDO.
 //
 // D1 MIRRORING NOTE: docs/04 describes DB_MSG as the "durable mirror" of this DO's authoritative
@@ -23,9 +34,28 @@
 // live enforcement path is this DO's own SQLite, not a D1 round-trip. Wiring real D1 mirroring is
 // pre-existing, not-yet-done work for all of this DO's tables, not something new introduced here.
 import { DurableObject } from "cloudflare:workers";
+import { LeanIMT } from "@zk-kit/lean-imt";
+import { poseidon2 } from "poseidon-lite";
 import type { Env } from "../env";
 
 const HEX64_RE = /^[0-9a-f]{64}$/; // a 32-byte value, lowercase hex
+
+// BN254 scalar field order (Fr) — every real leaf/root value is an element of this field. A 32-byte
+// big-endian value always fits (Fr < 2^254 < 2^256), but not every 32-byte value is a VALID field
+// element; reject out-of-range values defensively rather than silently accepting unreachable inputs.
+const FR_MODULUS = 21888242871839275222246405745257275088548364400416034343698204186575808495617n;
+
+function hexToField(hex: string): bigint {
+  const n = BigInt(`0x${hex}`);
+  if (n >= FR_MODULUS) throw new RangeError("value is not a valid BN254 field element (>= Fr modulus)");
+  return n;
+}
+function fieldToHex(n: bigint): string {
+  return n.toString(16).padStart(64, "0");
+}
+/// The conventional root of an empty tree — LeanIMT has no defined root with zero leaves, so this DO
+/// reports this sentinel instead of constructing a tree at all (avoids `.root` being `undefined`).
+const EMPTY_TREE_ROOT = "0".repeat(64);
 
 interface CommitmentRow {
   commitment: string;
@@ -38,11 +68,6 @@ interface CountRow {
 interface TokenNullRow {
   token_null: string;
   [key: string]: SqlStorageValue;
-}
-
-async function sha256Hex(input: string): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(input));
-  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 export class MerkleTreeDO extends DurableObject<Env> {
@@ -70,18 +95,22 @@ export class MerkleTreeDO extends DurableObject<Env> {
     if (request.method === "POST" && url.pathname === "/insert") return this.handleInsert(request);
     if (request.method === "POST" && url.pathname === "/nullifier/spend") return this.handleSpend(request);
     if (request.method === "GET" && url.pathname === "/root") {
-      return Response.json({ merkleRoot: await this.computeRoot() });
+      return Response.json({ merkleRoot: this.computeRoot() });
     }
     return new Response("Not found", { status: 404 });
   }
 
-  // Deterministic mock root: SHA-256 over every commitment in insertion order, domain-separated.
-  // Real Semaphore uses a Lean IMT with Poseidon — tracked in docs/06.
-  private async computeRoot(): Promise<string> {
+  // Real Lean IMT root over Poseidon2, matching Semaphore v4's actual circuit — see this file's
+  // header comment. Rebuilt from the full commitment list each call (simple, correct; incremental
+  // persistence is a future optimization).
+  private computeRoot(): string {
     const rows = this.ctx.storage.sql
       .exec<CommitmentRow>("SELECT commitment FROM commitments ORDER BY seq")
       .toArray();
-    return sha256Hex("vortic-merkle-v1" + rows.map((r) => r.commitment).join(""));
+    if (rows.length === 0) return EMPTY_TREE_ROOT;
+    const leaves = rows.map((r) => hexToField(r.commitment));
+    const tree = new LeanIMT((a: bigint, b: bigint) => poseidon2([a, b]), leaves);
+    return fieldToHex(tree.root as bigint);
   }
 
   private async handleInsert(request: Request): Promise<Response> {
@@ -95,6 +124,15 @@ export class MerkleTreeDO extends DurableObject<Env> {
     const tokenNull = (body as { tokenNull?: unknown }).tokenNull;
     if (typeof commitment !== "string" || !HEX64_RE.test(commitment)) {
       return new Response("commitment must be a 64-char lowercase hex (32-byte) value", { status: 400 });
+    }
+    // Must also be a valid BN254 field element (< Fr modulus) — the real Semaphore circuit's
+    // identityCommitment is a Poseidon output over this field; an out-of-range value could never
+    // have come from a real proof and would otherwise poison computeRoot() the next time it reads
+    // this row back (hexToField throws on out-of-range input).
+    try {
+      hexToField(commitment);
+    } catch {
+      return new Response("commitment is not a valid BN254 field element", { status: 400 });
     }
     if (typeof tokenNull !== "string" || !HEX64_RE.test(tokenNull)) {
       return new Response("tokenNull must be a 64-char lowercase hex (32-byte) value", { status: 400 });
@@ -123,7 +161,7 @@ export class MerkleTreeDO extends DurableObject<Env> {
       Date.now(),
     );
     const { n } = this.ctx.storage.sql.exec<CountRow>("SELECT COUNT(*) AS n FROM commitments").one();
-    return Response.json({ merkleRoot: await this.computeRoot(), size: n });
+    return Response.json({ merkleRoot: this.computeRoot(), size: n });
   }
 
   private async handleSpend(request: Request): Promise<Response> {

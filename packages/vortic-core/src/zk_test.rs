@@ -224,3 +224,110 @@ fn g2_coordinate_order_is_load_bearing() {
         "verifier accepted a proof with swapped G2 [c1, c0] ordering — ordering is not being enforced"
     );
 }
+
+// ── Real Semaphore v4 vector (R21, 2026-07) ──────────────────────────────────────────────────────
+//
+// Everything above this point uses `build_vector()`'s structurally-equivalent MOCK circuit (4 public
+// inputs in Semaphore's order, one real R1CS multiplication) — it validates our byte-contract/parser
+// pipeline but is NOT Semaphore's real circuit. This test closes that gap: the vk/proof/public-inputs
+// below come from the REAL, OFFICIAL `@semaphore-protocol/circuits` v4 template
+// (github.com/semaphore-protocol/semaphore/packages/circuits/src/semaphore.circom, unmodified,
+// MAX_DEPTH=20), compiled with the real `circom 2.2.3` compiler and a REAL Groth16 setup
+// (snarkjs: powersoftau + circuit-specific setup + contribution) — NOT PSE's production ceremony
+// (this is a local, test-only trusted setup; see docs/06's R21 entry for why that's the honest scope
+// for proving OUR verifier/pipeline is correct, as opposed to attesting to mainnet-ceremony security).
+//
+// Public signal order, confirmed empirically from snarkjs's own `publicSignals` output (circom
+// convention: circuit OUTPUTS first, then declared-public INPUTS): `[merkleRoot, nullifier, message,
+// scope]` — same POSITIONS as the mock's `[merkleRoot, nullifierHash, signalHash, externalNullifier]`
+// (nPublic=4 either way), different names/semantics per the real v4 circuit
+// (`nullifier = Poseidon2(scope, secret)`, no separate "signalHash"/"externalNullifier" hashing step
+// inside the circuit itself — the real circuit takes `message`/`scope` directly).
+//
+// The witness/proof were generated for: a 2-leaf LeanIMT (Poseidon2) with the proving identity's
+// commitment at index 0, `message=1337`, `scope=42`. `merkleRoot`/`nullifier` are therefore real,
+// self-consistent values from that real tree/identity — not placeholders.
+#[test]
+fn real_semaphore_v4_vector_verifies() {
+    let vk_hex = "15c77a2b333b2c35ce275aa66ff61002be4735273f54815f7bbed68c6b9ad3380ba3c527a60ae53284d7e37c04ed7fa09ac6ed8d4be9a0f8583b2e695a02ae17147f6fb673c131967c834c212e540c2ddf599ee4c45eb1c9c10aab0010a1a4372e036a0f1ca05bee9f52e23f24d9ed001fdd318ff145ce1c35f0af1d984e70401586f27e93fa19fef2f57d6c52b51c03449f38807b8ca8e5a000f6e854b3faa508683c375bdd137e988a37ef3bc749470bfaed628e91d8fbd5e312c4e02ea63f1800deef121f1e76426a00665e5c4479674322d4f75edadd46debd5cd992f6ed198e9393920d483a7260bfb731fb5d25f1aa493335a9e71297e485b7aef312c212c85ea5db8c6deb4aab71808dcb408fe3d1e7690c43d37b4ce6cc0166fa7daa090689d0585ff075ec9e99ad690c3395bc4b313370b38ef355acdadcd122975b1b2462f3d634bd394f6430f6c339be0070cb20983e2c5e088bd67fcbcae7758a0fe99b19c95af9ca373a0da5af51d72c977575acd3fb3bd566acd3743e90a039176d46b5d204461a2b5b62dfcf667732466fcdb2259e02dea037d37f9c0b1c9e02fc8ed514d75adb617303897fcbf682d76bdcc3e4954061505bbd452e8a4c6a2905e2777a5edc1f484fc81c65bd648be9ce82cbcf95bf559032874cfd6e972423d3f68cdb15f32646e82991f530ab386ebd316ab5ae7987ee7b3caaf5a44bf5045450d36221e211d55ffeb733d8a2859850121ee482fda46b3ad4ac1624d76e0d51a07f44e1251cb8746f5cb20dcfb7ff89b914365f09ef84e2041be23f5eb6047807142b0dcf739e0a59d1ae00c45b87acc8ecb9b407dd87d8666fd1729eb302749f0b5e1674460c68c4700b516f841f5de20201e2dc3bb5c8c2529b961f4e2ac9e93f129c60becde1cff8818dafcbb3b3382362db0ee62bb1fd0478382cf128dd11dabf4256ccd5f792c6b85fea3c6a6719b37567f93249fea0f3329c19640900bef55f144a994bec0b36e2f7ee093a2eebda437e1088be5ffddc11f34aed2e263857e1de8c40f1848743799056ad0f6117d874f298ba389e37e7623a24fa";
+    let proof_hex = "101aadebcb6f0a53ed7f7fe43f0b3191fb9f2aaa57a6b82d20ffc2dc8fc2697410171627f5ccb3fc89df24b37c6402840b064c8ee732e34d87e494516c67d38f01543a3fe26b0b5f526911ecb3cf947fc2d81ae1f7d617249536e62a9517a22f08f73be286ea958303b70d2972e81c0f89e5f03f83cc26ba4d2c32315a836a50058cb0dc9f02e4ea3e44f3f41705a84274326be88e6bd1c622edb3a0c14344a912f1f872ae7c25d2bba4e0a046f425e16ffaca1e9b01c7c502720d40d92b23a0198736b0e4d3d8d59e1ce23e59df3a6f28cadccbbaa092619d6da36b0a7f92ce20cd54c926bb0258e18faa026da400705665ba6515b5c13606a4e02c5448b9d5";
+    let inputs_hex = "05f43fb3c09152b01a54d1ea36275f238caa23194b42c43e081217da0ce4c40a2ee795c84e3c7ccb04063c2b052192e1218f865faf09c0390647d50ffba979580000000000000000000000000000000000000000000000000000000000000539000000000000000000000000000000000000000000000000000000000000002a";
+
+    let hex_bytes = |s: &str| -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    };
+    let vk = hex_bytes(vk_hex);
+    let proof = hex_bytes(proof_hex);
+    let inputs = hex_bytes(inputs_hex);
+    assert_eq!(vk.len(), 768);
+    assert_eq!(proof.len(), 256);
+    assert_eq!(inputs.len(), 128);
+
+    assert!(
+        zk_verify_groth16_bytes(&vk, &proof, &inputs),
+        "verifier rejected a real, valid Semaphore v4 proof from the official circuit"
+    );
+
+    // Negative control: tamper the last input (scope) — must reject, same as the mock vector's test.
+    let mut tampered = inputs.clone();
+    let last = tampered.len() - 1;
+    tampered[last] ^= 1;
+    assert!(
+        !zk_verify_groth16_bytes(&vk, &proof, &tampered),
+        "verifier accepted a real Semaphore v4 proof against a tampered public input"
+    );
+}
+
+// ── Official PSE trusted-setup ceremony vector (R21-continued, 2026-07) ─────────────────────────────
+//
+// The vector above (`real_semaphore_v4_vector_verifies`) used a LOCAL, single-party test-only Groth16
+// setup — legitimate for proving our verifier/pipeline is byte-compatible with a real circuit, but
+// explicitly NOT something to trust in production (the toxic waste from a single-party setup is known
+// to that one party). This test replaces that concern: the VK below is converted directly from
+// `semaphore-20.json`, part of the official `@zk-kit/semaphore-artifacts@4.13.0` npm package
+// (downloaded from unpkg, sha256-verified against the hash npm itself reports for that exact file —
+// see docs/06's R21-continued entry). That package ships the output of "Semaphore V4 Ceremony 1", a
+// real multi-party Groth16 Phase 2 ceremony run by PSE with 300-400+ independent contributors,
+// finalized 2024-09-05 (attestation: gist.github.com/NicoSerranoP/10b09d0539cb87445fee2d3d98cda96a,
+// contributor attestations confirm circuit `semaphorev4-20` was one of the 32 circuits — one per
+// supported tree depth 1..32 — covered by that ceremony). As long as at least one of those hundreds of
+// contributors destroyed their randomness, the toxic waste is unrecoverable — the standard trust
+// assumption for a real MPC trusted setup, unlike the single-party vector above.
+//
+// The witness/proof were generated with the OFFICIAL semaphore-20.wasm/zkey (not a locally recompiled
+// circuit) via snarkjs, driven directly (not through `@semaphore-protocol/proof@4.11.1`'s
+// `generateProof()`, which was found to build a stale `merkleProofIndices` (plural, per-level bit
+// array) witness input that this circuit's actual ABI rejects — the real circuit takes a single scalar
+// `merkleProofIndex`, confirmed by direct probing against the downloaded wasm). A real 2-leaf LeanIMT
+// (Poseidon2) tree, two real `@semaphore-protocol/identity` identities, `message=20260718`,
+// `scope=1784326405067`. `snarkjs.groth16.verify()` against the official `semaphore-20.json` VK
+// confirmed `true` before this vector was ever handed to arkworks.
+#[test]
+fn official_ceremony_semaphore_v4_vector_verifies() {
+    let vk_hex = "245229d9b076b3c0e8a4d70bde8c1cccffa08a9fae7557b165b3b0dbd653e2c7253ec85988dbb84e46e94b5efa3373b47a000b4ac6c86b2d4b798d274a1823022424bcc1f60a5472685fd50705b2809626e170120acaf441e133a2bd5e61d24407090a82e8fabbd39299be24705b92cf208ee8b3487f6f2b39ff27978a29a1db2b86859fd3d55c9d150fb3f0aeba798826493dd73d357ab0f9fdaced9fc818290ae1135cffdaf227c5dc266740607aa930bc3bd92ddc2b135086d9da2dfd3e2a1800deef121f1e76426a00665e5c4479674322d4f75edadd46debd5cd992f6ed198e9393920d483a7260bfb731fb5d25f1aa493335a9e71297e485b7aef312c212c85ea5db8c6deb4aab71808dcb408fe3d1e7690c43d37b4ce6cc0166fa7daa090689d0585ff075ec9e99ad690c3395bc4b313370b38ef355acdadcd122975b1673e455967762f96f57b413424631198e09e7bb1bb06844068fe44f307a8d591230a42b5aa82168743e9817923ea3ebd1d3a55ef1bd91a89eacc55663a026402e92f89b6bd8472ef679fa5d617805180e6e0605423cac37fc15f281939770a7061d9c5b1f377adc54722ccaf3601332ebc07660fec4d89b5c8213031f0aa8b72d3c9778d5cb3ab0bfe4b296e2ed90ed19619b8b353c1043b40e03b568a049a417276cb455cc5d461db37b0b4f6b34f1bb429a76968726205617095e1d39b92d09dae1c6d2e4114c5439c81baa28594cc0ab76e7f32c25c4f780c9e9d6e46a5a0a23d3bedfe1b14bff3eec36492bb9329f56ddbf7f5e1f122838e96dcfe98c4613a1149cf273a308c777146d7f4be2160aac12980d97661fad18cf682b7c5e242b74aaa132494d280ca444d5d2a99cd2bd426ff82d443e2b44b8441733bd450d29b8403a3843d4a77b6c70539d8965e57af369d6f32feab13450f3fa985aed18142569f4ef08c2a1947dcb6e99b5ac52cdd5876c50f02bd6afd62fc810a755110f47bd52a43c690f658374e9f7c2bc4285c641c7116a4ccd2c94f684cbeb7f2a17a29f16b646ebe94c4b2e2c4bc375cd7b002111dd55c4d212e9360cec88c188";
+    let proof_hex = "23234ac83feaa93c31fd8235397511cd53d3cb2bae46213d9cf1c70ea4ef5fe30cf42499488dbb7c5661cb32108bdd6ce5bdeafc26437c56b493202cdb3eb1121991bd8512e55196bec979f1f23b8a14b91c77e3be197c041f970761e93bdd3e2b7026e30f09f97b3e2236365bbc27bdc2ffd53056153e5baffec3d1cf720acf244495ffbb7a7efc21a9be735ab29fa8186362bc74fcd8a6cd7ef4aebf6c520b29fd99918f35bee4e05e86d4e957a1bdc24ff1249810b750863c7d9dbf87523b081c9a31a6d74747613595ffd76259a33fc7360ad690ad53d9029010ea1e3e961ce8ea0ab7ad7b34aaa9c100db08e0144959a3ffe9b4ad795dbe3334811b320d";
+    let inputs_hex = "0f2be177d0a8efab19f3bb5b849581d2a73f8330e7b412f6c6e9674d445bddad06e5af06125a35bbe35d2808003821de26ad391038cc6a00301db0416d4c5d6e000000000000000000000000000000000000000000000000000000000135276e0000000000000000000000000000000000000000000000000000019f72243bcb";
+
+    let hex_bytes = |s: &str| -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    };
+    let vk = hex_bytes(vk_hex);
+    let proof = hex_bytes(proof_hex);
+    let inputs = hex_bytes(inputs_hex);
+    assert_eq!(vk.len(), 768);
+    assert_eq!(proof.len(), 256);
+    assert_eq!(inputs.len(), 128);
+
+    assert!(
+        zk_verify_groth16_bytes(&vk, &proof, &inputs),
+        "verifier rejected a real, valid Semaphore v4 proof from the OFFICIAL PSE ceremony circuit"
+    );
+
+    let mut tampered = inputs.clone();
+    let last = tampered.len() - 1;
+    tampered[last] ^= 1;
+    assert!(
+        !zk_verify_groth16_bytes(&vk, &proof, &tampered),
+        "verifier accepted an official-ceremony Semaphore v4 proof against a tampered public input"
+    );
+}

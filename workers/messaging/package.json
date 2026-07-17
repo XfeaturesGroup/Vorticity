@@ -10,7 +10,9 @@
     "test": "vitest"
   },
   "dependencies": {
-    "itty-router": "^5.0.22"
+    "itty-router": "^5.0.22",
+    "@zk-kit/lean-imt": "^2.2.5",
+    "poseidon-lite": "^0.3.0"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.12.4",

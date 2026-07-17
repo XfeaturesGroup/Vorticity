@@ -98,12 +98,16 @@ Once a commitment is in the tree, the client proves membership **without reveali
 session capability.
 
 - **Identity:** Semaphore v4 EdDSA identity → `commitment = Poseidon(pk)`. Tree = **Lean Incremental Merkle
-  Tree**, root maintained by a `MerkleTreeDO` (Durable Object, authoritative) and mirrored to D1.
-- **Proof (Groth16):** public inputs `= (merkleRoot, nullifierHash, signalHash, externalNullifier)`; private
-  `= (identity secret, merkle path)`. Proves: *"I know the secret behind some commitment under `merkleRoot`,
-  and `nullifierHash` is its unique tag for `externalNullifier`."*
-- **`externalNullifier = H(epoch)`** where epoch = e.g. `floor(unix / 3600)`. One anonymous session per member
-  per epoch → **Sybil-resistant rate limiting with zero identity.** Reused nullifier ⇒ rejected.
+  Tree**, root maintained by a `MerkleTreeDO` (Durable Object, authoritative) and mirrored to D1. **Real as of
+  2026-07** — see [06](06-roadmap-and-risks.md)'s "Real Semaphore v4" entry: `MerkleTreeDO` runs the actual
+  LeanIMT (`@zk-kit/lean-imt` + `poseidon-lite`, used directly), byte-verified against the official circuit.
+- **Proof (Groth16):** public inputs `= (merkleRoot, nullifier, message, scope)`, in the real v4 circuit's own
+  naming (circuit-output-then-input order) — earlier drafts of this doc used v3-era names
+  (`nullifierHash`/`signalHash`/`externalNullifier`); the real circuit has no separate "hash" step for these,
+  the caller passes field elements directly. Private inputs `= (identity secret, merkle path)`. Proves: *"I
+  know the secret behind some commitment under `merkleRoot`, and `nullifier` is its unique tag for `scope`."*
+- **`scope = H(epoch)`** where epoch = e.g. `floor(unix / 3600)` — fills the same "one anonymous session per
+  member per epoch" role the older `externalNullifier` name described. Reused nullifier ⇒ rejected.
 - **Edge verification:** the Worker runs the **Groth16 verifier in WASM** and, on success, mints a short-lived
   **capability** (a MAC'd, audience-scoped token — *not* a ZK proof) valid for the epoch. **Subsequent messages
   authenticate with the cheap capability, never re-proving ZK.** This is the single most important performance

@@ -92,7 +92,9 @@ bands, not calendar promises.
   REJECT (flipped proof bit), and a `g2_coordinate_order_is_load_bearing` case proving the swapped `[c1,c0]`
   G2 ordering is rejected — i.e. the crate's `[c0,c1]` convention is the correct one. Full suite: 9/9
   (5 Phase 1 + 4 Phase 2). This validates the serialization/parse/verify pipeline and the ordering; it is a
-  structurally-equivalent mock, **not** Semaphore's real Poseidon/LeanIMT circuit.
+  structurally-equivalent mock, **not** Semaphore's real Poseidon/LeanIMT circuit. (This mock test still
+  exists and still passes — the REAL Semaphore v4 circuit test, `real_semaphore_v4_vector_verifies`, was
+  added alongside it, not in place of it; see the "Real Semaphore v4" entry further down.)
 - **Done (2026-07, "Airlock" pass — Этап 2): real `POST /oprf/issue` + DLEQ, end-to-end.** Added Chaum-Pedersen
   **DLEQ** to `oprf.rs` (`evaluate_with_dleq`/`verify_dleq` + wasm exports `oprf_evaluate_with_dleq` [128-byte
   `Z‖K‖c‖s`, unconditional/edge] and `oprf_verify_dleq` [client-full]) — proves the evaluator used the key
@@ -232,10 +234,141 @@ bands, not calendar promises.
     swap. Full browser login still needs the user's real Xfeatures OAuth creds (not tooling-drivable) — the
     RSABSSA leg itself needs independent live verification (Node probe / two-worker `wrangler dev`) since the
     OAuth leg can't be driven end-to-end here.
-- **Still open:** confirm byte-compat against **one genuine snarkjs-produced Semaphore v4 proof + its
-  ceremony VK** (needs the snarkjs toolchain — the mock proves our pipeline, not snarkjs's exact wire bytes);
-  **benchmark verify CPU in a real Worker isolate** (target <100 ms; the whole reason for not using snarkjs,
-  see R1); `wasm-opt -Oz`.
+- **Done (2026-07, "Real Semaphore v4" pass — closes R21 server-side): the mock circuit is retired for the
+  Messaging Plane's membership tree + ZK verifier.** Previously `MerkleTreeDO` computed a SHA-256-over-the-
+  list placeholder root and `/auth/session` checked every proof against one fixed, shared vector from
+  `zk_test.rs`'s mock circuit — this closes both gaps with the REAL, OFFICIAL Semaphore v4 circuit and a real
+  per-request Merkle tree.
+  - **Real circuit, not written from scratch:** the exact, unmodified `semaphore.circom` template from
+    `@semaphore-protocol/circuits` v4.14.3 (github.com/semaphore-protocol/semaphore/packages/circuits/src),
+    compiled with the real `circom 2.2.3` compiler (a prebuilt binary, no local build needed) against
+    `circomlib` + `@zk-kit/binary-merkle-root.circom`'s real includes, MAX_DEPTH=20. Confirmed circuit shape
+    empirically (not assumed): `identityCommitment = Poseidon2(Ax,Ay)` (BabyJubJub pubkey from a secret
+    scalar — Semaphore v4's actual identity scheme, NOT v3's trapdoor/nullifier pair), `nullifier =
+    Poseidon2(scope, secret)`, root via a variable-length `BinaryMerkleRoot` (confirming LeanIMT's dynamic-
+    depth property at the circuit level), `nPublic=4` in circuit-output-then-input order:
+    `[merkleRoot, nullifier, message, scope]`.
+  - **`semaphore-rs` (Worldcoin's Rust crate, the obvious-looking candidate) was investigated and REJECTED**
+    before writing any integration code: its `identity.rs` implements Semaphore v3's `{trapdoor, nullifier}`
+    scheme (not v4's single-secret EdDSA scheme our docs commit to), its `poseidon_tree.rs` is a fixed-depth
+    `MerkleTree`, not a LeanIMT, and its `build.rs` silently downloads a real trusted-setup zkey from a remote
+    URL at `cargo build` time — wrong protocol version, wrong tree structure, and a network-dependent build
+    besides. Caught by actually reading the crate's source rather than trusting its name/keywords.
+  - **Trusted setup: real circuit, TEST-ONLY setup — not PSE's production ceremony.** `snarkjs`
+    powersoftau(new→contribute→prepare phase2) + `groth16 setup` + a zkey contribution, run locally. Honest
+    scope: this proves OUR verifier/tree/wire-contract pipeline is correct against the real circuit's real
+    constraints; it does not attest to a specific mainnet ceremony's security. Swapping in PSE's published
+    ceremony VK later is a drop-in change (same byte contract, same verifier).
+  - **`MerkleTreeDO`'s `computeRoot()` now uses the REAL LeanIMT**, via the official `@zk-kit/lean-imt` +
+    `poseidon-lite` npm packages **used directly, not re-implemented** — both are pure TypeScript/BigInt, no
+    native/WASM dependency, so (unlike the RSABSSA pass) this needed ZERO Rust/WASM involvement. `commitments`/
+    `nullifiers`/`issuer_token_null` tables are unchanged, per this task's explicit scope. Parity-verified: the
+    exact same two leaves produce the exact same root via the TS module's logic and an independent Node script
+    using the same packages (expected, since both call the same library — but confirms no bug in the
+    hex↔field conversion glue). Added BN254 field-range validation on insert (reject a commitment ≥ Fr
+    modulus) so a malformed value can never later crash `computeRoot()`'s read path.
+  - **`zk.rs`'s verifier itself is UNCHANGED** — only `VK_HEX` (now real) and the public-input semantics
+    changed, proving the "reuse the verifier, don't rewrite it" design genuinely holds. Added a permanent
+    regression test, `zk_test.rs`'s `real_semaphore_v4_vector_verifies`, using a real proof/VK reconstructed
+    from the actual generated artifacts — 22/22 tests green.
+  - **`/auth/session`'s wire contract reworked for DYNAMIC public inputs:** the client now sends
+    `merkleRoot`/`nullifier`/`message`/`scope` (each real, per-request field elements) instead of relying on a
+    fixed shared vector; the Worker builds `public_inputs_bytes` from exactly what the caller sent
+    (`session.ts`'s `buildPublicInputsBytes`) and — critically — fetches MerkleTreeDO's actual CURRENT root
+    and rejects a mismatch (409) BEFORE running the expensive pairing check, closing the "valid proof against
+    a stale/replayed root" gap a fixed-vector design couldn't even express.
+  - **Verified live, full chain, both `wrangler dev` instances restarted fresh** (stale local DO storage from
+    the mock-root era was cleared first — old random hex "commitments" were never real field elements/
+    identities and could have poisoned the new real root computation): two real RSABSSA redemptions → real
+    `MerkleTreeDO` root (confirmed byte-identical to an independently-computed reference root) → a real
+    Groth16 witness+proof generated via `snarkjs.groth16.fullProve` against the real circuit for that exact
+    root/identity → `POST /auth/session` → **200 + capability**. Worker log: `[Session]
+    zk_verify_groth16_bytes -> true`. Negative controls, same live server: replay (same nullifier) → 409;
+    claimed-but-wrong `merkleRoot` → 409 (`"merkleRoot does not match the current membership tree root"`,
+    caught before verification even ran); tampered proof bytes → 401
+    (`zk_verify_groth16_bytes -> false`). `schema-lint` clean.
+  - **Deliberately NOT done in this pass (see R23):** `apps/web`'s `AuthCallback.tsx` was explicitly out of
+    scope ("не трогать UI/Security Gate") and still references the retired mock vector — the live browser
+    flow will now fail at step 5 until a follow-up wires real client-side proving (needs the circuit
+    `.wasm`+`.zkey` bundled into the web app). Flagged clearly rather than silently patched, since fixing it
+    either means building real client proving (a separate, larger task) or making a UI judgment call outside
+    this task's stated boundary. Root history/staleness tolerance (accepting a *recent* root, not only the
+    exact current one) is a reasonable future enhancement, not implemented — the simple "current root only"
+    check is correct, just less forgiving of concurrent tree growth between a client fetching a root and
+    submitting its proof.
+- **Done (2026-07, "R21-continued" pass — replaces the local test-only trusted setup with a REAL
+  multi-party ceremony VK).** The entry above intentionally used a single-party local Groth16 setup and said
+  so plainly — this pass swaps that toxic-waste-known-to-one-party VK for PSE's actual production ceremony
+  key, closing that gap.
+  - **`git grep` across all history for `*.zkey`/`*.ptau`: zero matches.** Nothing toxic-waste-bearing was
+    ever committed to this repo — the local test-only zkey generated for the original R21 pass lived only in
+    a scratchpad temp directory outside the repo and was never at risk of leaking through git history.
+  - **Official artifacts DO exist for our exact circuit (depth=20, MAX_DEPTH matching `MerkleTreeDO`)** —
+    found, not assumed: `@zk-kit/semaphore-artifacts@4.13.0` (npm, maintained by PSE, homepage
+    github.com/privacy-scaling-explorations/snark-artifacts) ships `semaphore-20.{json,wasm,zkey}` —
+    `.json` is `verification_key.json` (snarkjs export format), `nPublic=4`, `IC.length=5`, matching our
+    circuit shape exactly.
+  - **Real multi-party ceremony, not a rebrand of a single-party one.** "Semaphore V4 Ceremony 1" — a
+    Groth16 Phase 2 MPC ceremony run by PSE, 300-400+ independent contributors, finalized 2024-09-05.
+    Verified via two independent contributor attestation gists: NicoSerranoP's finalization attestation
+    (gist.github.com/NicoSerranoP/10b09d0539cb87445fee2d3d98cda96a, dated 2024-09-05, circuit
+    `semaphorev4-1`) and hw010101's attestation (gist.github.com/hw010101/cccbdf986150b96d706b935668693a0e,
+    dated 2024-06-23, contributor #291→#240 across **all 32 circuits `semaphorev4-1`..`semaphorev4-32`** —
+    confirming the ceremony covers every supported tree depth 1..32 as separate sequential circuits within
+    one coordinated event, `semaphorev4-20` being ours). As long as one of those hundreds of contributors
+    destroyed their randomness, the toxic waste is unrecoverable — the real MPC trust assumption.
+  - **File integrity checked, not assumed:** `semaphore-20.{json,wasm,zkey}` downloaded via unpkg and
+    sha256-verified byte-for-byte against the hash **npm itself** reports for that exact published file
+    (`unpkg.com/...?meta`'s `integrity` field). This confirms the download wasn't corrupted/tampered in
+    transit — it does **not** independently re-derive npm's own hash from a separate root of trust (see
+    "not independently verified" below).
+  - **A real ecosystem version-skew bug found and worked around, not papered over:** the official client
+    library `@semaphore-protocol/proof@4.11.1`'s `generateProof()` builds a witness input named
+    `merkleProofIndices` (plural — a per-level bit array, the v3-era encoding), but the actual circuit ABI
+    baked into these downloaded artifacts declares a single scalar `merkleProofIndex` (confirmed by reading
+    the current `semaphore.circom` source and by direct empirical probing — `snarkjs.groth16.fullProve`
+    rejects the plural array at every depth, accepts the scalar at exactly depth 20). Worked around by
+    driving `snarkjs` directly with the correct signal names instead of going through the stale client
+    library — not a problem with the ceremony artifacts or our own code, an upstream library/circuit drift
+    worth knowing about if this codebase ever adopts `@semaphore-protocol/proof` client-side for R23.
+  - **Validated offline first, cheaply, before touching Worker code** (same discipline as the original R21
+    pass): a real 2-leaf LeanIMT tree (two real `@semaphore-protocol/identity` identities), a real Merkle
+    proof, a real Groth16 witness+proof via `snarkjs.groth16.fullProve` against the OFFICIAL
+    `semaphore-20.wasm`/`.zkey` — `snarkjs.groth16.verify()` against the official VK: **true**. Converted to
+    `zk.rs`'s byte contract and checked natively: `zk_test.rs`'s new
+    `official_ceremony_semaphore_v4_vector_verifies` test — **arkworks accepts it**, and correctly rejects a
+    tampered public input. Full native suite: **23/23 passing** (up from 22, the one new test).
+  - **`VK_HEX` in `session.ts` swapped to the official-ceremony key** (only the constant + header comment
+    changed — `zk.rs`'s verifier, `MerkleTreeDO`'s LeanIMT logic, and the wire contract are all byte-for-byte
+    unchanged from the original R21 pass, confirming the design's VK is a drop-in swap as promised at the
+    time). `pnpm exec tsc --noEmit` clean.
+  - **Verified live, full chain, against the OFFICIAL ceremony VK — both `wrangler dev` instances restarted
+    fresh** (stale local DO storage from the earlier test-only-VK pass cleared first): two real RSABSSA
+    redemptions → real `MerkleTreeDO` insert (root confirmed byte-identical to an independently-computed
+    reference) → a real Groth16 proof generated with the **official** `semaphore-20.wasm`/`.zkey` → `POST
+    /auth/session` → **200 + capability**. Live worker log: `[Session] zk_verify_groth16_bytes -> true` (this
+    is the WASM build of `zk.rs` actually running inside the Workers runtime, not just the native `cargo
+    test` — both independently confirm acceptance). Same three negative controls as the original pass, same
+    live server: replay → 409; wrong `merkleRoot` → 409 (caught pre-pairing); tampered proof → 401
+    (`zk_verify_groth16_bytes -> false`).
+  - **What was NOT independently re-verified, said plainly:** the full ~300-400-contribution MPC transcript
+    (each intermediate contribution's hash chain, beacon computation, `p0tion` ceremony-coordinator replay)
+    was not reproduced by this pass — that is a materially heavier audit (would mean re-running PSE's own
+    ceremony-verification tooling across hundreds of recorded contributions) than downloading the published
+    end result and confirming it's structurally and cryptographically the right shape for our circuit, which
+    is what was actually done here. This is the same trust level essentially every project consuming these
+    artifacts operates at (there is no independent third-party re-audit published anywhere we found either);
+    flagging the gap rather than implying a full audit happened.
+  - **Остаточное доверие (явно, для будущего пересмотра перед продом):** Верифицированы: file integrity
+    опубликованного zkey/wasm (sha256 против npm), структурная/криптографическая корректность против нашего
+    circuit (via `zk_test.rs`), и два независимых contributor attestation (NicoSerranoP — finalizer, circuit
+    #1; hw010101 — contributor #240-291, все 32 схемы включая `semaphorev4-20`). НЕ верифицирована полная
+    транскрипт-цепочка ~300+ вкладов (hash chain между последовательными контрибуциями через p0tion/PSE
+    tooling) — известное остаточное доверие, приемлемое для текущей стадии (pre-deployment), но требующее
+    полного transcript-аудита перед прод.
+  - **Net effect on R21's risk-register status:** the "single local operator knows the toxic waste" caveat
+    from the original R21 entry is now closed. R21 remains annotated as not-fully-closed only because of
+    R23 (no real client-side proving yet) — see below.
 - **Spike remainder (de-risk):** decide trusted-setup (Groth16 ceremony) vs **transparent PLONK/Halo2** —
   still open, decide before it's load-bearing.
 - PPID sybil guard done (enrollment). `MerkleTreeDO` + nullifier one-spend done (see the "ZK airlock" entry
@@ -739,8 +872,9 @@ Severity × likelihood; **R1 is the one the brief explicitly asked about.**
 | R18 | **Nickname squatting / impersonation** | Low | Med | Registration PoW + capability; `alias_pub` signed ownership; reserved/verified namespaces; report+revoke; Key Transparency (K8) over alias→key | 3,5 |
 | R19 | **Self-doxxing** — a human-chosen public alias is a persistent identifier the *user* exposes | Low | High | Default invisible; explicit opt-in warning; recommend pairing with an ephemeral persona (K2); never auto-suggest real-name aliases | 3,4 |
 | R20 | **Session capability was in `localStorage`** — JS-readable, so any XSS or malicious extension with DOM access could trivially steal a live bearer credential authorising `/queue` etc. | High | Med | **Mitigated 2026-07** (Plane Bridge pass): moved to in-memory React state only, never persisted; reload loses the session by design. Open follow-up: a real "remember this device" UX (if ever added) needs a non-extractable key (WebCrypto non-exportable `CryptoKey` / platform keystore), not Web Storage | 2 |
-| R21 | **`/auth/session` accepts a fixed, shared valid ZK proof vector, not one generated live from the client's own Semaphore witness** — the WASM verifier is real (Groth16/BN254, 3-pairing), but every client currently presents the *same* proof; the endpoint doesn't yet bind a caller's actual membership/commitment into the public inputs it checks | High | Certain (today) | Needs the real Semaphore v4 circuit (Poseidon/LeanIMT) + a genuine per-client witness/proof, replacing the `zk_test.rs` mock vector currently hardcoded in `workers/messaging/src/session.ts`. Tracked as the largest remaining gap before the ZK airlock is production-ready — status: **open**, not started | 2 |
+| R21 | **`/auth/session` accepted a fixed, shared valid ZK proof vector, not one generated live from the client's own Semaphore witness** — the mock circuit's public inputs never changed, so every client presented the *same* proof. | High | ~~Certain~~ | **Resolved 2026-07 (server side — see docs/06's "Real Semaphore v4" and "R21-continued" entries below).** `/auth/session` now verifies a REAL Semaphore v4 proof (official circuit, real LeanIMT+Poseidon root in `MerkleTreeDO`) against public inputs built from the CALLER's own `(merkleRoot, nullifier, message, scope)`, with `merkleRoot` additionally checked against the tree's actual current root. `VK_HEX` is now the OFFICIAL PSE multi-party trusted-setup ceremony key ("Semaphore V4 Ceremony 1", 300-400+ contributors, finalized 2024-09-05) — not a local single-party test setup. Live-verified against the official artifacts: a genuinely different proof/root/nullifier per request, replay/stale-root/tampered-proof all correctly rejected, both natively (arkworks) and inside the live Workers WASM runtime. **Not independently re-verified:** the full multi-party ceremony transcript (per-contribution hash chain / beacon replay) — only the published end result's file integrity and structural/cryptographic correctness against our circuit. **Not fully closed:** see R23 — the WEB CLIENT (`AuthCallback.tsx`) does not yet generate a real proof itself, so the end-to-end browser flow is not exercised by this fix alone. | 2 |
 | R22 | **Messaging chat transport is still a one-socket-both-directions mock** — `useChatWebSocket.ts` does one `ws.send()` for both send and receive on a single `queue_id`, not `QueueDO`'s actual documented asymmetric protocol (`POST /push` HTTP for send, WS receive-only fan-out + `{type:"ack"}` for receive) | Med | Certain (today) | Reconcile the transport with `QueueDO`'s real push/ack shape once the capability-authorised queue-id scheme (per-conversation, two queues) is designed. Status: **open**, explicitly deferred out of the RSABSSA Plane Bridge pass's scope, flagged here so it isn't lost | 3 |
+| R23 | **Client (`apps/web`) does not generate a real Semaphore proof** — `AuthCallback.tsx`'s step 5 still references the retired mock-circuit vector and sends no `message`/`scope`; against the now-real `/auth/session` (R21, resolved server-side) this will fail (missing fields, and even patched, the old proof bytes won't verify against the new real VK). Real client-side proving needs the circuit `.wasm`+`.zkey` bundled into the web app and a browser proving step (docs/06 R6 territory — WASM size/perf). | High | Certain (today) | **Explicitly out of scope for the "Real Semaphore v4" pass** (server-side circuit/verifier/tree only, per that task's own scope note) — flagged here, not silently left broken, so it's picked up as its own follow-up rather than lost. Status: **open, not started**. | 2,4 |
 
 ### R1 & R2 — the ZKP↔Workers coupling, in depth (the brief's key question)
 
