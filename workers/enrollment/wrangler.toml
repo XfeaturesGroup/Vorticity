@@ -1,0 +1,27 @@
+# Enrollment Plane. See docs/04-serverless-architecture.md.
+# HARD RULE: this config may bind DB_ENROLL and nothing else that touches identity or messaging.
+# It must never gain a binding to DB_MSG, R2 media, or any Messaging-Plane Durable Object —
+# schema-lint (scripts/schema-lint.mjs) checks this file for exactly that.
+name = "vorticity-enrollment"
+main = "src/index.ts"
+compatibility_date = "2026-02-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding = "DB_ENROLL"
+database_name = "vorticity-enroll"
+database_id = "c96fdb7c-78f9-405f-8b3f-490f2e7b0148"
+
+[vars]
+# Two distinct hosts, confirmed against https://account.xfeatures.net/docs/oauth2 — resolves the
+# ambiguity noted in docs/legacy-reference/README.md. The authorize redirect is browser-side
+# (apps/web hits account.xfeatures.net/oauth/authorize directly); this Worker only ever calls the
+# API host below for the token exchange and userinfo lookup.
+IDM_API_URL = "https://auth.xfeatures.net"
+OAUTH_CLIENT_ID = "xf_9116480c21a94a849a1182717e35f335"
+OAUTH_REDIRECT_URI = "https://id.vort.xfeatures.net/oauth/callback"
+
+# OAUTH_CLIENT_SECRET, PPID_HMAC_SECRET, and ISSUER_SIGNING_KEY_PEM are real secrets — local dev
+# loads them from `.dev.vars` (gitignored; see `.dev.vars.example`), production via
+# `wrangler secret put`. NEVER add a secret-shaped value to this [vars] block — schema-lint checks
+# for exactly that pattern (var names matching /SECRET|KEY|SIGNING|PRIVATE/i).

@@ -1,0 +1,22 @@
+{
+  "name": "@vorticity/vortic-core",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "JS/WASM wrapper around the vortic-core Rust crate. See docs/03-crypto-core.md.",
+  "exports": {
+    ".": "./js/crypto.ts"
+  },
+  "scripts": {
+    "build:client": "wasm-pack build --target web --out-dir pkg/client --features client-full",
+    "build:msg": "wasm-pack build --target web --out-dir pkg/msg --no-default-features --features edge-verify-only",
+    "build:issuer": "wasm-pack build --target web --out-dir pkg/issuer --no-default-features --features edge-verify-only,issuer-full",
+    "build:edge": "wasm-pack build --target bundler --out-dir pkg/edge --no-default-features --features edge-verify-only",
+    "build": "pnpm run build:client && pnpm run build:msg && pnpm run build:issuer",
+    "test": "cargo test --features client-full,issuer-full",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2"
+  }
+}

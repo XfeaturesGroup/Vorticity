@@ -1,0 +1,9 @@
+{
+  "name": "@vorticity/mobile",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Capacitor shell around @vorticity/web. Full native scaffold deferred to Phase 4 (docs/06) — this placeholder just reserves the workspace slot and documents the plan.",
+  "scripts": {
+    "sync": "echo 'Phase 4: cap init && cap add android && cap sync' && exit 1"
+  }
+}

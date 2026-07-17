@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "vorticity-web",
+      "runtimeExecutable": "pnpm",
+      "runtimeArgs": ["--filter", "@vorticity/web", "dev"],
+      "port": 5173
+    },
+    {
+      "name": "vorticity-messaging",
+      "runtimeExecutable": "pnpm",
+      "runtimeArgs": ["--filter", "@vorticity/worker-messaging", "dev", "--", "--port", "8788"],
+      "port": 8788
+    }
+  ]
+}

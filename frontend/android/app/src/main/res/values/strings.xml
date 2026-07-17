@@ -1,7 +1,0 @@
-<?xml version='1.0' encoding='utf-8'?>
-<resources>
-    <string name="app_name">Vorticity</string>
-    <string name="title_activity_main">Vorticity</string>
-    <string name="package_name">net.xfeatures.vorticity</string>
-    <string name="custom_url_scheme">net.xfeatures.vorticity</string>
-</resources>

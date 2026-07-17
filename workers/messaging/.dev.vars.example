@@ -1,0 +1,8 @@
+# Local-dev secrets for workers/messaging. Copy this file to `.dev.vars` (gitignored) and fill in
+# real values — `wrangler dev` auto-loads `.dev.vars`; production uses `wrangler secret put` instead.
+# This must never live in wrangler.toml's [vars] — schema-lint checks for exactly that.
+
+# 32+ bytes hex — HMAC key this Worker uses to sign/verify its OWN session capabilities (/auth/session,
+# requireCapability in index.ts). This is NOT the RSABSSA issuer key — this Worker never holds that;
+# see src/issuer-keys.ts for the (public, safe-to-commit) issuer public key instead.
+SESSION_SIGNING_KEY="replace-with-a-long-random-hex-string"

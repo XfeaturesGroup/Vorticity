@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  schema-lint:
+    name: Plane-isolation gate (schema-lint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      # Deliberately dependency-free — this gate must be able to run before `pnpm install`
+      # ever succeeds, so a broken lockfile can never be the reason it didn't run.
+      - run: node scripts/schema-lint.mjs
+
+  typecheck-and-lint:
+    name: Typecheck + lint
+    runs-on: ubuntu-latest
+    needs: schema-lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "pnpm"
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run typecheck
+      - run: pnpm run lint
+
+  vortic-core:
+    name: vortic-core (client-full + edge-verify-only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo check --features client-full
+        working-directory: packages/vortic-core
+      - run: cargo check --no-default-features --features edge-verify-only
+        working-directory: packages/vortic-core

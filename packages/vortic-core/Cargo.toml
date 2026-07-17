@@ -1,0 +1,101 @@
+[package]
+name = "vortic-core"
+version = "0.0.0"
+edition = "2021"
+description = "Vorticity cryptographic core — compiled once, run on client (full) and edge (verify-only)."
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# Default: full client build — proving, encryption, decryption, ratchet state, all of it.
+default = ["client-full"]
+client-full = [
+    "dep:ml-kem",
+    "dep:x25519-dalek",
+    "dep:kem",
+    "dep:chacha20poly1305",
+    "dep:base64",
+    "dep:getrandom",
+]
+# Edge builds (Cloudflare Workers) must be able to compile WITHOUT linking any decryption or
+# proving code — this is the crate-level enforcement of docs/03 crypto invariant #4 ("the edge
+# only ever *verifies* ... and holds no decryption keys, ever"). `cargo build --no-default-features
+# --features edge-verify-only` must succeed and the resulting binary must contain no ratchet/KEM
+# decrypt, no MLS decrypt, no OPRF blind-side, and no Groth16 *prover* — verifier-only.
+edge-verify-only = []
+# Additive: enables the RSA blind-signature ISSUER operation (`blind_sig::blindsig_sign`, which needs
+# the issuer's RSA private key) and offline keypair generation. This is deliberately a THIRD,
+# orthogonal feature — not folded into `client-full` (a client never signs) and not part of
+# `edge-verify-only`'s default set (the Messaging Plane's WASM build must never even COMPILE the
+# secret-key-handling code, not just "not call it" — see blind_sig.rs's module doc for why this is
+# stricter than the existing `oprf::evaluate` precedent). Only `workers/enrollment` enables this,
+# combined with `edge-verify-only` (it needs no ml-kem/AEAD/client machinery either).
+issuer-full = []
+
+[dependencies]
+wasm-bindgen = "0.2"
+zeroize = { version = "1", features = ["derive"] }
+# Always-compiled (both profiles): util.rs (HKDF), and oprf::evaluate / future ring::verify need
+# Ristretto point arithmetic even on edge-verify-only — see oprf.rs's doc comment for why that's
+# safe (evaluate needs a secret key the Messaging Plane never holds; it isn't decryption).
+sha2 = "0.11.0"
+hkdf = "0.13.0"
+curve25519-dalek = "5.0.0"
+
+# Always-compiled in BOTH profiles: the Groth16/BN254 verifier (zk.rs). Verification is safe on the
+# edge — it holds no secret and decrypts nothing (docs/03 invariant #4) — so these are unconditional
+# deps, not optional. `default-features = false` pulls arkworks in no_std + alloc mode, which links
+# cleanly into this std crate and, critically, compiles for wasm32-unknown-unknown without the
+# `parallel`/rayon or `std` features (verification is deterministic — no RNG, no getrandom backend).
+ark-bn254 = { version = "0.6.0", default-features = false, features = ["curve"] }
+ark-ff = { version = "0.6.0", default-features = false }
+ark-groth16 = { version = "0.6.0", default-features = false }
+
+# Always-compiled in BOTH profiles: RSA blind signatures (RFC 9474 / RSABSSA), the Plane Bridge
+# replacing VOPRF for the enrollment<->messaging redemption token (see blind_sig.rs). `verify()` needs
+# no secret and must run on the edge (messaging), so this crate itself is unconditional — same
+# reasoning as ark-bn254/ark-groth16 above. `default-features = false` drops its `serde` feature
+# (unneeded; we hand-roll the wasm-bindgen byte contract like every other module here).
+blind-rsa-signatures = { version = "0.17.2", default-features = false }
+# blind-rsa-signatures pulls `rand 0.10` -> `getrandom 0.4` transitively (a DIFFERENT major version
+# than the `getrandom 0.2` below, which symmetric.rs's nonce uses — Cargo resolves both as distinct
+# crate instances; aliasing avoids a `[dependencies.getrandom]` key collision in this file). The
+# "wasm_js" feature must be turned on for that 0.4.x instance or `wasm32-unknown-unknown` fails to
+# compile at all (getrandom 0.4 has a hard `compile_error!` otherwise) — verified via a scratch probe
+# crate before adding this dependency for real. Needed even for verify-only builds: the whole
+# blind-rsa-signatures crate (and its `rand`/`getrandom` deps) is linked regardless of which of its
+# functions get called, so this feature must be on unconditionally, not gated to issuer-full/client-full.
+getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+
+# client-full only: key generation, encapsulation/decapsulation, blinding. Optional so a
+# `--no-default-features --features edge-verify-only` build never links them. Both ml-kem's
+# from_seed/encapsulate_deterministic and x25519-dalek's StaticSecret::from(bytes) are fully
+# deterministic given caller-supplied entropy, so no RNG crate (rand_core/rand_chacha) or
+# `getrandom` WASM backend is needed anywhere in this crate.
+ml-kem = { version = "0.3.2", optional = true }
+x25519-dalek = { version = "3.0.0", optional = true, features = ["static_secrets"] }
+kem = { version = "0.3.0", optional = true }
+
+# client-full only: real symmetric AEAD (Phase 1). ChaCha20-Poly1305 is a good WASM target — pure
+# software, no AES-NI dependency, constant-time. `default-features = false` + `alloc` gives the Vec
+# `Aead` API without pulling the crate's own `getrandom`/rand wiring; the 12-byte nonce is filled by
+# `getrandom` directly (feature "js" selects the browser `crypto.getRandomValues` backend on
+# wasm32-unknown-unknown; on native targets the feature is inert and the OS backend is used, so
+# `cargo test --features client-full` still builds). base64 encodes nonce||ciphertext||tag for the wire.
+chacha20poly1305 = { version = "0.10", optional = true, default-features = false, features = ["alloc"] }
+base64 = { version = "0.22", optional = true }
+getrandom = { version = "0.2", optional = true, features = ["js"] }
+
+[dev-dependencies]
+ark-relations = { version = "0.6.0", default-features = false }
+ark-snark = { version = "0.6.0", default-features = false }
+ark-std = "0.6.0"
+wasm-bindgen-test = "0.3"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"

@@ -1,0 +1,20 @@
+# Local-dev secrets for workers/enrollment. Copy this file to `.dev.vars` (gitignored) and fill in
+# real values — `wrangler dev` auto-loads `.dev.vars`; production uses `wrangler secret put` instead.
+# None of these may ever live in wrangler.toml's [vars] — schema-lint checks for exactly that.
+
+# Xfeatures Account OAuth2 client secret (token exchange). Get from the Xfeatures developer console.
+OAUTH_CLIENT_SECRET="replace-with-real-oauth-client-secret"
+
+# 32+ random bytes, hex or any string — HMAC key for PPID = HMAC(secret, oauth_sub). Rotating this
+# invalidates every existing PPID's sybil-guard history; treat like a signing key, not a config value.
+PPID_HMAC_SECRET="replace-with-a-long-random-string"
+
+# RSA-3072 PRIVATE key (PKCS#8 PEM) for the RSABSSA Plane Bridge issuer (see
+# packages/vortic-core/src/blind_sig.rs). Generate a real keypair with:
+#   cargo run --release --example rsabssa_keygen --no-default-features --features issuer-full
+# (run from packages/vortic-core). Paste the printed "sk_issuer" PEM below; paste the matching
+# "pk_issuer" PEM into workers/messaging/src/issuer-keys.ts (that half is PUBLIC, safe to commit).
+# NEVER commit a real value for this key — it is the entire RSABSSA bridge's secret.
+ISSUER_SIGNING_KEY_PEM="-----BEGIN PRIVATE KEY-----
+replace-with-a-real-PKCS8-PEM-private-key
+-----END PRIVATE KEY-----"

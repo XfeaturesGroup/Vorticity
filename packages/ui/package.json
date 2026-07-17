@@ -1,0 +1,33 @@
+{
+  "name": "@vorticity/ui",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Vorticity shared design system — tokens + primitives inherited from Xfeatures HQ + Xfeatures Web.",
+  "sideEffects": [
+    "*.css"
+  ],
+  "exports": {
+    ".": "./src/index.ts",
+    "./theme.css": "./src/styles/theme.css"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "dependencies": {
+    "clsx": "^2.1.1",
+    "tailwind-merge": "^3.6.0",
+    "framer-motion": "^12.42.2",
+    "lucide-react": "^1.23.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "tailwindcss": "^4.3.2",
+    "typescript": "^5.7.2"
+  }
+}

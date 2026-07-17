@@ -1,8 +1,0 @@
-{
-  "appId": "net.xfeatures.vorticity",
-  "appName": "Vorticity",
-  "webDir": "dist",
-  "server": {
-    "url": "https://vort.xfeatures.net"
-  }
-}

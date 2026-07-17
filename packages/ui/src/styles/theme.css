@@ -1,0 +1,156 @@
+/*
+ * Vorticity design tokens.
+ * Inherited from two ecosystem sources — NOT invented here:
+ *   - Xfeatures HQ  (xfeatures-hq-web): obsidian scale, "fluid" accent gradient, shadow-glass,
+ *     the house motion ease, and the only real componentized primitives in either kit.
+ *   - Xfeatures Web (xfeatures-web):    dark-only canvas discipline, global noise/grain overlay,
+ *     JetBrains Mono as the third type family, hairline-border card language.
+ * Divergences between the two sources were resolved as follows (see docs/07-ui-design-system.md
+ * for the full rationale):
+ *   - Tailwind v4 (@theme, no config file) chosen over Web's v3 — HQ is the more current setup.
+ *   - Roboto Flex / Playfair Display / JetBrains Mono chosen as the canonical trio: it is the
+ *     *configured* pair in both kits' theme declarations. Web's index.html currently loads a
+ *     different experimental pair (Newsreader/Switzer) via a live A/B "FontSwitcher" dev toggle —
+ *     that is explicitly in-flux, not a settled brand decision, so it is not inherited.
+ *   - `--shadow-edge-lit` and `--shadow-focus-ring` were referenced by HQ's Button/Input but never
+ *     defined anywhere (a real gap in the source kit). They are defined properly below instead of
+ *     propagating the bug.
+ *   - HQ's Modal.tsx used a raw `bg-[#111]` instead of the obsidian scale or the glass pattern used
+ *     everywhere else in the same kit. Fixed in packages/ui/src/primitives/Modal.tsx to use tokens.
+ *
+ * NOTE ON CONSUMPTION: `@import "tailwindcss"` lives HERE (not in each consumer) because
+ * @tailwindcss/vite transforms every CSS file that reaches it through Vite's module graph, and an
+ * `@apply`-using file (see the base layer below) needs Tailwind's context bootstrapped in itself,
+ * not just inherited textually from whatever imports it — an app-level `@import "@vorticity/ui/
+ * theme.css";` alone is NOT enough. The `@source` lines below are what make each package's own
+ * class usage actually get scanned. New consumers (e.g. apps/mobile once Phase 4 gives it real
+ * source) must add their own line here.
+ *
+ * `../` (this file lives in packages/ui/src/styles/, so `../` reaches packages/ui/src/ — where the
+ * actual primitives/lib code is) is listed EXPLICITLY rather than relied on implicitly, even though
+ * Tailwind's automatic detection is documented to root at the nearest package.json to this file
+ * (i.e. packages/ui itself, which should cover this same directory automatically). Confirmed live:
+ * whatever that implicit rooting was actually scanning, it silently missed at least one class
+ * (`pointer-events-none` in NoiseOverlay.tsx) while sibling classes in the SAME className string
+ * (`absolute`, `inset-0`) kept working — because those happened to *also* be used directly in
+ * apps/web/src, masking the gap. `pointer-events-none` wasn't used anywhere outside packages/ui, so
+ * it was the one class that exposed it. (First attempt at this explicit fix used `@source "./"` —
+ * wrong, since "." resolves to this file's own directory, `styles/`, which has no source files in
+ * it at all; the actual code lives one level up, hence `../`.)
+ */
+@import "tailwindcss";
+
+@source "../";
+@source "../../../../apps/web/src";
+
+@theme {
+  /* Type */
+  --font-sans: "Roboto Flex", sans-serif;
+  --font-serif: "Playfair Display", serif;
+  --font-mono: "JetBrains Mono", monospace;
+
+  --tracking-tighter: -0.04em;
+  --tracking-tight: -0.02em;
+  --tracking-widest: 0.08em;
+
+  /* Surface scale — canonical replacement for both kits' ad hoc black hex literals
+     (HQ: obsidian-900/800/700; Web: #000/#030303/#050505/#0a0a0a/#020202, unnamed) */
+  --color-obsidian-950: #000000;
+  --color-obsidian-900: #070709;
+  --color-obsidian-800: #0d0d12;
+  --color-obsidian-700: #14141a;
+  --color-obsidian-600: #1c1c24;
+
+  /* Brand accent — HQ's "fluid" gradient family. Chosen over Web's plain orange/red as
+     Vorticity's primary identity because HQ is the account/security-facing product and this
+     is the richer, already-established accent for that context (see docs/07). */
+  --color-fluid-peach: #f4983b;
+  --color-fluid-purple: #8a2be2;
+  --color-fluid-magenta: #ff003c;
+  --color-fluid-pink: #ff00a0;
+
+  /* Semantic (Security Gate scoring, safety-number states, PoW/verification feedback) —
+     neither kit defines these; using stock Tailwind hues to avoid inventing new brand colors,
+     matching Web's convention of falling back to stock palette values when no token exists. */
+  --color-signal-danger: var(--color-fluid-pink);
+  --color-signal-warning: var(--color-fluid-peach);
+  --color-signal-success: oklch(0.72 0.19 149); /* ~emerald-500 */
+  --color-signal-info: oklch(0.71 0.14 254); /* ~blue-500 */
+
+  --background-image-glass-border: linear-gradient(
+    135deg,
+    rgba(255, 255, 255, 0.15) 0%,
+    rgba(255, 255, 255, 0) 100%
+  );
+
+  /* Elevation */
+  --shadow-glass: 0 8px 32px 0 rgba(0, 0, 0, 0.4), inset 0 1px 1px 0 rgba(255, 255, 255, 0.1),
+    inset 0 -1px 1px 0 rgba(255, 255, 255, 0.05);
+  --shadow-glass-hover: 0 8px 32px 0 rgba(0, 0, 0, 0.6), inset 0 1px 2px 0 rgba(255, 255, 255, 0.2),
+    inset 0 -1px 1px 0 rgba(255, 255, 255, 0.1);
+  /* Previously referenced by HQ's Button/Input but never defined anywhere in that kit — defined
+     here for real, following the same construction pattern as shadow-glass-hover. */
+  --shadow-edge-lit: 0 0 0 1px rgba(255, 255, 255, 0.25), 0 8px 24px -4px rgba(255, 255, 255, 0.08);
+  --shadow-focus-ring: 0 0 0 1px var(--color-fluid-peach), 0 0 0 4px rgba(244, 152, 59, 0.2);
+  --shadow-neon-glow: 0 0 15px rgba(0, 240, 255, 0.5), inset 0 0 10px rgba(0, 240, 255, 0.3);
+
+  --blur-liquid: 20px;
+
+  /* Motion — the house ease appears identically across both kits' framer-motion usage
+     (Button hold-transition, GlassPanel entrance, PageTransition fades). */
+  --ease-house: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@layer base {
+  body {
+    @apply bg-black text-white antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  ::selection {
+    @apply bg-fluid-peach/30 text-fluid-peach;
+  }
+  ::-webkit-scrollbar {
+    width: 0px;
+    background: transparent;
+  }
+}
+
+@layer components {
+  /* Opt-in thin scrollbar for internal scrollable panels (both kits had this, slightly differently
+     tuned — merged here as one utility). */
+  .vx-scrollbar::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  .vx-scrollbar::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .vx-scrollbar::-webkit-scrollbar-thumb {
+    background: var(--color-obsidian-600);
+    border-radius: 10px;
+  }
+  .vx-scrollbar::-webkit-scrollbar-thumb:hover {
+    background: var(--color-fluid-peach);
+  }
+
+  /* Hover-focus "dim siblings" interaction from HQ's Sidebar (glass-dimmable/focus-card) */
+  .vx-glass-dimmable,
+  .vx-focus-card {
+    transition: all 0.5s var(--ease-house);
+    transform: translateZ(0);
+    will-change: transform, opacity, filter;
+  }
+  @media (hover: hover) {
+    body:has(.vx-focus-card:hover) .vx-glass-dimmable,
+    body:has(.vx-focus-card:hover) .vx-focus-card:not(:hover) {
+      opacity: 0.15;
+      filter: blur(8px);
+      transform: scale(0.98);
+      pointer-events: none;
+    }
+    body:has(.vx-focus-card:hover) .vx-focus-card:hover {
+      z-index: 50;
+      transform: scale(1.02);
+    }
+  }
+}

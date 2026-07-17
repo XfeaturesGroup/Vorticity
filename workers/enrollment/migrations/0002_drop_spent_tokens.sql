@@ -1,0 +1,14 @@
+-- Bugfix (2026-07, Plane Bridge / RSABSSA pass): `spent_tokens` was dead schema that contradicted
+-- docs/04 Flow 1's own diagram, which has always shown the spend-nullifier check happening in the
+-- MESSAGING plane (`M->>M: verify token · check spend-nullifier · LeanIMT.insert`), not here. No
+-- code in this Worker ever wrote to this table — the only real write this Worker makes is the
+-- `enroll_ppid` upsert in `/oauth/callback`. Keeping it in DB_ENROLL implied Enrollment must
+-- participate in every redemption (a runtime Enrollment<->Messaging coupling on the hot path), which
+-- is exactly the timing/IP-correlation risk docs/03 §2 flags as a residual risk to minimize, not
+-- something to build into the schema. The real redemption-token replay guard now lives in DB_MSG's
+-- `issuer_token_null` (see workers/messaging/migrations/0002_issuer_token_null.sql) and
+-- MerkleTreeDO, matching the diagram that was always correct.
+--
+-- Migrations are append-only (never edit an already-applied file) — this DROPs the table rather
+-- than editing 0001_init.sql, consistent with the DO-migration convention this repo already follows.
+DROP TABLE IF EXISTS spent_tokens;

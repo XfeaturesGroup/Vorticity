@@ -1,0 +1,24 @@
+{
+  "name": "vorticity",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Xfeatures — Vorticity: closed, metadata-hostile E2EE messenger. See docs/README.md.",
+  "packageManager": "pnpm@9.15.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "pnpm -r --if-present run build",
+    "dev:web": "pnpm --filter @vorticity/web dev",
+    "dev:enrollment": "pnpm --filter @vorticity/worker-enrollment dev",
+    "dev:messaging": "pnpm --filter @vorticity/worker-messaging dev",
+    "typecheck": "pnpm -r --if-present run typecheck",
+    "lint": "pnpm -r --if-present run lint",
+    "test": "pnpm -r --if-present run test",
+    "schema-lint": "node scripts/schema-lint.mjs",
+    "ci": "pnpm run schema-lint && pnpm run typecheck && pnpm run lint && pnpm run test"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2"
+  }
+}
