@@ -132,6 +132,13 @@ encapsulation keys** (Kyber prekeys), all rotated.
 - Classical DH ratchet (X25519) → **post-compromise security**.
 - **Sparse Post-Quantum Ratchet**: chunked ML-KEM public keys / encapsulations amortized across message headers
   (a full ML-KEM key is too big per message), periodically re-mixing PQ entropy into the root → **PQ PCS**.
+  **Implemented scope (2026-07, `ratchet.rs`, see docs/06 R24):** the remix folds into the *chain key* of the
+  specific message that carries the ML-KEM ciphertext, not into the shared root key — an async offer/response
+  can't be reliably paired to the same DH-ratchet turn on both peers (a real symmetry bug during
+  implementation proved this), so a provably-symmetric chain-level fold replaced the literal root-level one.
+  **Practical effect: PQ entropy refreshes on a slower/decoupled cadence than the classical DH ratchet's own
+  PCS** — a remix protects the chain segment it lands in, not automatically every later chain, until an
+  ordinary DH turn re-derives fresh randomness on its own.
 
 Result: FS + PCS + PQ, degrading gracefully — breaking classical *or* quantum alone never fully compromises.
 Implementation: fork/bind `libsignal` PQXDH + our SPQR module, or port to `vortic-core`.

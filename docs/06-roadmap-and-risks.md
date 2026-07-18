@@ -67,9 +67,14 @@ bands, not calendar promises.
   and a message round-tripped through real ChaCha under it. Honest gaps: unauthenticated DH (MITM-able on first
   contact — needs signed prekeys), no PQ leg in the handshake yet (ml-kem exists but isn't wired into it), no
   ratchet/forward-secrecy. cargo tests: 16 (adds X25519 agreement + wrong-key rejection).
-- **Still to implement:** **PQXDH** session-establishment framing around the hybrid KEM, **Triple Ratchet**
-  (start from libsignal PQXDH + SPQR module), **MLS** wrapper (`mls-rs`), **bLSAG ring sigs**,
-  **Argon2id/BIP39 backup**. VOPRF DLEQ proof (Phase 2 spike, per docs/03 §2).
+- **Done (2026-07, "R24: real Triple Ratchet" pass) — closes R24, the last "unauthenticated DH, no
+  ratchet" gap R22's own entry flagged as separate/deferred work.** See the risk-register R24 row and
+  the full write-up further down (Phase 3's "R24: real Triple Ratchet" entry) for the design, the two
+  real symmetry bugs found and fixed while building the Sparse PQ Ratchet, and live-verification
+  results — the crypto-core module itself (`ratchet.rs`) lives here in Phase 1's scope; kept the
+  detailed write-up in one place rather than duplicating it across two phase sections.
+- **Still to implement:** **MLS** wrapper (`mls-rs`), **bLSAG ring sigs**, **Argon2id/BIP39 backup**.
+  VOPRF DLEQ proof (Phase 2 spike, per docs/03 §2).
 - WASM boundary fuzzing + NIST ML-KEM KATs; constant-time & `zeroize` audit — deferred (explicitly out of
   scope for this pass; current tests are correctness-only, not fuzz/side-channel hardened).
 - **Exit:** interop tests green (two clients ratchet PQ messages, form an MLS group, rotate epochs); backup
@@ -633,13 +638,94 @@ bands, not calendar promises.
   - **Net effect:** R22 closed as a transport-correctness risk. Explicitly NOT claiming Flow 5/6 (contact
     establishment / real queue-id provisioning) or the ratchet/PQXDH work are done — those remain open,
     separate, and larger.
+- **Done (2026-07, "R24: real Triple Ratchet" pass) — closes R24: the unauthenticated, non-ratcheting
+  X25519 DH that R22's own entry flagged and deferred is now gone.** Highest priority per this pass's
+  own framing: a direct gap against docs/02's G1-G4 (confidentiality, forward secrecy, post-compromise
+  security, PQ) sitting in the one transport R22 just finished making real.
+  - **Audited before assuming anything was ready:** `kem.rs` already had real hybrid ML-KEM-768+X25519
+    encapsulate/decapsulate and `symmetric.rs` had real ChaCha20-Poly1305 — both usable as-is.
+    `ratchet.rs` was a literal `todo!()` stub; no Ed25519 identity/signing module existed anywhere in
+    the crate. Nothing was assumed "basically done" without checking the actual code.
+  - **PQXDH-style authenticated handshake:** new `ed25519-dalek` dependency (deterministic signing,
+    no RNG needed, consistent with the crate's existing seed-threading convention). A responder
+    ("Bob") publishes a hybrid KEM prekey bundle (`kem::HybridPublicKey`) *signed* by a long-term
+    Ed25519 identity key; an initiator ("Alice") verifies that signature BEFORE doing anything else —
+    `RatchetSession::handshakeInitiate` returns an `Err` outright on a bad/wrong-key signature
+    (unit-tested: `handshake_rejects_bad_signature`). This is what makes it authenticated rather than
+    bare DH: an attacker without Bob's identity signing key cannot get a substituted bundle accepted.
+    (Not solved, same as Signal's own model: verifying a `verifying_key` really belongs to the expected
+    peer the first time is a separate out-of-band UX problem, not addressed here.)
+  - **Real Double Ratchet:** standard Signal algorithm — symmetric-key ratchet (HKDF hash chain,
+    advances every message, forward secrecy) + DH ratchet (fresh X25519 keypair each time the sender
+    direction flips, post-compromise security), including a bounded (`MAX_SKIP=25`) skipped-message-key
+    cache for legitimate out-of-order delivery and an explicit rejection of replayed/already-consumed
+    sequence numbers (rather than silently deriving a wrong key).
+  - **Sparse PQ Ratchet — two real symmetry bugs found and fixed while building it, not glossed over:**
+    the design periodically offers a fresh ML-KEM-768 keypair in a message header; the peer
+    encapsulates to it and attaches the ciphertext to its own next new-chain message.
+    1. **First bug:** a single `pending_pq_ss` slot got clobbered when a side both received an answer
+       to its own earlier offer AND had to answer the peer's offer before the first value was ever
+       consumed — caught by a live-alternating-senders test failing with a decryption error, not by
+       inspection.
+    2. **Second, deeper bug, found fixing the first:** mixing the ML-KEM secret into `state.rk`
+       (the shared root key) at each side's own *next* DH ratchet turn assumed the two turns are
+       paired 1:1 across peers — true for the plain DH ratchet, but an asynchronous PQ offer/response
+       is NOT guaranteed to land on paired turns, so this **desynced every later turn's root-key
+       salt** and broke the whole session, not just the PQ remix. Root-caused (not worked around):
+       `state.rk` is a purely local value whose bitwise snapshots are never meant to match the peer's
+       except at specific *paired* `kdf_rk` call-sites; touching it anywhere else breaks that.
+       **Fix:** mix the PQ secret into the CHAIN key only, at the exact `n == 0` message that carries
+       the ciphertext — both sides are, by construction, processing the *same wire message*, so no
+       cross-message turn-pairing is needed. This is a real, working, but intentionally *narrower*
+       property than a literal "into the root for every future chain" reading of docs/03 §4 — it
+       strengthens the chain segment the remix lands in, on top of the DH ratchet's own already-proven
+       per-turn PCS, not a permanent root-level fold. Documented in `ratchet.rs`'s module doc as a
+       known, deliberate simplification, including *why* the more literal design doesn't work without
+       a different synchronization primitive.
+  - **6/6 ratchet unit tests, full crate suite 29/29:** handshake signature rejection; bidirectional
+    round-trip; distinct ciphertext for identical repeated plaintext (proves per-message key rotation,
+    not just "different sender"); forward secrecy (a consumed message key cannot be recovered from
+    later state — the exact bug class the two fixes above were about); out-of-order delivery via the
+    skipped-key cache; and the Sparse PQ Ratchet actually incrementing its remix counter after enough
+    alternating turns (not just present-but-inert code). Both build profiles checked: `edge-verify-only`
+    compiles clean with `ratchet.rs` entirely absent (module now gated `#[cfg(feature = "client-full")]`
+    at `lib.rs`, matching `kem`/`symmetric` — crypto invariant #4).
+  - **`apps/web` wiring:** `useQueueTransport.ts`'s flat X25519 handshake is GONE, no fallback kept.
+    New envelope pair `prekey_offer`/`session_init` (PQXDH is one-sided, unlike the old symmetric DH
+    swap) maps directly onto the existing `role` stand-in from R22: "responder" publishes a signed
+    bundle once per chat mount, "initiator" answers with the KEM ciphertext. From then on, `message`
+    envelopes carry `RatchetSession.encryptMessage`/`decryptMessage`'s own header+ciphertext framing.
+    **Honestly scoped:** identity + prekey material is generated fresh per mount, not persisted to
+    device storage or published to any directory service — real long-term identity persistence and a
+    `PrekeyDO` (docs/03 §4) are separate, not-yet-built infrastructure; this pass replaced the key-
+    exchange cryptography, not identity/prekey distribution (same honesty standard as R22's `role`
+    stand-in for Flow 5/6).
+  - **Live-verified against a real `wrangler dev` QueueDO, not just unit-tested:** a real capability
+    minted via the full RSABSSA+official-ceremony-Semaphore chain, then Alice/Bob complete the real
+    PQXDH handshake over real `prekey_offer`/`session_init` pushes, exchange 4 real alternating
+    messages (all decrypt correctly), and: **key-rotation proof** — Alice sends literally "same text"
+    twice; the two wire frames are provably distinct (not just "probably", diffed byte-for-byte) despite
+    identical plaintext, confirming the message key rotates every message, not just per sender.
+    **Forward-secrecy proof, live** — Alice's FIRST captured wire message replayed against Bob's
+    NOW-ADVANCED session correctly throws (`decryption failed`), confirming the old message key is
+    genuinely gone from current state, not just untested. `PQ_REMIX_EVERY_N_TURNS=3` is a small
+    constant chosen for testability (docs/03 only requires "periodic"); the live 4-message run didn't
+    reach a remix (expected, tuning note left in `ratchet.rs`), covered separately by the unit test
+    that runs enough alternating turns to observe one.
+  - **Net effect:** R24 closed as a crypto-correctness risk for 1:1 messaging. Explicitly NOT claiming:
+    MLS/group ratcheting (separate, Phase 1 "still to implement"), a `PrekeyDO`/identity-persistence
+    service (Flow 5/6-adjacent, not built), or a literal root-level (vs. chain-level) PQ remix — all
+    said plainly above, not discovered later.
 - **Still open:** `PresenceDO`. `@cloudflare/actors` fan-out for anything beyond
   single-DO WS (not yet needed — every DO so far handles its own fan-out directly). R2 presigned
   chunked-AES-GCM media path. Alias adaptive/per-target PoW difficulty, Argon2id hardened option, signed
   update/revoke (would need `alias_pub` back out as a plaintext column), approval-gated contact-request flow
   through the resolved `intro_queue_id`, `H(nickname)`-prefix sharding. Real per-user queue-id provisioning
-  (Flow 5/6 contact establishment) — the "R22: real transport" pass above fixed the transport primitive but
-  still relies on an explicit `role` stand-in, not real contact-driven queue assignment.
+  (Flow 5/6 contact establishment) — the "R22: real transport" pass fixed the transport primitive and "R24:
+  real Triple Ratchet" fixed the crypto, but both still rely on an explicit `role` stand-in, not real
+  contact-driven queue/identity assignment. A real `PrekeyDO`/identity-persistence service for the ratchet
+  handshake (docs/03 §4) — R24 generates fresh identity/prekey material per mount, not persisted or
+  published anywhere.
 - **Exit:** two devices exchange 1:1 + group messages + media offline/online; **Metadata Diagnostics (K5)**
   shows only opaque IDs/ciphertext; an opt-in `@alias` registers, resolves under PoW, and bootstraps a contact
   with **owner approval** — while a raw `AliasDO` dump yields no readable nickname→identity link and no
@@ -1043,6 +1129,7 @@ Severity × likelihood; **R1 is the one the brief explicitly asked about.**
 | **R21** | **`/auth/session` accepted a fixed, shared valid ZK proof vector, not one generated live from the client's own Semaphore witness** — the mock circuit's public inputs never changed, so every client presented the *same* proof. | High | Closed | **Resolved 2026-07 (server side — see docs/06's "Real Semaphore v4" and "R21-continued" entries below).** `/auth/session` now verifies a REAL Semaphore v4 proof (official circuit, real LeanIMT+Poseidon root in `MerkleTreeDO`) against public inputs built from the CALLER's own `(merkleRoot, nullifier, message, scope)`, with `merkleRoot` additionally checked against the tree's actual current root. `VK_HEX` is now the OFFICIAL PSE multi-party trusted-setup ceremony key ("Semaphore V4 Ceremony 1", 300-400+ contributors, finalized 2024-09-05) — not a local single-party test setup. Live-verified against the official artifacts: a genuinely different proof/root/nullifier per request, replay/stale-root/tampered-proof all correctly rejected, both natively (arkworks) and inside the live Workers WASM runtime. **Not independently re-verified:** the full multi-party ceremony transcript (per-contribution hash chain / beacon replay) — only the published end result's file integrity and structural/cryptographic correctness against our circuit. | 2 |
 | **R22** | **Messaging chat transport is still a one-socket-both-directions mock** — `useChatWebSocket.ts` does one `ws.send()` for both send and receive on a single `queue_id`, not `QueueDO`'s actual documented asymmetric protocol (`POST /push` HTTP for send, WS receive-only fan-out + `{type:"ack"}` for receive) | Med | Closed | **Resolved 2026-07** (see the "R22: real transport" entry below). `useChatWebSocket.ts` deleted outright, no fallback path; the real `useQueueTransport.ts` uses the documented `POST /push` + WS-receive + `{type:"ack"}` protocol over two real unidirectional queues, plus Sealed Sender++ receipts (padded/delayed/decoupled — docs/01, docs/README #5) and real `ConvLogDO` multi-device sync (a genuine WS-hibernation gap in `ConvLogDO` found and fixed in the same pass). Live-verified: real bidirectional 1:1 delivery + receipts through `QueueDO`, and 3-device `ConvLogDO` fan-out (2 live + 1 backlog-on-connect), all against a live `wrangler dev`, zero mocking. **Not fully closed as a PRODUCT feature** — see the entry below for the honest remaining gap (real per-user queue-id provisioning / contact establishment, Flow 5/6, still doesn't exist; this pass fixed the transport primitive, not that separate system). | 3 |
 | **R23** | **Client (`apps/web`) does not generate a real Semaphore proof** — `AuthCallback.tsx`'s step 5 still references the retired mock-circuit vector and sends no `message`/`scope`; against the now-real `/auth/session` (R21, resolved server-side) this will fail (missing fields, and even patched, the old proof bytes won't verify against the new real VK). Real client-side proving needs the circuit `.wasm`+`.zkey` bundled into the web app and a browser proving step (docs/06 R6 territory — WASM size/perf). | High | Closed | **Fully Resolved 2026-07** (see the "R23: real client-side proving" and "R23 follow-up: MerkleTreeDO /proof/:commitment" entries below). `AuthCallback.tsx` generates a real Groth16 proof in-browser via `snarkjs` against the official ceremony `semaphore-20.wasm`/`.zkey`, fetching its own real Merkle proof from `MerkleTreeDO`'s new `GET /proof/:commitment` — works for a tree of ANY size, not just the sole-member case the first sub-pass shipped. Live-verified with TWO real identities, proof requested for the non-first member specifically (the key regression check): both authenticate successfully (`zk_verify_groth16_bytes -> true`, capability minted for both). | 2,4 |
+| **R24** | **1:1 message transport (R22, resolved) still ran on unauthenticated, non-ratcheting X25519 DH** — a bare ephemeral key swap with no signed prekeys (MITM-able on first contact) and no ratchet at all (one static session key for the whole chat, so a single key compromise exposes every message, past and future) — a direct gap against docs/02's G1-G4 (confidentiality, forward secrecy, post-compromise security, PQ). | High | Closed | **Resolved 2026-07** (see the "R24: real Triple Ratchet" entries in both Phase 1 and Phase 3 below). Real PQXDH-style handshake (Ed25519-signed hybrid ML-KEM-768+X25519 prekey bundle, rejects an unsigned/wrong-key bundle outright) + real Double Ratchet (per-message forward secrecy, DH-turn post-compromise security) + Sparse PQ Ratchet (periodic ML-KEM remix, chain-scoped — see the entry for why root-scoped hit a real symmetry bug and was descoped honestly). `useQueueTransport.ts`'s flat DH deleted, no fallback. Live-verified over a real `wrangler dev` QueueDO: PQXDH handshake, 4 alternating messages, key-rotation proof (identical plaintext → provably distinct ciphertext), and forward-secrecy proof (replaying an old captured message against the receiver's advanced session correctly fails). **Not claiming:** MLS/group ratcheting, a real `PrekeyDO`/identity-persistence service (still a `role`-style stand-in, same honesty standard as R22), or literal root-level (vs. chain-level) PQ propagation. | 1,3 |
 
 ### R1 & R2 — the ZKP↔Workers coupling, in depth (the brief's key question)
 
