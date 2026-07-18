@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@semaphore-protocol/identity": "^4.11.1",
+    "@vorticity/ohttp": "workspace:*",
     "@vorticity/ui": "workspace:*",
     "@vorticity/vortic-core": "workspace:*",
     "lucide-react": "^1.23.0",

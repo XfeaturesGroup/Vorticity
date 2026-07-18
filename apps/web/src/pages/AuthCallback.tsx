@@ -44,6 +44,7 @@ import { useAuth } from "../contexts/AuthContext";
 import { PKCE_VERIFIER_KEY } from "../lib/pkce";
 import { ISSUER_PK_PEM } from "../lib/issuerKey";
 import { Identity, proveMembershipSession, type MerkleProofResponse } from "../lib/zkProof";
+import { ohttpFetch } from "../lib/ohttp";
 
 const STEPS = [
   "Exchanging OAuth Token",
@@ -90,9 +91,9 @@ interface SessionResponse {
 // mirrors the redirect host already hardcoded into that Worker's wrangler.toml for symmetry with
 // the messaging Worker's `api.vort.xfeatures.net` naming, not a live endpoint.
 const ENROLLMENT_API_URL = import.meta.env.DEV ? "http://localhost:8788" : "https://id.vort.xfeatures.net";
-// Messaging Plane (Flow 1 membership insert + Flow 2 ZK session). Same host `useChatWebSocket.ts`
-// talks to (8787 locally), over HTTP here rather than the WebSocket it uses for the transport.
-const MESSAGING_API_URL = import.meta.env.DEV ? "http://localhost:8787" : "https://api.vort.xfeatures.net";
+// Messaging Plane (Flow 1 membership insert + Flow 2 ZK session) calls no longer hit this Worker's
+// origin directly — R25 (2026-07) routes them through real OHTTP (../lib/ohttp.ts's `ohttpFetch`,
+// itself pointed at workers/ohttp-relay). No `MESSAGING_API_URL` constant is needed here any more.
 
 function wait(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -252,9 +253,13 @@ export function AuthCallback() {
       setStepIndex(3);
       const identity = new Identity();
       const commitment = fieldToHex(identity.commitment);
+      // R25 (2026-07): this call goes through real OHTTP (RFC 9458) — HPKE-sealed via the Messaging
+      // Worker's published Key Config, relayed by workers/ohttp-relay, decapsulated by the Worker's
+      // Gateway route. Cloudflare never sees this browser's real IP on this request; see
+      // ../lib/ohttp.ts and docs/06's R25 entry. Not a plain `fetch()` any more — deliberately.
       let insertRes: Response;
       try {
-        insertRes = await fetch(`${MESSAGING_API_URL}/membership/insert`, {
+        insertRes = await ohttpFetch("/membership/insert", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -264,8 +269,8 @@ export function AuthCallback() {
             commitment,
           }),
         });
-      } catch {
-        if (runId.current === token) setNetworkError(`Could not reach the Messaging Worker at ${MESSAGING_API_URL}.`);
+      } catch (err) {
+        if (runId.current === token) setNetworkError(`OHTTP request to the Messaging Gateway failed: ${(err as Error).message}`);
         return;
       }
       if (runId.current !== token) return;
@@ -283,11 +288,12 @@ export function AuthCallback() {
       setStepIndex(4);
       // Fetch this identity's OWN real Merkle proof (siblings + index) — MerkleTreeDO's new
       // /proof/:commitment route, needed for any tree size beyond the earlier sole-member special case.
+      // R25: also via OHTTP — same reasoning as the insert call above.
       let merkleProofRes: Response;
       try {
-        merkleProofRes = await fetch(`${MESSAGING_API_URL}/membership/proof/${commitment}`);
-      } catch {
-        if (runId.current === token) setNetworkError(`Could not reach the Messaging Worker at ${MESSAGING_API_URL}.`);
+        merkleProofRes = await ohttpFetch(`/membership/proof/${commitment}`, { method: "GET" });
+      } catch (err) {
+        if (runId.current === token) setNetworkError(`OHTTP request to the Messaging Gateway failed: ${(err as Error).message}`);
         return;
       }
       if (runId.current !== token) return;
@@ -318,9 +324,10 @@ export function AuthCallback() {
         `[Session] real proof generated in-browser: merkleRoot 0x${proof.merkleRoot.slice(0, 16)}..., ` +
           `nullifier 0x${proof.nullifier.slice(0, 16)}...`,
       );
+      // R25: also via OHTTP — same reasoning as the insert call above.
       let sessionRes: Response;
       try {
-        sessionRes = await fetch(`${MESSAGING_API_URL}/auth/session`, {
+        sessionRes = await ohttpFetch("/auth/session", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -331,8 +338,8 @@ export function AuthCallback() {
             scope: proof.scope,
           }),
         });
-      } catch {
-        if (runId.current === token) setNetworkError(`Could not reach the Messaging Worker at ${MESSAGING_API_URL}.`);
+      } catch (err) {
+        if (runId.current === token) setNetworkError(`OHTTP request to the Messaging Gateway failed: ${(err as Error).message}`);
         return;
       }
       if (runId.current !== token) return;

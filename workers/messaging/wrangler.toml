@@ -2,8 +2,13 @@
 # HARD RULE: this config may bind DB_MSG, MEDIA (R2), and the Messaging-Plane Durable Objects
 # below — nothing else. It must never gain a binding to DB_ENROLL or any Enrollment-Plane
 # secret (OAUTH_CLIENT_SECRET, PPID_HMAC_SECRET) — schema-lint checks this file for exactly that.
-# In production this Worker sits behind an OHTTP relay (docs/03 §2, §10) so it never observes
-# client IPs directly.
+# R25 (2026-07): real OHTTP (RFC 9458) is implemented, not a stub — this Worker's `/ohttp/keys` +
+# `/ohttp/gateway` routes are the Gateway role (src/index.ts, @vorticity/ohttp); a separate
+# `workers/ohttp-relay` is the Relay role clients actually connect to in front of it. Wraps the three
+# routes docs/04's Flow 1/2 diagrams draw through the Relay PLUS `/queue/:id/push` (the real message
+# send path — see docs/06's R25 entry for why that one was a same-day follow-up, not in the first
+# pass). WebSocket upgrades (`/queue/:id` subscribe, `/conv/:id`) structurally CANNOT be OHTTP-wrapped
+# — see index.ts's header comment near the /queue routes for the honest, permanent residual gap.
 name = "vorticity-messaging"
 main = "src/index.ts"
 compatibility_date = "2026-02-01"

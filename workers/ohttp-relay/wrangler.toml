@@ -1,0 +1,26 @@
+# OHTTP Relay role (RFC 9458 §4) in front of the Messaging Plane's OHTTP Gateway (workers/messaging's
+# /ohttp/keys, /ohttp/gateway). Deliberately minimal — the Relay never touches HPKE at all, it only
+# forwards opaque encapsulated-request bytes to the Gateway and opaque encapsulated-response bytes
+# back; see src/index.ts. Mirrors the shape of Cloudflare's own open-source reference relay
+# (github.com/cloudflare/privacy-gateway-relay), written fresh for this repo's conventions rather than
+# vendored, since the whole point of the Relay role is that its logic is this small.
+#
+# HONEST RESIDUAL NOTE (see docs/06's R25 entry): for OHTTP's privacy property to hold against a
+# single adversary, the Relay operator must be INDEPENDENT of the Gateway operator — a relay and
+# gateway both run by Cloudflare (as this local-dev config does, and as a same-account production
+# deploy would too, unless deliberately hosted elsewhere) do not, by themselves, prevent Cloudflare
+# from correlating the two hops if it chose to. This still closes the gap this pass targets (the
+# Messaging Worker/Gateway structurally never receives the client's IP in the decapsulated request),
+# but a second, independently-operated relay is the deeper mitigation docs/03 §2 already gestures at
+# ("different hostnames/Workers per plane") — not deployed here, flagged rather than implied.
+name = "vorticity-ohttp-relay"
+main = "src/index.ts"
+compatibility_date = "2026-02-01"
+
+[vars]
+# Local dev: the Messaging Worker's own `wrangler dev` origin. Production would point this at
+# `https://q.vort.xfeatures.net` (or an internal service binding, which is a stronger option worth
+# revisiting — see the residual note above about operator independence not mattering for THIS specific
+# leg, since a service binding vs. a public fetch doesn't change the IP-visibility property this pass
+# is about).
+GATEWAY_ORIGIN = "http://127.0.0.1:8787"

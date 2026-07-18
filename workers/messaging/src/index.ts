@@ -6,6 +6,7 @@ import { verifyGroth16 } from "./zk-wasm";
 import { verifyBlindSig } from "./blindsig-wasm";
 import { CURRENT_ISSUER_PK_PEM } from "./issuer-keys";
 import { VK_HEX, hexToBytes, buildPublicInputsBytes, mintCapability, verifyCapability } from "./session";
+import { OhttpGateway, MEDIA_TYPE_KEY_CONFIG, MEDIA_TYPE_REQUEST, MEDIA_TYPE_RESPONSE, type BhttpRequest } from "@vorticity/ohttp";
 
 export { MerkleTreeDO } from "./durable-objects/MerkleTreeDO";
 export { QueueDO } from "./durable-objects/QueueDO";
@@ -48,6 +49,21 @@ function rateGateStub(env: Env) {
   return env.RATE_GATE_DO.get(env.RATE_GATE_DO.idFromName(`epoch:${epoch}`));
 }
 
+// R25 (2026-07): the OHTTP Gateway role (RFC 9458 §4) — decapsulates HPKE-sealed requests that
+// arrived via a separate Relay Worker (workers/ohttp-relay), which is the ONLY hop that ever sees a
+// real client IP; this Worker, reached only through that Relay for the three routes below, sees the
+// real request but never the caller's IP. See docs/04's OHTTP Relay topology and docs/06's R25 entry.
+// One Gateway keypair per Worker isolate — cached module-level since `deriveKeyPair` does real HPKE
+// key-derivation work and the isolate is reused across requests until Cloudflare recycles it.
+const OHTTP_KEY_ID = 1;
+let ohttpGatewaySingleton: OhttpGateway | null = null;
+async function getOhttpGateway(env: Env): Promise<OhttpGateway> {
+  if (!ohttpGatewaySingleton) {
+    ohttpGatewaySingleton = await OhttpGateway.create(hexToBytes(env.OHTTP_GATEWAY_SEED), OHTTP_KEY_ID);
+  }
+  return ohttpGatewaySingleton;
+}
+
 // The session capability minted by /auth/session gates every conversation route. A browser can't set
 // headers on `new WebSocket()`, so the /queue upgrade carries it as a `?cap=` query param; plain HTTP
 // routes (/conv, /group) use `Authorization: Bearer <cap>`. Accept either everywhere for uniformity.
@@ -76,6 +92,18 @@ router.options("*", (request: IRequest) => new Response(null, { headers: corsHea
 router.get("/health", () => Response.json({ ok: true, plane: "messaging" }));
 
 
+// --- Core handlers below are plain functions over parsed input, NOT `Request`/`Response` — this is
+// what lets the SAME logic be reached two ways: directly by the router (thin wrappers just below turn
+// the real `Request` into `body`/`params` and the `CoreResult` back into a CORS-aware `Response`), and
+// via the OHTTP Gateway dispatch (`handleGatewayRequest` further down), which has no real `Request` at
+// all — only a decapsulated `BhttpRequest` it built itself from HPKE-sealed bytes, and no CORS to add
+// (an OHTTP round trip through the Relay isn't a browser cross-origin fetch). Duplicating this logic
+// per entry point was the alternative; sharing it means the two paths cannot drift apart.
+interface CoreResult {
+  status: number;
+  body: unknown;
+}
+
 // Flow 1 (docs/04): redeem an Enrollment-issued RSABSSA token by inserting the client's Semaphore
 // `commitment` into the membership accumulator; return the new Merkle root. Replaces the earlier
 // "assumed valid" VOPRF-token placeholder — the redemption token is now REALLY verified: the client
@@ -84,19 +112,13 @@ router.get("/health", () => Response.json({ ok: true, plane: "messaging" }));
 // (issuer-keys.ts) — no secret ever crosses the plane boundary. Only on a valid signature do we
 // compute `tokenNull = H(msg)` and hand it to MerkleTreeDO, which enforces the one-spend guard
 // (`issuer_token_null`) before inserting the commitment (see MerkleTreeDO.ts's header comment).
-router.post("/membership/insert", async (request: IRequest, env: Env) => {
-  const origin = request.headers.get("Origin");
-  let body: { msg?: unknown; sig?: unknown; msgRandomizer?: unknown; commitment?: unknown };
-  try {
-    body = await request.json();
-  } catch {
-    return errorResp("Invalid JSON body", origin, 400);
-  }
+async function coreMembershipInsert(env: Env, rawBody: unknown): Promise<CoreResult> {
+  const body = rawBody as { msg?: unknown; sig?: unknown; msgRandomizer?: unknown; commitment?: unknown };
   if (typeof body.msg !== "string" || typeof body.sig !== "string" || typeof body.msgRandomizer !== "string") {
-    return errorResp("Missing msg, sig, or msgRandomizer (base64) — the RSABSSA redemption token", origin, 400);
+    return { status: 400, body: { error: "Missing msg, sig, or msgRandomizer (base64) — the RSABSSA redemption token" } };
   }
   if (typeof body.commitment !== "string" || !HEX64_RE.test(body.commitment)) {
-    return errorResp("commitment must be a 64-char lowercase hex (32-byte) value", origin, 400);
+    return { status: 400, body: { error: "commitment must be a 64-char lowercase hex (32-byte) value" } };
   }
 
   let msgBytes: Uint8Array, sigBytes: Uint8Array, randomizerBytes: Uint8Array;
@@ -105,12 +127,12 @@ router.post("/membership/insert", async (request: IRequest, env: Env) => {
     sigBytes = b64ToBytes(body.sig);
     randomizerBytes = b64ToBytes(body.msgRandomizer);
   } catch {
-    return errorResp("msg, sig, and msgRandomizer must be valid base64", origin, 400);
+    return { status: 400, body: { error: "msg, sig, and msgRandomizer must be valid base64" } };
   }
 
   const valid = verifyBlindSig(CURRENT_ISSUER_PK_PEM, msgBytes, randomizerBytes, sigBytes);
   console.log(`[Membership] blindsig_verify -> ${valid} (msg ${msgBytes.length}B, commitment ${body.commitment.slice(0, 16)}…)`);
-  if (!valid) return errorResp("Redemption token signature verification failed", origin, 401);
+  if (!valid) return { status: 401, body: { error: "Redemption token signature verification failed" } };
 
   const tokenNull = await sha256Hex(msgBytes);
   const res = await merkleStub(env).fetch(
@@ -120,11 +142,10 @@ router.post("/membership/insert", async (request: IRequest, env: Env) => {
       body: JSON.stringify({ commitment: body.commitment, tokenNull }),
     }),
   );
-  if (res.status === 409) return errorResp("redemption token already spent — cannot insert twice", origin, 409);
-  if (!res.ok) return errorResp(`MerkleTreeDO insert failed (${res.status})`, origin, 502);
-  const inserted = (await res.json()) as { merkleRoot: string; size: number };
-  return jsonResp(inserted, origin);
-});
+  if (res.status === 409) return { status: 409, body: { error: "redemption token already spent — cannot insert twice" } };
+  if (!res.ok) return { status: 502, body: { error: `MerkleTreeDO insert failed (${res.status})` } };
+  return { status: 200, body: await res.json() };
+}
 
 // R23 follow-up (2026-07): a client needs its own Merkle proof (siblings path + leaf index) to build a
 // real Semaphore witness for any tree beyond the trivial single-member case. Commitments are PUBLIC BY
@@ -134,11 +155,9 @@ router.post("/membership/insert", async (request: IRequest, env: Env) => {
 // /auth/session in the first place). Rate-limited PER COMMITMENT instead (see `rateGateStub` above) —
 // this is an O(n) tree rebuild on MerkleTreeDO's side per call, and an unauthenticated caller who
 // already knows one commitment (e.g. their own) could otherwise force unlimited rebuilds against it.
-router.get("/membership/proof/:commitment", async (request: IRequest, env: Env) => {
-  const origin = request.headers.get("Origin");
-  const commitment = request.params.commitment;
+async function coreMembershipProof(env: Env, commitment: string | undefined): Promise<CoreResult> {
   if (!commitment || !HEX64_RE.test(commitment)) {
-    return errorResp("commitment must be a 64-char lowercase hex (32-byte) value", origin, 400);
+    return { status: 400, body: { error: "commitment must be a 64-char lowercase hex (32-byte) value" } };
   }
 
   const rateRes = await rateGateStub(env).fetch(
@@ -148,19 +167,18 @@ router.get("/membership/proof/:commitment", async (request: IRequest, env: Env) 
       body: JSON.stringify({ key: `proof:${commitment}`, limit: PROOF_RATE_LIMIT_PER_EPOCH }),
     }),
   );
-  if (!rateRes.ok) return errorResp(`Rate check failed (${rateRes.status})`, origin, 502);
+  if (!rateRes.ok) return { status: 502, body: { error: `Rate check failed (${rateRes.status})` } };
   const { allowed, count, limit } = (await rateRes.json()) as { allowed: boolean; count: number; limit: number };
   if (!allowed) {
     console.log(`[Membership] proof rate limit hit for commitment ${commitment.slice(0, 16)}… (${count}/${limit} this epoch)`);
-    return errorResp("Too many proof requests for this commitment this epoch — try again next epoch", origin, 429);
+    return { status: 429, body: { error: "Too many proof requests for this commitment this epoch — try again next epoch" } };
   }
 
   const res = await merkleStub(env).fetch(new Request(`https://do/proof/${commitment}`));
-  if (res.status === 404) return errorResp("commitment not found in the membership tree", origin, 404);
-  if (!res.ok) return errorResp(`MerkleTreeDO proof lookup failed (${res.status})`, origin, 502);
-  const proof = (await res.json()) as { index: number; siblings: string[]; merkleRoot: string };
-  return jsonResp(proof, origin);
-});
+  if (res.status === 404) return { status: 404, body: { error: "commitment not found in the membership tree" } };
+  if (!res.ok) return { status: 502, body: { error: `MerkleTreeDO proof lookup failed (${res.status})` } };
+  return { status: 200, body: await res.json() };
+}
 
 // Flow 2 (docs/04): prove membership in zero knowledge -> mint a session capability. The client sends
 // a REAL Groth16 proof (bytes) for the REAL Semaphore v4 circuit, plus the four values it commits to
@@ -172,15 +190,9 @@ router.get("/membership/proof/:commitment", async (request: IRequest, env: Env) 
 // existed for which I have a witness", not that it's the current tree state (a stale replay would
 // otherwise still verify). On success we spend the nullifier (one session per proof) and mint a
 // signed capability, unchanged from before.
-router.post("/auth/session", async (request: IRequest, env: Env) => {
-  const origin = request.headers.get("Origin");
-  let body: { proof?: unknown; merkleRoot?: unknown; nullifier?: unknown; message?: unknown; scope?: unknown };
-  try {
-    body = await request.json();
-  } catch {
-    return errorResp("Invalid JSON body", origin, 400);
-  }
-  if (typeof body.proof !== "string") return errorResp("Missing proof (base64)", origin, 400);
+async function coreAuthSession(env: Env, rawBody: unknown): Promise<CoreResult> {
+  const body = rawBody as { proof?: unknown; merkleRoot?: unknown; nullifier?: unknown; message?: unknown; scope?: unknown };
+  if (typeof body.proof !== "string") return { status: 400, body: { error: "Missing proof (base64)" } };
   for (const [name, value] of Object.entries({
     merkleRoot: body.merkleRoot,
     nullifier: body.nullifier,
@@ -188,7 +200,7 @@ router.post("/auth/session", async (request: IRequest, env: Env) => {
     scope: body.scope,
   })) {
     if (typeof value !== "string" || !HEX64_RE.test(value)) {
-      return errorResp(`${name} must be a 64-char lowercase hex (32-byte) value`, origin, 400);
+      return { status: 400, body: { error: `${name} must be a 64-char lowercase hex (32-byte) value` } };
     }
   }
   const { merkleRoot, nullifier, message, scope } = body as { merkleRoot: string; nullifier: string; message: string; scope: string };
@@ -197,30 +209,30 @@ router.post("/auth/session", async (request: IRequest, env: Env) => {
   try {
     proofBytes = b64ToBytes(body.proof);
   } catch {
-    return errorResp("proof is not valid base64", origin, 400);
+    return { status: 400, body: { error: "proof is not valid base64" } };
   }
 
   // Cheap check first, before the Groth16 pairing work: reject a stale/unrelated root outright.
   const rootRes = await merkleStub(env).fetch(new Request("https://do/root"));
-  if (!rootRes.ok) return errorResp(`MerkleTreeDO root fetch failed (${rootRes.status})`, origin, 502);
+  if (!rootRes.ok) return { status: 502, body: { error: `MerkleTreeDO root fetch failed (${rootRes.status})` } };
   const { merkleRoot: currentRoot } = (await rootRes.json()) as { merkleRoot: string };
   if (merkleRoot !== currentRoot) {
     console.log(`[Session] merkleRoot mismatch: claimed ${merkleRoot.slice(0, 16)}… vs current ${currentRoot.slice(0, 16)}…`);
-    return errorResp("merkleRoot does not match the current membership tree root", origin, 409);
+    return { status: 409, body: { error: "merkleRoot does not match the current membership tree root" } };
   }
 
   let publicInputsBytes: Uint8Array;
   try {
     publicInputsBytes = buildPublicInputsBytes(merkleRoot, nullifier, message, scope);
   } catch (err) {
-    return errorResp(`Invalid public inputs: ${(err as Error).message}`, origin, 400);
+    return { status: 400, body: { error: `Invalid public inputs: ${(err as Error).message}` } };
   }
 
   const ok = verifyGroth16(hexToBytes(VK_HEX), proofBytes, publicInputsBytes);
   console.log(
     `[Session] zk_verify_groth16_bytes -> ${ok} (proof ${proofBytes.length}B, merkleRoot ${merkleRoot.slice(0, 16)}…, nullifier ${nullifier.slice(0, 16)}…)`,
   );
-  if (!ok) return errorResp("ZK proof verification failed", origin, 401);
+  if (!ok) return { status: 401, body: { error: "ZK proof verification failed" } };
 
   // One session per nullifier: spend it in the accumulator (rejects proof replay).
   const spendRes = await merkleStub(env).fetch(
@@ -231,13 +243,151 @@ router.post("/auth/session", async (request: IRequest, env: Env) => {
     }),
   );
   if (spendRes.status === 409) {
-    return errorResp("nullifier already spent — a session was already issued for this proof", origin, 409);
+    return { status: 409, body: { error: "nullifier already spent — a session was already issued for this proof" } };
   }
-  if (!spendRes.ok) return errorResp(`nullifier spend failed (${spendRes.status})`, origin, 502);
+  if (!spendRes.ok) return { status: 502, body: { error: `nullifier spend failed (${spendRes.status})` } };
 
   const capability = await mintCapability(env.SESSION_SIGNING_KEY, nullifier);
   console.log(`[Session] Capability issued (nullifier ${nullifier.slice(0, 16)}…): ${capability.slice(0, 24)}…`);
-  return jsonResp({ capability }, origin);
+  return { status: 200, body: { capability } };
+}
+
+router.post("/membership/insert", async (request: IRequest, env: Env) => {
+  const origin = request.headers.get("Origin");
+  let body: unknown;
+  try {
+    body = await request.json();
+  } catch {
+    return errorResp("Invalid JSON body", origin, 400);
+  }
+  const result = await coreMembershipInsert(env, body);
+  return jsonResp(result.body, origin, result.status);
+});
+
+router.get("/membership/proof/:commitment", async (request: IRequest, env: Env) => {
+  const origin = request.headers.get("Origin");
+  const result = await coreMembershipProof(env, request.params.commitment);
+  return jsonResp(result.body, origin, result.status);
+});
+
+router.post("/auth/session", async (request: IRequest, env: Env) => {
+  const origin = request.headers.get("Origin");
+  let body: unknown;
+  try {
+    body = await request.json();
+  } catch {
+    return errorResp("Invalid JSON body", origin, 400);
+  }
+  const result = await coreAuthSession(env, body);
+  return jsonResp(result.body, origin, result.status);
+});
+
+function parseJsonBody(body: Uint8Array): { ok: true; value: unknown } | { ok: false } {
+  try {
+    return { ok: true, value: JSON.parse(new TextDecoder().decode(body)) };
+  } catch {
+    return { ok: false };
+  }
+}
+
+function getBhttpHeader(headers: [string, string][], name: string): string | null {
+  const lower = name.toLowerCase();
+  for (const [k, v] of headers) if (k.toLowerCase() === lower) return v;
+  return null;
+}
+
+// R25 follow-up (2026-07, same day): `POST /queue/:id/push` — the real 1:1 message SEND path
+// (useQueueTransport.ts's `pushEnvelope`). Flagged in the first R25 pass as "not wired yet" and
+// closed here once it became clear this is the highest-FREQUENCY OHTTP-eligible route in the whole
+// app (fires per message, not once per session like the other three) — a real priority miss in the
+// original pass, not a cosmetic one. `requireCapability`'s direct-route logic (reading `Authorization`
+// off a real `IRequest`) doesn't apply here — there is no `IRequest`, only the decapsulated
+// `BhttpRequest`'s own header list, so capability verification is re-expressed against that shape
+// (same `verifyCapability` call, same HMAC check — not a parallel/weaker auth path).
+async function coreQueuePush(env: Env, queueId: string, req: BhttpRequest): Promise<CoreResult> {
+  const auth = getBhttpHeader(req.headers, "authorization");
+  const cap = auth?.startsWith("Bearer ") ? auth.slice("Bearer ".length) : null;
+  if (!cap) return { status: 401, body: { error: "Missing session capability" } };
+  const verdict = await verifyCapability(env.SESSION_SIGNING_KEY, cap);
+  if (!verdict.valid) return { status: 401, body: { error: `Invalid session capability: ${verdict.reason}` } };
+
+  const doHeaders: Record<string, string> = {};
+  const ttlMs = getBhttpHeader(req.headers, "x-ttl-ms");
+  const sizeBucket = getBhttpHeader(req.headers, "x-size-bucket");
+  if (ttlMs !== null) doHeaders["X-Ttl-Ms"] = ttlMs;
+  if (sizeBucket !== null) doHeaders["X-Size-Bucket"] = sizeBucket;
+
+  const stub = env.QUEUE_DO.get(env.QUEUE_DO.idFromName(queueId));
+  const res = await stub.fetch(new Request("https://do/push", { method: "POST", headers: doHeaders, body: req.body }));
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    return { status: res.status, body: { error: text || `QueueDO push failed (${res.status})` } };
+  }
+  return { status: res.status, body: await res.json() };
+}
+
+// Dispatches a DECAPSULATED request (a `BhttpRequest` the Gateway itself constructed from HPKE-sealed
+// bytes — never a real Cloudflare `Request`, so there is no `cf-connecting-ip`/`CF-Connecting-IP`
+// header or any other IP-bearing field for these handlers to even reach for) to the SAME core logic
+// the direct routes above use. See docs/06's R25 entry for which routes are NOT reachable here
+// (WebSocket upgrades can't be tunneled through a single-shot request/response scheme like OHTTP at
+// all — that's a structural limit, not a scope choice).
+async function dispatchBhttpRequest(env: Env, req: BhttpRequest): Promise<CoreResult> {
+  const proofMatch = /^\/membership\/proof\/([0-9a-f]{64})$/.exec(req.path);
+  if (req.method === "GET" && proofMatch) {
+    return coreMembershipProof(env, proofMatch[1]);
+  }
+  if (req.method === "POST" && req.path === "/membership/insert") {
+    const parsed = parseJsonBody(req.body);
+    if (!parsed.ok) return { status: 400, body: { error: "Invalid JSON body" } };
+    return coreMembershipInsert(env, parsed.value);
+  }
+  if (req.method === "POST" && req.path === "/auth/session") {
+    const parsed = parseJsonBody(req.body);
+    if (!parsed.ok) return { status: 400, body: { error: "Invalid JSON body" } };
+    return coreAuthSession(env, parsed.value);
+  }
+  const queuePushMatch = /^\/queue\/([^/]+)\/push$/.exec(req.path);
+  if (req.method === "POST" && queuePushMatch) {
+    return coreQueuePush(env, decodeURIComponent(queuePushMatch[1]!), req);
+  }
+  return { status: 404, body: { error: "Not found (via OHTTP gateway)" } };
+}
+
+// RFC 9458 §3.2: publish the Gateway's Key Config so a Client can encapsulate against it. Public and
+// unauthenticated by necessity — a Client needs this before it has any capability, same openness
+// rationale as `/membership/proof/:commitment` above.
+router.get("/ohttp/keys", async (_request: IRequest, env: Env) => {
+  const gateway = await getOhttpGateway(env);
+  return new Response(gateway.keyConfigBytes(), { headers: { "Content-Type": MEDIA_TYPE_KEY_CONFIG } });
+});
+
+// RFC 9458 §4: the Gateway endpoint itself. Reached only via workers/ohttp-relay in production — this
+// Worker never needs to (and structurally cannot, from the decapsulated `BhttpRequest` shape alone)
+// recover the original caller's IP from a request that arrives here.
+router.post("/ohttp/gateway", async (request: IRequest, env: Env) => {
+  const contentType = request.headers.get("Content-Type");
+  if (contentType !== MEDIA_TYPE_REQUEST) {
+    return new Response(`Content-Type must be ${MEDIA_TYPE_REQUEST}`, { status: 400 });
+  }
+  const gateway = await getOhttpGateway(env);
+  const encapsulatedRequest = new Uint8Array(await request.arrayBuffer());
+
+  let decapsulated: Awaited<ReturnType<OhttpGateway["decapsulateRequest"]>>;
+  try {
+    decapsulated = await gateway.decapsulateRequest(encapsulatedRequest);
+  } catch (err) {
+    console.warn("[OHTTP] decapsulation failed:", (err as Error).message);
+    return new Response("Bad encapsulated request", { status: 400 });
+  }
+
+  const result = await dispatchBhttpRequest(env, decapsulated.request);
+  const encapsulatedResponse = await decapsulated.encapsulateResponse({
+    status: result.status,
+    headers: [["content-type", "application/json"]],
+    body: new TextEncoder().encode(JSON.stringify(result.body)),
+  });
+  return new Response(encapsulatedResponse, { headers: { "Content-Type": MEDIA_TYPE_RESPONSE } });
 });
 
 /**
@@ -254,8 +404,19 @@ function forwardToDO(request: IRequest, ns: DurableObjectNamespace, id: string, 
 
 // Every conversation route below is gated by `requireCapability` — the session capability minted by
 // /auth/session (HMAC over nullifier+expiry, verified here with SESSION_SIGNING_KEY). No valid
-// capability -> 401 before the DO is ever reached. In production this Worker also sits behind an
-// OHTTP relay so it never observes a client IP directly (see docs/03 §10, docs/04 topology).
+// capability -> 401 before the DO is ever reached.
+//
+// R25 (2026-07) honest scope note: the OHTTP Gateway (`/ohttp/keys`, `/ohttp/gateway` above) wraps
+// four plain request/response routes — the three docs/04's Flow 1/2 diagrams draw through the Relay
+// (/membership/insert, /membership/proof/:commitment, /auth/session) PLUS `/queue/:id/push` (the
+// real message SEND path, wired in a same-day follow-up once it was pointed out that this is the
+// HIGHEST-frequency OHTTP-eligible route in the app — fires per message, not once per session; see
+// `coreQueuePush` above and docs/06's R25 entry). NOT wrapped, and structurally CANNOT be: WebSocket
+// upgrades (`/queue/:id` subscribe, `/conv/:id`) — OHTTP is a single-shot HPKE-per-request/response
+// scheme (RFC 9458), fundamentally incompatible with a persistent connection. A client's WS
+// connection to RECEIVE messages is still made directly, so its IP is visible to Cloudflare's edge
+// for that connection's lifetime — a real, documented residual gap (see docs/06's R25 entry), not
+// silently claimed as covered.
 //
 // Mounted as `/queue/:queueId/*` (not `/q/...`) because apps/web's `useChatWebSocket.ts` hits this
 // Worker directly (no `/ws` prefix) when running against a local `wrangler dev` instance — that

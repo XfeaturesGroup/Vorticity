@@ -1,0 +1,23 @@
+{
+  "name": "@vorticity/ohttp",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Oblivious HTTP (RFC 9458) client + gateway roles, over Binary HTTP (RFC 9292) framing. See docs/04's OHTTP Relay topology and docs/06's R25 entry.",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@hpke/core": "^1.9.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2",
+    "vitest": "~3.2.0",
+    "snarkjs": "^0.7.5",
+    "@semaphore-protocol/identity": "^4.11.1"
+  }
+}

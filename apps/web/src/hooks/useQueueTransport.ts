@@ -54,6 +54,7 @@ import {
 } from "@vorticity/vortic-core";
 import { useAuth } from "../contexts/AuthContext";
 import { formatNow, type ChatMessage } from "../lib/mockChats";
+import { ohttpFetch } from "../lib/ohttp";
 
 function freshSeed32(): Uint8Array {
   const seed = new Uint8Array(32);
@@ -64,7 +65,12 @@ function freshSeed32(): Uint8Array {
 export type SocketStatus = "offline" | "connecting" | "online" | "reconnecting";
 export type TransportRole = "initiator" | "responder";
 
-const MESSAGING_API_URL = import.meta.env.DEV ? "http://localhost:8787" : "https://api.vort.xfeatures.net";
+// R25 follow-up (2026-07): `MESSAGING_API_URL` is gone — `pushEnvelope` below goes through
+// `ohttpFetch` (../lib/ohttp.ts) instead of hitting this Worker's origin directly. WS subscribe
+// (`WS_BASE_URL` below) still connects directly — a persistent connection structurally cannot be
+// OHTTP-wrapped (RFC 9458 is single-shot request/response); see docs/06's R25 entry for the honest,
+// permanent residual gap this leaves (a subscriber's IP is visible to Cloudflare's edge for the
+// lifetime of that connection).
 const WS_BASE_URL = import.meta.env.DEV ? "ws://localhost:8787/queue" : "wss://api.vort.xfeatures.net/ws/queue";
 
 const MESSAGE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days — matches QueueDO's own defensive cap
@@ -149,19 +155,19 @@ function padEnvelope(envelope: Envelope): { bytes: Uint8Array; bucket: number } 
   return { bytes: new TextEncoder().encode(withoutPad), bucket: SIZE_BUCKETS.length - 1 };
 }
 
+// R25 follow-up (2026-07): goes through real OHTTP now, not a plain `fetch()` — this is the highest-
+// frequency OHTTP-eligible call in the app (fires per message), higher priority in practice than the
+// three one-time enrollment calls the first R25 pass wired; see ../lib/ohttp.ts and docs/06's R25 entry.
 async function pushEnvelope(queueId: string, cap: string, envelope: Envelope, ttlMs: number): Promise<void> {
   const { bytes, bucket } = padEnvelope(envelope);
-  const res = await fetch(`${MESSAGING_API_URL}/queue/${encodeURIComponent(queueId)}/push`, {
+  const res = await ohttpFetch(`/queue/${encodeURIComponent(queueId)}/push`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${cap}`,
       "X-Ttl-Ms": String(ttlMs),
       "X-Size-Bucket": String(bucket),
     },
-    // `Uint8Array<ArrayBufferLike>` isn't structurally `BlobPart`/`BodyInit` under TS 5.7+'s stricter
-    // lib.dom typed-array generics (it allows a SharedArrayBuffer-backed view, `Blob`/`fetch` don't) —
-    // `fetch` accepts any `ArrayBufferView` at runtime regardless; this is a type-level-only mismatch.
-    body: bytes as BodyInit,
+    body: bytes,
   });
   if (!res.ok) throw new Error(`push to ${queueId} failed: HTTP ${res.status}`);
 }

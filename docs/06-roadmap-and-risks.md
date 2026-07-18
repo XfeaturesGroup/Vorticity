@@ -483,6 +483,135 @@ bands, not calendar promises.
   **Live-verified:** 25 sequential requests against one real commitment → first 20 return 200, the next 5
   return 429 with a clear error message; a second, different real commitment's first request returns 200
   unaffected by the first commitment's counter (confirms per-key isolation, not a global limit).
+- **Done (2026-07, "R25: real OHTTP" pass) — closes R25: the OHTTP Relay was never implemented, only
+  stub comments (`index.ts`, `wrangler.toml`) claiming it existed "in production."** README calls this
+  "load-bearing, not cosmetic" — without it Cloudflare sees the real client IP on every anonymity-zone
+  call even with full cryptographic identity unlinkability (docs/03 §2's whole point).
+  - **Researched before writing anything, per this task's own instruction not to reinvent HPKE:**
+    Cloudflare's "Privacy Gateway" (the link docs/04 already cited) is a **closed-beta managed
+    service** ("select privacy-oriented companies and partners") — not self-serve, not usable here.
+    `cloudflare/privacy-gateway-relay` is real, open-source, and reusable — but it only implements the
+    **Relay** role (a dumb byte-forwarder, no HPKE at all). The **Gateway** role (HPKE decapsulation)
+    has no maintained, Workers-verified package: `@hpke/ohttp` (from the actively-maintained
+    `dajiaji/hpke-js`) is unreleased ("Coming Soon"); `chris-wood/ohttp-js` (from an actual RFC 9458
+    co-author) is a stale 2023 v0.0.1, unverified for Workers. **Decision, confirmed with the user
+    before coding:** the HPKE *primitive* is real and reusable (`@hpke/core` — confirmed by installing
+    it and reading its actual `.d.ts` files, not assumed from docs — ships `DhkemX25519HkdfSha256`
+    directly, Workers-verified via WebCrypto); the OHTTP-specific protocol *framing* (RFC 9292 Binary
+    HTTP + RFC 9458's Key Config/request/response framing) has no reusable package and was implemented
+    fresh, spec-driven, against the actual RFC text (fetched and read directly, not paraphrased from
+    memory).
+  - **New workspace package `packages/ohttp`** (pure TS, no Rust/WASM — `@hpke/core` already covers
+    the WebCrypto-backed crypto in both the browser and Workers): `varint.ts` (RFC 9000 §16 QUIC
+    varints), `bhttp.ts` (RFC 9292 Known-Length request/response framing — method/scheme/authority/
+    path/headers/body; no informational responses, no chunked framing, empty trailers omitted, all
+    conformant subsets of the spec, not shortcuts), `keyConfig.ts` (RFC 9458 §3.1), `hpkeSuite.ts`
+    (shared constants + the RFC 9458 §4.4 response-key derivation, factored out once rather than
+    duplicated between client.ts and gateway.ts), `client.ts` (encapsulate/decapsulate), `gateway.ts`
+    (decapsulate/encapsulate, deterministic keypair from a seed — same "seed-threaded, no internal RNG"
+    convention as `vortic-core`). 18 unit tests: varint boundary/round-trip, Binary HTTP round-trip
+    (including duplicate headers, large bodies, wrong-framing-indicator rejection), and a full
+    Client-encapsulate → Gateway-decapsulate → handle → Gateway-encapsulate → Client-decapsulate round
+    trip (wrong key_id rejected, tampered ciphertext byte rejected, independent encapsulations per
+    call, deterministic Key Config from a fixed seed).
+  - **A real library bug found and worked around, not glossed over:** `@hpke/core`'s `kdf.extract()`
+    artificially rejects any `salt` whose length isn't exactly the hash size — a narrowing of RFC 5869
+    (whose `Extract` accepts a salt of *any* length) to match RFC 9180's own internal usage pattern,
+    not a requirement of Extract itself. RFC 9458 §4.4's response derivation needs a 48-byte salt
+    (32-byte X25519 `enc` + 16-byte `response_nonce`) — caught by a failing round-trip test, not
+    predicted in advance, and fixed by calling WebCrypto's HMAC directly for this one step (still not
+    "HPKE from scratch" — `expand()`, `.export()`, and the rest of the HPKE key schedule are all still
+    the library's own code; only the one artificially-restricted primitive was replaced).
+  - **`workers/messaging` Gateway wiring:** `GET /ohttp/keys` (publishes the Key Config, unauthenticated
+    by necessity — same chicken-and-egg reasoning as `/membership/proof/:commitment`) and
+    `POST /ohttp/gateway` (RFC 9458 §4: decapsulate → dispatch → encapsulate). The three existing
+    handlers (`/membership/insert`, `/membership/proof/:commitment`, `/auth/session` — the ones docs/04's
+    Flow 1/2 diagrams actually draw through the Relay) were refactored into plain functions over parsed
+    input (`CoreResult { status, body }`, no `Request`/`Response`), reached BOTH by the direct router
+    routes and by `dispatchBhttpRequest` — sharing logic rather than duplicating it, so the two paths
+    cannot drift apart. `OHTTP_GATEWAY_SEED` (32 bytes hex) added to `.dev.vars`/`.dev.vars.example`,
+    same secret-handling convention as `SESSION_SIGNING_KEY`.
+  - **New `workers/ohttp-relay`** — the Relay role, deliberately as small as
+    `cloudflare/privacy-gateway-relay` itself (written fresh for this repo's conventions, not vendored):
+    forwards `GET /ohttp/keys` and `POST /ohttp/gateway` verbatim to `GATEWAY_ORIGIN`, refuses every
+    other path outright (never an open proxy). **Residual note, stated plainly:** OHTTP's privacy
+    property needs the Relay operator to be INDEPENDENT of the Gateway operator; a same-account
+    Cloudflare deploy of both (as this local config does) closes the gap THIS pass targets (the
+    Messaging Worker/Gateway structurally never receives the client's IP) but does not by itself defeat
+    a single adversary who could operate or compel both — docs/03 §2 already names this class of
+    residual risk ("different hostnames/Workers per plane" as a partial mitigation, VPN/Tor as the
+    deeper one); an independently-hosted Relay is a real future step, not deployed here.
+  - **`apps/web` wiring:** new `src/lib/ohttp.ts` (`ohttpFetch`, returns a real `Response` so
+    `.ok`/`.status`/`.json()` call sites needed minimal changes), used for exactly the three calls in
+    `AuthCallback.tsx` docs/04 draws through the Relay. `MESSAGING_API_URL` (now unused for those calls)
+    removed rather than left as dead code.
+  - **Live-verified against real `wrangler dev` processes for all three roles** (Client logic run via a
+    vitest integration file that skips itself if the servers aren't reachable, not a hard CI dependency):
+    Relay forwards the Gateway's real Key Config byte-for-byte; a full OHTTP round trip reaches the REAL
+    `/membership/proof/:commitment` handler and returns its real 404 through full encryption both
+    directions (with an explicit check that the plaintext path/commitment never appear in the wire
+    bytes); a real `/membership/insert` call reaches real blind-signature verification through OHTTP
+    (`[Membership] blindsig_verify -> false` in the worker's own log — the REAL handler ran, not a
+    stub); wrong `Content-Type` on `/ohttp/gateway` is rejected (400). Confirmed via the worker's own
+    logs (`POST /ohttp/gateway 200 OK`, not just script-side assertions).
+  - **IP-visibility comparison (the task's explicit ask), done honestly rather than faked:** `wrangler
+    dev`'s local loopback environment doesn't meaningfully simulate Cloudflare's edge-injected
+    `cf-connecting-ip` the way production does (a direct local request's `cf-connecting-ip` is
+    whatever value a caller sends, not edge-authoritative — confirmed empirically: a request with a
+    spoofed `CF-Connecting-IP` header was read back verbatim by a temporarily-instrumented `/health`
+    handler, then the instrumentation was reverted, not left in). Comparing raw header VALUES between
+    "direct" and "via relay" in this local environment would therefore not be a meaningful proof either
+    way. The real, load-bearing guarantee demonstrated instead is STRUCTURAL: the direct router routes
+    receive a real `IRequest`/`Request` object (confirmed live — `request.headers.get(...)` is a live,
+    populated access path), while `coreMembershipInsert`/`coreMembershipProof`/`coreAuthSession`/
+    `dispatchBhttpRequest` — reached via `/ohttp/gateway` — never accept a `Request`/`IRequest`
+    parameter at all; they only ever see `Env` plus a `BhttpRequest` this Worker's own HPKE-decapsulation
+    code constructed from bytes the CLIENT chose to include (method/scheme/authority/path/headers/body —
+    no IP field exists in that shape, by RFC 9292's own design). There is no code path from the
+    `POST /ohttp/gateway` request's own transport metadata to those handlers — not a header that gets
+    scrubbed (which could be forgotten on a future edit), but an argument that was never passed in the
+    first place, verifiable by reading the function signatures in `index.ts`.
+  - **Net effect (original pass):** R25 closed for the three routes docs/04 explicitly draws through
+    the Relay. Explicitly NOT claimed: WebSocket-based routes OHTTP-wrapped (`/queue/:id` subscribe,
+    `/conv/:id` — RFC 9458 is a single-shot request/response scheme, structurally incompatible with a
+    persistent connection); `/queue/:id/push` (the plain-POST send path) OHTTP-wrapped; an
+    independently-operated Relay (see the residual note above).
+  - **Same-day follow-up, prompted by a direct question rather than found independently:** the user
+    asked explicitly whether `POST /queue/:id/push` (`useQueueTransport.ts`'s `pushEnvelope`, the real
+    1:1 message SEND path) went through `ohttpFetch` or a plain `fetch`. It was still plain `fetch` —
+    correctly *disclosed* in the original pass's scope note, but under-prioritized: unlike the WS
+    receive gap (structurally impossible to fix), `/queue/:id/push` is a plain POST/response with
+    nothing blocking it, and it fires on every message send — the highest-FREQUENCY OHTTP-eligible
+    route in the app, not a one-time enrollment call. Closed the same day:
+    - `apps/web/src/lib/ohttp.ts`'s `ohttpFetch` extended to accept a binary body (`string | Uint8Array`),
+      not just JSON strings, since `pushEnvelope`'s padded Sealed Sender++ envelope isn't JSON.
+    - `workers/messaging/src/index.ts` gained `coreQueuePush` — capability verification re-expressed
+      against the decapsulated `BhttpRequest`'s own header list (`getBhttpHeader`, case-insensitive
+      lookup) rather than a real `IRequest`, calling the SAME `verifyCapability` HMAC check as the
+      direct route (not a parallel/weaker auth path) — then forwards to `QueueDO` exactly like the
+      direct route's `forwardToDO` does, just from decapsulated fields instead of a real `Request`.
+    - `useQueueTransport.ts`'s `pushEnvelope` now calls `ohttpFetch` instead of `fetch`;
+      `MESSAGING_API_URL` (now fully unused) removed rather than left dead.
+    - **Live-verified with the strongest test in this whole R25 pass:** mint one REAL session
+      capability via the full RSABSSA+official-ceremony-Semaphore chain, push one REAL message
+      through the REAL OHTTP pipe (Client → Relay → Gateway → `coreQueuePush` → `QueueDO`), and
+      confirm delivery via a DIRECT WebSocket subscribe (unwrapped — WS can't be OHTTP'd) — the
+      exact plaintext marker round-tripped byte-for-byte, with the pushed `seq` matching what the
+      subscriber received. Worker log shows the real chain end to end: `blindsig_verify -> true`,
+      `POST /membership/insert 200`, `zk_verify_groth16_bytes -> true`, `Capability issued`,
+      `GET /queue/... 101 Switching Protocols` (the direct WS subscribe), `POST /ohttp/gateway 200 OK`
+      (the actual OHTTP-wrapped push) — not a mocked or isolated-unit proof.
+  - **Net effect (after the follow-up):** R25 now covers all four plain request/response routes in the
+    app (`/membership/insert`, `/membership/proof/:commitment`, `/auth/session`, `/queue/:id/push`).
+    **Remaining, permanent, structural gap — now its own tracked risk, see R26 below:** a WS
+    subscribe/receive connection (`/queue/:id`, `/conv/:id`) cannot be OHTTP-wrapped at all, so it
+    hands its real connecting IP directly to the Messaging Worker — that is, to **A2, docs/02's
+    primary adversary (the host itself)**, not merely to a passive network observer. Worth stating
+    precisely rather than as a vague "IP visible to the edge" line: this is a materially different,
+    more severe category of exposure than what R2's OHTTP/VPN/temporal-decoupling mitigation stack
+    was built for, because the Security Gate's VPN nudge does nothing to stop A2 specifically from
+    observing which IP is behind an active receiving session — see R26. An independently-operated
+    Relay also remains undeployed (see the residual note above, a separate and lesser concern).
 - **Spike remainder (de-risk):** decide trusted-setup (Groth16 ceremony) vs **transparent PLONK/Halo2** —
   still open, decide before it's load-bearing.
 - PPID sybil guard done (enrollment). `MerkleTreeDO` + nullifier one-spend done (see the "ZK airlock" entry
@@ -1130,6 +1259,8 @@ Severity × likelihood; **R1 is the one the brief explicitly asked about.**
 | **R22** | **Messaging chat transport is still a one-socket-both-directions mock** — `useChatWebSocket.ts` does one `ws.send()` for both send and receive on a single `queue_id`, not `QueueDO`'s actual documented asymmetric protocol (`POST /push` HTTP for send, WS receive-only fan-out + `{type:"ack"}` for receive) | Med | Closed | **Resolved 2026-07** (see the "R22: real transport" entry below). `useChatWebSocket.ts` deleted outright, no fallback path; the real `useQueueTransport.ts` uses the documented `POST /push` + WS-receive + `{type:"ack"}` protocol over two real unidirectional queues, plus Sealed Sender++ receipts (padded/delayed/decoupled — docs/01, docs/README #5) and real `ConvLogDO` multi-device sync (a genuine WS-hibernation gap in `ConvLogDO` found and fixed in the same pass). Live-verified: real bidirectional 1:1 delivery + receipts through `QueueDO`, and 3-device `ConvLogDO` fan-out (2 live + 1 backlog-on-connect), all against a live `wrangler dev`, zero mocking. **Not fully closed as a PRODUCT feature** — see the entry below for the honest remaining gap (real per-user queue-id provisioning / contact establishment, Flow 5/6, still doesn't exist; this pass fixed the transport primitive, not that separate system). | 3 |
 | **R23** | **Client (`apps/web`) does not generate a real Semaphore proof** — `AuthCallback.tsx`'s step 5 still references the retired mock-circuit vector and sends no `message`/`scope`; against the now-real `/auth/session` (R21, resolved server-side) this will fail (missing fields, and even patched, the old proof bytes won't verify against the new real VK). Real client-side proving needs the circuit `.wasm`+`.zkey` bundled into the web app and a browser proving step (docs/06 R6 territory — WASM size/perf). | High | Closed | **Fully Resolved 2026-07** (see the "R23: real client-side proving" and "R23 follow-up: MerkleTreeDO /proof/:commitment" entries below). `AuthCallback.tsx` generates a real Groth16 proof in-browser via `snarkjs` against the official ceremony `semaphore-20.wasm`/`.zkey`, fetching its own real Merkle proof from `MerkleTreeDO`'s new `GET /proof/:commitment` — works for a tree of ANY size, not just the sole-member case the first sub-pass shipped. Live-verified with TWO real identities, proof requested for the non-first member specifically (the key regression check): both authenticate successfully (`zk_verify_groth16_bytes -> true`, capability minted for both). | 2,4 |
 | **R24** | **1:1 message transport (R22, resolved) still ran on unauthenticated, non-ratcheting X25519 DH** — a bare ephemeral key swap with no signed prekeys (MITM-able on first contact) and no ratchet at all (one static session key for the whole chat, so a single key compromise exposes every message, past and future) — a direct gap against docs/02's G1-G4 (confidentiality, forward secrecy, post-compromise security, PQ). | High | Closed | **Resolved 2026-07** (see the "R24: real Triple Ratchet" entries in both Phase 1 and Phase 3 below). Real PQXDH-style handshake (Ed25519-signed hybrid ML-KEM-768+X25519 prekey bundle, rejects an unsigned/wrong-key bundle outright) + real Double Ratchet (per-message forward secrecy, DH-turn post-compromise security) + Sparse PQ Ratchet (periodic ML-KEM remix, chain-scoped — see the entry for why root-scoped hit a real symmetry bug and was descoped honestly). `useQueueTransport.ts`'s flat DH deleted, no fallback. Live-verified over a real `wrangler dev` QueueDO: PQXDH handshake, 4 alternating messages, key-rotation proof (identical plaintext → provably distinct ciphertext), and forward-secrecy proof (replaying an old captured message against the receiver's advanced session correctly fails). **Not claiming:** MLS/group ratcheting, a real `PrekeyDO`/identity-persistence service (still a `role`-style stand-in, same honesty standard as R22), or literal root-level (vs. chain-level) PQ propagation. | 1,3 |
+| **R25** | **OHTTP was never implemented, only stub comments claiming it existed "in production"** — `index.ts`/`wrangler.toml` said this Worker "sits behind an OHTTP relay" with no relay, no Gateway route, and no client-side encapsulation anywhere in the codebase. README calls this "load-bearing, not cosmetic": without it Cloudflare sees the real client IP on every anonymity-zone call regardless of cryptographic identity unlinkability (docs/03 §2). | High | Closed | **Resolved 2026-07** (see the "R25: real OHTTP" entry above, plus its same-day follow-up). Real RFC 9458 implementation: new `packages/ohttp` (RFC 9292 Binary HTTP framing + RFC 9458 Key Config/request/response framing, built on the real `@hpke/core` HPKE library — researched first, confirmed no maintained Gateway/framing package exists before writing any protocol code, per this task's own instruction), `workers/messaging`'s new Gateway routes (`/ohttp/keys`, `/ohttp/gateway`), new `workers/ohttp-relay` (the Relay role), `apps/web`'s `ohttpFetch` wired into all FOUR plain request/response routes: the three original ones (`/membership/insert`, `/membership/proof/:commitment`, `/auth/session`) plus `/queue/:id/push` — the real message-send path, added same-day after being flagged as under-prioritized (it's the highest-frequency OHTTP-eligible route, not a one-time enrollment call). Live-verified against real `wrangler dev` for all three roles, including a full round trip that mints a real capability, pushes a real message through OHTTP, and confirms delivery via a direct WS subscribe with the exact plaintext round-tripping. IP-visibility demonstrated structurally (the Gateway-dispatched handlers never receive a `Request` object at all, only a decapsulated `BhttpRequest` with no IP field) rather than via a locally-meaningless header comparison — see the entry above for why. **Not claiming:** WebSocket routes are OHTTP-wrapped (structurally impossible — single-shot scheme vs. persistent connection; a subscriber's IP is handed directly to A2, the Messaging Worker itself — see **R26**, tracked separately because this is a different, more severe adversary category than the network-observer threat R2's VPN/OHTTP mitigation stack targets), or an independently-operated Relay (same-account Cloudflare deploy closes this pass's target gap, not the deeper "colluding relay+gateway operator" threat docs/03 §2 already names). | 2 |
+| **R26** | **A WS subscribe/receive connection (`/queue/:id`, `/conv/:id`) hands its real connecting IP directly to A2 — docs/02's PRIMARY adversary, the host itself** ("reads all D1/R2/DO state, sees Worker inputs incl. client IP, can log & correlate, can be legally compelled") — not merely to a passive network observer (A1/A7). R25's OHTTP cannot wrap this: RFC 9458 is a single-shot request/response scheme, structurally incompatible with a persistent connection, so for the ENTIRE time a client is online receiving messages, its IP is an ordinary Worker input the Messaging Worker (and therefore Cloudflare) sees directly — no wiretap, no traffic analysis required, just an ordinary connection log. **This is a categorically different and more severe risk than R2** ("network-level correlation defeats ZK"): R2 is about an adversary correlating separate requests across time/IP; this is the primary adversary observing, continuously and trivially, exactly which IP is behind an active receiving session. | High | Open | **Not mitigated.** The Security Gate's VPN/Tor nudge (docs/README point 12, R2's own mitigation stack) does **not** close this gap — it changes *which* IP Cloudflare sees (real vs. VPN exit), not *whether* Cloudflare, as the host terminating the WS connection, can observe an IP tied to an active session; it is also voluntary/UX-dependent, not a structural guarantee, and a user who skips the VPN nudge gets no protection at all on this path. No fix implemented. Candidate mitigations, none built: a genuinely independent (non-Cloudflare) relay hop in front of WS connections specifically (distinct from R25's request/response Relay); a poll-based receive fallback that CAN be OHTTP-wrapped, trading real-time delivery latency for this protection; or accepting this as a permanent architectural limit of "real-time push over a host-terminated WebSocket" and scoping docs/02's goals to say so explicitly rather than leaving it implied only by R25's fine print. | 3 |
 
 ### R1 & R2 — the ZKP↔Workers coupling, in depth (the brief's key question)
 

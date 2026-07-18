@@ -1,0 +1,17 @@
+{
+  "name": "@vorticity/worker-ohttp-relay",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "OHTTP (RFC 9458) Relay role in front of the Messaging Plane's Gateway. See docs/06's R25 entry.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260710.1",
+    "typescript": "^5.7.2",
+    "wrangler": "^4.62.0"
+  }
+}

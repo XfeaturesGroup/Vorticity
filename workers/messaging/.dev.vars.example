@@ -6,3 +6,12 @@
 # requireCapability in index.ts). This is NOT the RSABSSA issuer key — this Worker never holds that;
 # see src/issuer-keys.ts for the (public, safe-to-commit) issuer public key instead.
 SESSION_SIGNING_KEY="replace-with-a-long-random-hex-string"
+
+# 32 bytes hex — seed for this Gateway's HPKE (X25519) keypair (RFC 9458 §3.1's Key Config), used by
+# the OHTTP Gateway role at GET /ohttp/keys / POST /ohttp/gateway (see ohttp-gateway.ts). Deterministic
+# from this seed (packages/ohttp's OhttpGateway.create), so a cold Worker start never needs to persist
+# a raw private key separately — same convention as vortic-core's seed-threaded key derivation.
+# Rotating this value changes the Gateway's public key; clients cache the old Key Config until its
+# next `GET /ohttp/keys` fetch, so a rotation briefly breaks in-flight encapsulations (acceptable —
+# this endpoint has no session state to preserve across a rotation).
+OHTTP_GATEWAY_SEED="replace-with-a-random-32-byte-hex-string"
