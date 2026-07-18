@@ -11,12 +11,14 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@semaphore-protocol/identity": "^4.11.1",
     "@vorticity/ui": "workspace:*",
     "@vorticity/vortic-core": "workspace:*",
     "lucide-react": "^1.23.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
-    "react-router-dom": "^7.13.0"
+    "react-router-dom": "^7.13.0",
+    "snarkjs": "^0.7.5"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.2",

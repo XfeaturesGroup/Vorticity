@@ -43,6 +43,15 @@ impl Drop for HybridKeyPair {
     }
 }
 
+impl HybridKeyPair {
+    /// Crate-internal only (never exported to WASM): the X25519 leg of this hybrid keypair, reused by
+    /// `ratchet.rs` as Bob's initial Double Ratchet DH keypair — exactly how Signal's spec reuses the
+    /// signed prekey as the first ratchet key, so there is no separate "ratchet prekey" to publish.
+    pub(crate) fn x25519_secret(&self) -> [u8; 32] {
+        self.x25519_sk
+    }
+}
+
 pub struct HybridCiphertext {
     pub ml_kem_ct: Vec<u8>,
     pub x25519_ephemeral_pk: [u8; 32],
@@ -128,6 +137,59 @@ fn combine(ml_kem_ss: &[u8], x25519_ss: &[u8]) -> [u8; 32] {
     ikm.extend_from_slice(x25519_ss);
     let okm = hkdf_sha256(&ikm, b"vortic-pqxdh-v1", b"root-key", 32);
     arr32(&okm)
+}
+
+// --- ML-KEM-768 only, no X25519 leg (R24: ratchet.rs's Sparse PQ Ratchet) -------------------------
+//
+// The Triple Ratchet's PQ leg periodically offers a *fresh* ML-KEM keypair in a message header and
+// gets back a lone KEM ciphertext a message or two later (docs/03 §4: "chunked ML-KEM public
+// keys/encapsulations amortized across message headers"). That is a bare ML-KEM exchange, not a
+// hybrid one — the X25519 leg of confidentiality is already carried by the Double Ratchet's own DH
+// ratchet every turn, so re-deriving a second X25519 exchange here would be redundant. Kept in this
+// module (not ratchet.rs) because it reuses the same fixed-size framing constants and private
+// `arr32`/`arr64` helpers as the hybrid path above.
+
+pub struct MlKemKeyPair {
+    dk: Vec<u8>,
+    pub ek: Vec<u8>,
+}
+
+impl Drop for MlKemKeyPair {
+    fn drop(&mut self) {
+        self.dk.zeroize();
+    }
+}
+
+pub fn ml_kem_generate_keypair(seed: &[u8; 32]) -> MlKemKeyPair {
+    let ml_kem_seed_bytes = arr64(&hkdf_sha256(seed, b"vortic-sparse-pq-v1", b"ml-kem-seed", 64));
+    let dk = DecapsulationKey::<MlKem768>::from_seed(Seed::from(ml_kem_seed_bytes));
+    let ek = dk.encapsulation_key().clone();
+    MlKemKeyPair {
+        dk: dk.to_bytes().as_slice().to_vec(),
+        ek: ek.to_bytes().as_slice().to_vec(),
+    }
+}
+
+pub fn ml_kem_encapsulate(seed: &[u8; 32], peer_ek: &[u8]) -> (Vec<u8>, [u8; 32]) {
+    let ek_key: Key<EncapsulationKey<MlKem768>> = Key::<EncapsulationKey<MlKem768>>::from(
+        <[u8; ML_KEM_768_EK_LEN]>::try_from(peer_ek).expect("bad ek length"),
+    );
+    let ek = EncapsulationKey::<MlKem768>::new(&ek_key).expect("invalid ek");
+    let m = B32::from(arr32(&hkdf_sha256(seed, b"vortic-sparse-pq-v1", b"ml-kem-encap-m", 32)));
+    let (ct, ss) = ek.encapsulate_deterministic(&m);
+    (ct.as_slice().to_vec(), arr32(ss.as_slice()))
+}
+
+pub fn ml_kem_decapsulate(keypair: &MlKemKeyPair, ct: &[u8]) -> [u8; 32] {
+    let dk_key: Key<DecapsulationKey<MlKem768>> = Key::<DecapsulationKey<MlKem768>>::from(
+        <[u8; ML_KEM_768_DK_LEN]>::try_from(keypair.dk.as_slice()).expect("bad dk length"),
+    );
+    let dk = DecapsulationKey::<MlKem768>::new(&dk_key);
+    let ct_arr = ml_kem::Ciphertext::<MlKem768>::from(
+        <[u8; ML_KEM_768_CT_LEN]>::try_from(ct).expect("bad ct length"),
+    );
+    let ss = dk.decapsulate(&ct_arr);
+    arr32(ss.as_slice())
 }
 
 // --- Fixed-size (de)serialization for the WASM boundary. A nicer typed JS wrapper is Phase 4

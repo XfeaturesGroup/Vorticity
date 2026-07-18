@@ -24,6 +24,14 @@
 // matched a real proof's public `merkleRoot` regardless of how correct the ZK verifier itself was.
 // Rebuilds the tree from the full commitment list on every query — simple and correct at this scale;
 // incrementally persisting tree state is a future optimization, not required for correctness.
+// COST NOTE (R23 follow-up, 2026-07 — flagged, not fixed): `/root`, `/insert`, and the new `/proof/:commitment`
+// (below) all pay this same O(n) Poseidon2-hashes-from-scratch cost per call, n = total commitment count.
+// Fine at the hundreds-of-members scale this pass was built/tested against; at thousands+ members this
+// rebuild-per-request pattern (now hit by proof requests too, not just insert/root) is the first place
+// to look if MerkleTreeDO latency becomes a problem — the fix would be incremental/cached tree state,
+// deliberately not built here since it wasn't yet a measured bottleneck. `/proof/:commitment` is
+// additionally per-commitment rate-limited at the `index.ts` route level (via `RateGateDO`) precisely
+// because it's unauthenticated AND pays this cost — see that route's comment.
 // SCOPE (Phase 2 pass): commitments/nullifier tables are unchanged. The nullifier sets are real and
 // enforce one-spend semantics. Single global instance for now (addressed by "global"), like AliasDO.
 //
@@ -97,6 +105,9 @@ export class MerkleTreeDO extends DurableObject<Env> {
     if (request.method === "GET" && url.pathname === "/root") {
       return Response.json({ merkleRoot: this.computeRoot() });
     }
+    if (request.method === "GET" && url.pathname.startsWith("/proof/")) {
+      return this.handleProof(url.pathname.slice("/proof/".length));
+    }
     return new Response("Not found", { status: 404 });
   }
 
@@ -111,6 +122,37 @@ export class MerkleTreeDO extends DurableObject<Env> {
     const leaves = rows.map((r) => hexToField(r.commitment));
     const tree = new LeanIMT((a: bigint, b: bigint) => poseidon2([a, b]), leaves);
     return fieldToHex(tree.root as bigint);
+  }
+
+  // Real Merkle proof (siblings path + leaf index) for a given commitment — what a client needs to
+  // build a real Semaphore witness for any tree, not just the trivial size===1 case (R23 follow-up,
+  // 2026-07). Commitments in a Semaphore membership set are PUBLIC BY DESIGN — the protocol's whole
+  // point is "prove I'm one of these known commitments without saying which one", so handing out a
+  // sibling path here is expected protocol behavior, not an anonymity leak. No capability gating: this
+  // is called BEFORE a session capability exists (the client needs this proof to even attempt
+  // /auth/session in the first place), matching the existing openness of /root and /insert.
+  // Rebuilds the tree from the full commitment list, same as `computeRoot()` — see that method's
+  // comment on the cost tradeoff; this endpoint doesn't change the cost CLASS (already O(n) Poseidon2
+  // hashes per call before this endpoint existed), just adds one more caller that pays it.
+  private handleProof(commitment: string): Response {
+    if (!HEX64_RE.test(commitment)) {
+      return new Response("commitment must be a 64-char lowercase hex (32-byte) value", { status: 400 });
+    }
+    const rows = this.ctx.storage.sql
+      .exec<CommitmentRow>("SELECT commitment FROM commitments ORDER BY seq")
+      .toArray();
+    const leafIndex = rows.findIndex((r) => r.commitment === commitment);
+    if (leafIndex === -1) {
+      return new Response("commitment not found in the membership tree", { status: 404 });
+    }
+    const leaves = rows.map((r) => hexToField(r.commitment));
+    const tree = new LeanIMT((a: bigint, b: bigint) => poseidon2([a, b]), leaves);
+    const proof = tree.generateProof(leafIndex);
+    return Response.json({
+      index: proof.index,
+      siblings: proof.siblings.map((s) => fieldToHex(s as bigint)),
+      merkleRoot: fieldToHex(tree.root as bigint),
+    });
   }
 
   private async handleInsert(request: Request): Promise<Response> {
@@ -149,16 +191,30 @@ export class MerkleTreeDO extends DurableObject<Env> {
     if (existingToken.length > 0) {
       return new Response("redemption token already spent (replay)", { status: 409 });
     }
-    this.ctx.storage.sql.exec("INSERT INTO issuer_token_null (token_null, spent_at) VALUES (?, ?)", tokenNull, Date.now());
+    const tokenSpentAt = Date.now();
+    this.ctx.storage.sql.exec("INSERT INTO issuer_token_null (token_null, spent_at) VALUES (?, ?)", tokenNull, tokenSpentAt);
+    this.ctx.waitUntil(
+      this.env.DB_MSG.prepare("INSERT INTO issuer_token_null (token_null, spent_at) VALUES (?, ?)")
+        .bind(tokenNull, tokenSpentAt)
+        .run()
+        .catch((err) => console.error("D1 mirror error (issuer_token_null):", err))
+    );
 
     // Idempotent: re-inserting an existing commitment is a no-op (INSERT OR IGNORE), so a retried
     // request doesn't grow the tree or change the root. (The tokenNull check above already prevents a
     // single token from being redeemed twice; this guards the separate case of the same commitment
     // bytes colliding, which INSERT OR IGNORE handles safely either way.)
+    const commitCreatedAt = Date.now();
     this.ctx.storage.sql.exec(
       "INSERT OR IGNORE INTO commitments (commitment, created_at) VALUES (?, ?)",
       commitment,
-      Date.now(),
+      commitCreatedAt,
+    );
+    this.ctx.waitUntil(
+      this.env.DB_MSG.prepare("INSERT OR IGNORE INTO commitments (commitment, created_at) VALUES (?, ?)")
+        .bind(commitment, commitCreatedAt)
+        .run()
+        .catch((err) => console.error("D1 mirror error (commitments):", err))
     );
     const { n } = this.ctx.storage.sql.exec<CountRow>("SELECT COUNT(*) AS n FROM commitments").one();
     return Response.json({ merkleRoot: this.computeRoot(), size: n });
@@ -185,7 +241,14 @@ export class MerkleTreeDO extends DurableObject<Env> {
     if (existing.length > 0) {
       return new Response("nullifier already spent (replay)", { status: 409 });
     }
-    this.ctx.storage.sql.exec("INSERT INTO nullifiers (nullifier, spent_at) VALUES (?, ?)", nullifier, Date.now());
+    const spentAt = Date.now();
+    this.ctx.storage.sql.exec("INSERT INTO nullifiers (nullifier, spent_at) VALUES (?, ?)", nullifier, spentAt);
+    this.ctx.waitUntil(
+      this.env.DB_MSG.prepare("INSERT INTO nullifiers (nullifier, spent_at) VALUES (?, ?)")
+        .bind(nullifier, spentAt)
+        .run()
+        .catch((err) => console.error("D1 mirror error (nullifiers):", err))
+    );
     return Response.json({ ok: true });
   }
 }

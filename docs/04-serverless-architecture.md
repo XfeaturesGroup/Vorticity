@@ -202,12 +202,12 @@ sequenceDiagram
 flowchart TB
     subgraph Client["Client — React/Vite + vortic-core (WASM)"]
       UI[UI kits: Xfeatures site + HQ]
-      Core[vortic-core: ratchet/MLS/ZK/ring/OPRF]
+      Core[vortic-core: ratchet/MLS/ZK/ring/RSABSSA]
       Store[(IndexedDB + OPFS<br/>keys, ratchet, CRDT)]
     end
     subgraph Edge["Cloudflare Edge"]
       subgraph EP["Enrollment Plane — id.vort"]
-        EW[Enrollment Worker<br/>OAuth · VOPRF · PPID]
+        EW[Enrollment Worker<br/>OAuth · RSABSSA · PPID]
         DE[(D1 enroll<br/>PPID counters only)]
       end
       OH[[OHTTP Relay<br/>strips client IP]]
@@ -259,6 +259,11 @@ enrollment-plane migration.
 
 ### `DB_MSG` (Messaging Plane) — no column can hold PII or a cross-plane join key
 ```sql
+CREATE TABLE commitments (            -- Semaphore identity commitments (Flow 1, RSABSSA redemption)
+  seq INTEGER PRIMARY KEY,
+  commitment TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
 CREATE TABLE merkle_nodes (           -- Lean IMT mirror (DO is authoritative)
   group_id  TEXT, idx INTEGER, level INTEGER, hash TEXT,
   PRIMARY KEY (group_id, level, idx)
@@ -268,8 +273,8 @@ CREATE TABLE group_roots (
   PRIMARY KEY (group_id, epoch)
 );
 CREATE TABLE nullifiers (             -- per-epoch session/anti-sybil nullifiers (Flow 2, ZK session)
-  external_nullifier TEXT, nullifier_hash TEXT, epoch INTEGER,
-  PRIMARY KEY (external_nullifier, nullifier_hash)
+  nullifier TEXT PRIMARY KEY,
+  spent_at  INTEGER NOT NULL
 );
 CREATE TABLE issuer_token_null (       -- redemption-token replay guard (Flow 1, RSABSSA) — see the
   token_null TEXT PRIMARY KEY,         -- DB_ENROLL bugfix note above. token_null = H(msg); unlinkable

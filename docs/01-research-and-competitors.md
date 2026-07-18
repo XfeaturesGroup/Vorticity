@@ -138,7 +138,7 @@ account layer without the linkability, via blinded enrollment + ZK membership.*
 | 1:1 ratchet | **Triple Ratchet / SPQR-style** | Signal's Oct-2025 design; FS + PCS + PQ, silent. |
 | Group protocol | **MLS (RFC 9420)** via `mls-rs` / OpenMLS | Tree-based PCS for thousands; production Rust → WASM. |
 | ZK membership | **Semaphore v4** (Lean IMT, EdDSA id, Poseidon, Groth16) | Purpose-built anonymous group membership + nullifiers. |
-| Anonymous enrollment | **VOPRF / Privacy Pass blinded tokens** (RFC 9578 family) | Unlinkable "I'm an enrolled member" credential. |
+| Anonymous enrollment | **RSA Blind Signatures (RSABSSA)** (RFC 9474) | Unlinkable "I'm an enrolled member" credential. |
 | Anon authorship | **Linkable ring signatures (LSAG/bLSAG)** | Sender-in-set anonymity + per-epoch spam linkability. |
 | Transport | **SimpleX-style pairwise queues** on Durable Objects | No user IDs on the wire; graph invisibility. |
 | Real-time | **Durable Objects + WebSocket Hibernation** + `@cloudflare/actors` | Pub/Sub is retired; DO hibernation makes idle sockets ~free. |

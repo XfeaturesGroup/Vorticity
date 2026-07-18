@@ -20,15 +20,21 @@
 //                                          workers/messaging/src/issuer-keys.ts), then inserts a
 //                                          random Semaphore `commitment` into MerkleTreeDO and
 //                                          returns the Merkle root.
-//   Step 5 "Proving Membership (ZK)"     — REAL POST /auth/session: sends a genuine Groth16 proof
-//                                          (the zk_test.rs vector) + root + nullifier; the Worker runs
-//                                          the real WASM verifier (zk.rs) and, on true, mints a signed
-//                                          session `capability` — which becomes the login token.
-// Honest remaining gaps: the identity message and ZK nullifier are random-per-session (a real
-// deployment derives them from a stable identity so re-enrollment/replay across sessions is
-// detectable); the ZK proof is a fixed valid vector, not one generated live from the client's actual
-// membership witness (needs the real Semaphore circuit); and there's no ratchet/PQ hybrid in the
-// chat cipher yet.
+//   Step 5 "Proving Membership (ZK)"     — REAL POST /auth/session: a genuine Groth16 proof (R23,
+//                                          2026-07) generated IN-BROWSER via snarkjs against the
+//                                          official PSE ceremony `semaphore-20.wasm`/`.zkey`
+//                                          (`public/zk/`, see `../lib/zkProof.ts`) for the identity
+//                                          just inserted in step 4. The Worker runs the real WASM
+//                                          verifier (zk.rs) and, on true, mints a signed session
+//                                          `capability` — which becomes the login token.
+// Real client-side proving (`zkProof.ts`) now works for a tree of any size: after step 4 inserts this
+// identity's commitment, this page fetches the identity's own real Merkle proof from the Worker's
+// `GET /membership/proof/:commitment` (backed by `MerkleTreeDO`'s `/proof/` route — commitments are
+// public by Semaphore's own design, so this needs no capability gate any more than `/root` does) before
+// generating the ZK proof.
+// Honest remaining gaps: the identity message (RSABSSA redemption token) is random-per-session (a real
+// deployment derives it from a stable identity so re-enrollment/replay across sessions is detectable);
+// and there's no ratchet/PQ hybrid in the chat cipher yet.
 import { useEffect, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { CheckCircle2, Circle, Loader2, Shield, XCircle } from "lucide-react";
@@ -37,6 +43,7 @@ import { initCrypto, blindSigBlind, blindSigFinalize, blindSigRandomizer } from 
 import { useAuth } from "../contexts/AuthContext";
 import { PKCE_VERIFIER_KEY } from "../lib/pkce";
 import { ISSUER_PK_PEM } from "../lib/issuerKey";
+import { Identity, proveMembershipSession, type MerkleProofResponse } from "../lib/zkProof";
 
 const STEPS = [
   "Exchanging OAuth Token",
@@ -62,25 +69,13 @@ function bytesToHex(bytes: Uint8Array): string {
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
 }
-function hexToBytes(hex: string): Uint8Array {
-  const out = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
-  return out;
-}
-function randomHex32(): string {
-  return bytesToHex(crypto.getRandomValues(new Uint8Array(32)));
+function fieldToHex(n: bigint): string {
+  return n.toString(16).padStart(64, "0");
 }
 
 interface TokenIssueResponse {
   blindSig: string;
 }
-
-// A REAL, valid Groth16/BN254 proof (256 bytes, hex) — the deterministic vector from vortic-core's
-// zk_test.rs (the 4/4-green Semaphore-shaped circuit). We deliberately do NOT ship snarkjs; the
-// Messaging Worker holds the matching verifying key + public inputs and runs the real WASM verifier
-// (zk.rs) over these bytes. See workers/messaging/src/session.ts for the honest scope note.
-const VALID_ZK_PROOF_HEX =
-  "17e8e4cb5be7c7ae9910066d462dc7e9c66e3282686f29332d615d9599c657571c11002e2bda601495863af1e379071d0eb59be411440c7ea6a669782ca8138215e4007f899308c6176545905f34a72166aa2f85de8584bd3f3fad7388f20ed91ebdff6a6676487c7f4c736931299a163c3478209fbc97e465c653db7674fb91003994c49f76d357ed927be3cd05bca8831af2dfd424f033e116ca2066de4d7825d9b41fe952bf764ff97e2bafbfd52084b4f5307fdaa76c32a23eb7c0d2cd2b1e2a50e263209480e20377a3d372000f2c4bd848d95d3e11ee291e3c1d344f4f2216b023701ab5f35b925f4d05b2f801d5fb21cce8db0d6bd0e5cd0a194748c8";
 
 interface MembershipInsertResponse {
   merkleRoot: string;
@@ -249,10 +244,14 @@ export function AuthCallback() {
       console.log(`[Enroll] Redemption token issued+finalized: msg 0x${bytesToHex(identityMsg).slice(0, 16)}...`);
       await wait(300);
 
-      // --- Step 4 (Flow 1): redeem the token -> insert a commitment into the Merkle tree ---
+      // --- Step 4 (Flow 1): redeem the token -> insert a REAL Semaphore identity commitment ---
+      // (R23, 2026-07) `identity.commitment = Poseidon2(Ax,Ay)` — the real Semaphore v4 identity
+      // scheme, generated fresh per session (see this file's header comment on the honest gap: a real
+      // deployment would derive this from a stable, re-usable identity, not a fresh random one).
       if (runId.current !== token) return;
       setStepIndex(3);
-      const commitment = randomHex32();
+      const identity = new Identity();
+      const commitment = fieldToHex(identity.commitment);
       let insertRes: Response;
       try {
         insertRes = await fetch(`${MESSAGING_API_URL}/membership/insert`, {
@@ -275,21 +274,62 @@ export function AuthCallback() {
         setNetworkError(body.error || `Membership insert failed (HTTP ${insertRes.status})`);
         return;
       }
-      const { merkleRoot } = (await insertRes.json()) as MembershipInsertResponse;
-      console.log(`[Membership] commitment inserted; merkleRoot 0x${merkleRoot.slice(0, 16)}...`);
+      const { merkleRoot: insertedRoot, size } = (await insertRes.json()) as MembershipInsertResponse;
+      console.log(`[Membership] commitment inserted; merkleRoot 0x${insertedRoot.slice(0, 16)}..., size ${size}`);
       await wait(300);
 
-      // --- Step 5 (Flow 2): prove membership in ZK -> receive a session capability ---
+      // --- Step 5 (Flow 2): generate a REAL Groth16 proof in-browser -> receive a session capability ---
       if (runId.current !== token) return;
       setStepIndex(4);
-      const nullifier = randomHex32();
-      const proofB64 = bytesToB64(hexToBytes(VALID_ZK_PROOF_HEX));
+      // Fetch this identity's OWN real Merkle proof (siblings + index) — MerkleTreeDO's new
+      // /proof/:commitment route, needed for any tree size beyond the earlier sole-member special case.
+      let merkleProofRes: Response;
+      try {
+        merkleProofRes = await fetch(`${MESSAGING_API_URL}/membership/proof/${commitment}`);
+      } catch {
+        if (runId.current === token) setNetworkError(`Could not reach the Messaging Worker at ${MESSAGING_API_URL}.`);
+        return;
+      }
+      if (runId.current !== token) return;
+      if (!merkleProofRes.ok) {
+        const body = (await merkleProofRes.json().catch(() => ({}))) as { error?: string };
+        setNetworkError(body.error || `Merkle proof lookup failed (HTTP ${merkleProofRes.status})`);
+        return;
+      }
+      const merkleProof = (await merkleProofRes.json()) as MerkleProofResponse;
+      console.log(`[Session] fetched Merkle proof: index ${merkleProof.index}, ${merkleProof.siblings.length} sibling(s)`);
+
+      let proof: Awaited<ReturnType<typeof proveMembershipSession>>;
+      try {
+        proof = await proveMembershipSession(identity, merkleProof);
+      } catch (err) {
+        setNetworkError(`ZK proof generation failed: ${(err as Error).message}`);
+        return;
+      }
+      if (runId.current !== token) return;
+      if (proof.merkleRoot !== merkleProof.merkleRoot) {
+        setNetworkError(
+          `Internal error: the circuit's own merkleRoot output (0x${proof.merkleRoot.slice(0, 16)}...) does not ` +
+            `match the root the Merkle proof was built against (0x${merkleProof.merkleRoot.slice(0, 16)}...).`,
+        );
+        return;
+      }
+      console.log(
+        `[Session] real proof generated in-browser: merkleRoot 0x${proof.merkleRoot.slice(0, 16)}..., ` +
+          `nullifier 0x${proof.nullifier.slice(0, 16)}...`,
+      );
       let sessionRes: Response;
       try {
         sessionRes = await fetch(`${MESSAGING_API_URL}/auth/session`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ proof: proofB64, merkleRoot, nullifier }),
+          body: JSON.stringify({
+            proof: bytesToB64(proof.proofBytes),
+            merkleRoot: proof.merkleRoot,
+            nullifier: proof.nullifier,
+            message: proof.message,
+            scope: proof.scope,
+          }),
         });
       } catch {
         if (runId.current === token) setNetworkError(`Could not reach the Messaging Worker at ${MESSAGING_API_URL}.`);

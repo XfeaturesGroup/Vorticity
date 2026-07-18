@@ -18,6 +18,7 @@ client-full = [
     "dep:chacha20poly1305",
     "dep:base64",
     "dep:getrandom",
+    "dep:ed25519-dalek",
 ]
 # Edge builds (Cloudflare Workers) must be able to compile WITHOUT linking any decryption or
 # proving code — this is the crate-level enforcement of docs/03 crypto invariant #4 ("the edge
@@ -87,6 +88,13 @@ kem = { version = "0.3.0", optional = true }
 chacha20poly1305 = { version = "0.10", optional = true, default-features = false, features = ["alloc"] }
 base64 = { version = "0.22", optional = true }
 getrandom = { version = "0.2", optional = true, features = ["js"] }
+
+# client-full only (R24): long-term device identity signing (docs/03 §1 "Long-term device: Ed25519 +
+# X25519 + ML-KEM") — authenticates PQXDH prekey bundles so the ratchet handshake isn't bare
+# unauthenticated DH. `Signer::sign` is deterministic per RFC 8032 (nonce derived from
+# SHA-512(seed) internally), so — same as every other client-full dep here — no RNG/getrandom
+# backend is needed for signing itself.
+ed25519-dalek = { version = "2", optional = true, default-features = false, features = ["alloc", "zeroize"] }
 
 [dev-dependencies]
 ark-relations = { version = "0.6.0", default-features = false }

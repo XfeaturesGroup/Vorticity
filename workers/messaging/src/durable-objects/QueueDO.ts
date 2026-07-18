@@ -14,15 +14,13 @@
 // mirroring to D1 (if ever needed for cross-region durability) is a separate concern, not part of
 // the hot push/pull path.
 //
-// PHASE 5 TRANSPORT-SPIKE RELAY (webSocketMessage below): any JSON text frame that isn't the
-// `{type:"ack",...}` protocol frame gets broadcast verbatim to every OTHER socket currently
-// attached to this queue (see `relayToOthers`). This is NOT the real push/ack split described in
-// the rest of this file — a real push is `POST /push` over HTTP with a ciphertext body, TTL, and
-// size bucket, and gets persisted + fanned out via `fanOut()`. The relay path is unpersisted and
-// exists solely so apps/web's `useChatWebSocket.ts` can exercise the local dev loop end-to-end
-// (browser <-> `wrangler dev`) before the real capability bridge and push/ack reconciliation land.
-// It's a deliberate, temporary widening of this DO's job, not an oversight — revisit once the real
-// protocol is wired all the way through.
+// R22 (2026-07): the earlier "Phase 5 transport-spike relay" — broadcasting any non-ack WS text
+// frame verbatim to other sockets, unpersisted — is REMOVED as of this pass. It existed only so
+// apps/web's old `useChatWebSocket.ts` (raw `ws.send()` both ways) had something to talk to. The
+// real client (see apps/web/src/hooks/useQueueTransport.ts) now uses the real protocol this file
+// already implemented: `POST /push` to send (persisted, fanned out via `fanOut()`), WS receive-only
+// push + `{type:"ack",upToSeq}` frames to receive/acknowledge. `webSocketMessage` below now handles
+// ONLY the ack frame — anything else is a malformed/unexpected client and is ignored, not relayed.
 //
 // WEBSOCKET HIBERNATION — what it actually buys us here (being precise, not oversold): while a
 // subscriber's socket sits open with no traffic, the DO holds no in-memory JS state and accrues no
@@ -218,8 +216,8 @@ export class QueueDO extends DurableObject<Env> {
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  override async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
-    if (typeof message !== "string") return; // ack/relay protocol is JSON text frames only
+  override async webSocketMessage(_ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    if (typeof message !== "string") return; // the ack protocol is JSON text frames only
     let parsed: unknown;
     try {
       parsed = JSON.parse(message);
@@ -231,23 +229,9 @@ export class QueueDO extends DurableObject<Env> {
       this.ctx.storage.sql.exec("DELETE FROM messages WHERE seq <= ?", obj.upToSeq);
       return;
     }
-
-    // Phase 5 transport-spike relay (see file-header note): everything else — e.g. the plaintext
-    // {type:"message",...} frames apps/web's useChatWebSocket.ts sends — gets broadcast as-is to
-    // every OTHER socket on this queue. Unpersisted, best-effort, not the real push path.
-    this.relayToOthers(ws, message);
-  }
-
-  /** Broadcasts a raw text frame to every attached socket except the one it came from. */
-  private relayToOthers(sender: WebSocket, message: string): void {
-    for (const ws of this.ctx.getWebSockets()) {
-      if (ws === sender) continue;
-      try {
-        ws.send(message);
-      } catch {
-        // A dead/closing socket shouldn't break the relay for everyone else.
-      }
-    }
+    // Anything else is not part of this DO's protocol (the real push path is POST /push, not a WS
+    // frame) — ignore rather than crash the socket on an unexpected/malformed message from an
+    // untrusted client, same tolerance as the JSON.parse failure above.
   }
 
   override async webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean): Promise<void> {

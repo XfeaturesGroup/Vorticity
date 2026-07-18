@@ -25,6 +25,12 @@ import init, {
   blindsig_blind,
   blindsig_finalize,
   blindsig_verify,
+  kem_generate_keypair,
+  kem_public_key_from_keypair,
+  identity_verifying_key,
+  identity_sign_bundle,
+  identity_verify_bundle,
+  RatchetSession,
 } from "../pkg/client/vortic_core.js";
 import wasmUrl from "../pkg/client/vortic_core_bg.wasm?url";
 
@@ -153,4 +159,52 @@ export function blindSigFinalize(pkPem: string, blindingState: Uint8Array, blind
 /// client-side self-check before sending, e.g. in tests.)
 export function blindSigVerify(pkPem: string, msg: Uint8Array, msgRandomizer: Uint8Array, sig: Uint8Array): boolean {
   return blindsig_verify(pkPem, msg, msgRandomizer, sig);
+}
+
+// --- Triple Ratchet (R24): PQXDH-style authenticated handshake + Double + Sparse-PQ Ratchet ---
+// See packages/vortic-core/src/ratchet.rs's module doc for the full design. Everything below is a
+// thin wrapper: all cryptographic state lives inside the WASM `RatchetSession` object; this module
+// only adds the "fresh randomness on every call" convention JS call sites need to follow.
+
+export { RatchetSession };
+
+/// 96 bytes of fresh CSPRNG entropy — the `entropy` argument every `RatchetSession.encryptMessage`/
+/// `decryptMessage` call requires. Most of it goes unused on any given call (only consumed if that
+/// specific call happens to trigger a DH ratchet turn or a Sparse-PQ-Ratchet event) — see ratchet.rs's
+/// `Entropy` doc comment — but which case applies isn't knowable in advance, so always draw fresh.
+export function freshRatchetEntropy(): Uint8Array {
+  const bytes = new Uint8Array(96);
+  crypto.getRandomValues(bytes);
+  return bytes;
+}
+
+/// A device's long-term hybrid (ML-KEM-768 + X25519) prekey keypair, deterministic from a 32-byte
+/// seed the caller persists locally (e.g. IndexedDB) — never sent anywhere. Requires `initCrypto()`.
+export function kemGenerateKeypair(seed: Uint8Array): Uint8Array {
+  return kem_generate_keypair(seed);
+}
+
+/// The public half of a `kemGenerateKeypair` output — this is the prekey bundle to sign
+/// (`identitySignBundle`) and publish. Requires `initCrypto()`.
+export function kemPublicKeyFromKeypair(keypairBytes: Uint8Array): Uint8Array {
+  return kem_public_key_from_keypair(keypairBytes);
+}
+
+/// The public verifying key for a long-term Ed25519 identity, deterministic from a 32-byte seed the
+/// caller persists locally. Publish this once (e.g. alongside the prekey bundle) so peers can verify
+/// signed bundles. Requires `initCrypto()`.
+export function identityVerifyingKey(seed: Uint8Array): Uint8Array {
+  return identity_verifying_key(seed);
+}
+
+/// Sign a hybrid prekey bundle (`kemPublicKeyFromKeypair`'s output) with the long-term identity
+/// derived from `seed` — this signature is what makes a peer's `RatchetSession.handshakeInitiate`
+/// call authenticated rather than bare DH. Requires `initCrypto()`.
+export function identitySignBundle(seed: Uint8Array, hybridPublicBytes: Uint8Array): Uint8Array {
+  return identity_sign_bundle(seed, hybridPublicBytes);
+}
+
+/// Verify a signed prekey bundle against a peer's published verifying key. Requires `initCrypto()`.
+export function identityVerifyBundle(verifyingKey: Uint8Array, hybridPublicBytes: Uint8Array, sig: Uint8Array): boolean {
+  return identity_verify_bundle(verifyingKey, hybridPublicBytes, sig);
 }

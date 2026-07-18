@@ -31,7 +31,7 @@ BLAKE3 for blobs, **Poseidon** inside circuits. **Sig** = Ed25519 (transport) / 
 | Layer | Keypair | Known to | Purpose |
 |---|---|---|---|
 | **Account** | OAuth (Xfeatures) | IdP only | Onboarding, anti-Sybil, recovery gate |
-| **Enrollment credential** | blinded VOPRF token | nobody-linkably | "I'm an enrolled member" — unlinkable |
+| **Enrollment credential** | blinded RSABSSA token | nobody-linkably | "I'm an enrolled member" — unlinkable |
 | **Membership** | Semaphore id `(trapdoor, nullifier)` → commitment | in Merkle set (anon) | ZK proof of membership |
 | **Long-term device** | Ed25519 + X25519 + ML-KEM | peers only (via prekeys) | Ratchet handshake, device auth |
 | **Ephemeral** | per-message ratchet keys | derived | FS/PCS |
@@ -283,7 +283,7 @@ size padded. Server can host and serve but never decrypt, thumbnail, or classify
 1. No primitive with a single point of failure — **always hybrid** on the confidentiality path.
 2. Nonces never reused (per-key deterministic counters or 192-bit random for XChaCha).
 3. All comparisons of secrets are **constant-time**; all key material `zeroize`d on drop.
-4. The **edge only ever *verifies*** (Groth16, ring sigs, OPRF-DLEQ) and holds **no decryption keys**, ever.
+4. The **edge only ever *verifies*** (Groth16, ring sigs, RSABSSA-verify) and holds **no decryption keys**, ever.
 5. Circuit + verifier keys are pinned, versioned, and reproducibly built; a trusted-setup ceremony (Groth16)
    or migration to a **transparent-setup system (PLONK/Halo2)** is tracked as a risk (see [06](06-roadmap-and-risks.md)).
 6. Public aliases are **opt-in and default-off**; an alias record stores no identity and no plaintext nickname,

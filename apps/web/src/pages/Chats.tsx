@@ -6,7 +6,7 @@
 import { useCallback, useState } from "react";
 import { ChatList } from "../components/chat/ChatList";
 import { ActiveChatPanel } from "../components/chat/ActiveChatPanel";
-import { useChatWebSocket } from "../hooks/useChatWebSocket";
+import { useQueueTransport } from "../hooks/useQueueTransport";
 import { INITIAL_CHATS, formatNow, type Chat, type ChatMessage } from "../lib/mockChats";
 
 export function Chats() {
@@ -16,7 +16,7 @@ export function Chats() {
   const activeChat = chats.find((c) => c.id === activeChatId) ?? null;
 
   // Appends a message pushed down the wire for `chatId` into that chat's history. Only the active
-  // chat ever has a live socket (see useChatWebSocket's scoping note), so this always targets the
+  // chat ever has a live socket (see useQueueTransport's scoping note), so this always targets the
   // conversation currently on screen — no unread-badge bump needed, it's already being read live.
   const handleIncoming = useCallback((chatId: string, message: ChatMessage) => {
     setChats((prev) =>
@@ -28,7 +28,10 @@ export function Chats() {
     );
   }, []);
 
-  const { status: socketStatus, sendMessage } = useChatWebSocket(activeChatId, handleIncoming);
+  // "initiator" default: this mock UI has no real per-user identity yet to derive a role from (real
+  // queue-id/role provisioning is Flow 5/6 contact establishment, not built) — see
+  // useQueueTransport.ts's header comment. A real two-party exchange needs one side on each role.
+  const { status: socketStatus, sendMessage } = useQueueTransport(activeChatId, "initiator", handleIncoming);
 
   const handleSelect = (id: string) => {
     setActiveChatId(id);

@@ -36,6 +36,18 @@ function merkleStub(env: Env) {
   return env.MERKLE_TREE_DO.get(env.MERKLE_TREE_DO.idFromName("global"));
 }
 
+// /membership/proof/:commitment (below) is necessarily unauthenticated — it's called BEFORE a session
+// capability can exist, and MerkleTreeDO rebuilds the whole tree per call (see its header comment's cost
+// note), so an unrate-limited caller could force repeated O(n) rebuilds against one commitment. RateGateDO
+// is sharded by epoch bucket (docs/04 DO catalog) — one fresh counter set per epoch, so this needs no
+// explicit reset/cleanup logic.
+const PROOF_RATE_LIMIT_PER_EPOCH = 20;
+
+function rateGateStub(env: Env) {
+  const epoch = Math.floor(Date.now() / 1000 / 3600);
+  return env.RATE_GATE_DO.get(env.RATE_GATE_DO.idFromName(`epoch:${epoch}`));
+}
+
 // The session capability minted by /auth/session gates every conversation route. A browser can't set
 // headers on `new WebSocket()`, so the /queue upgrade carries it as a `?cap=` query param; plain HTTP
 // routes (/conv, /group) use `Authorization: Bearer <cap>`. Accept either everywhere for uniformity.
@@ -62,6 +74,7 @@ async function requireCapability(request: IRequest, env: Env): Promise<Response 
 router.options("*", (request: IRequest) => new Response(null, { headers: corsHeaders(request.headers.get("Origin")) }));
 
 router.get("/health", () => Response.json({ ok: true, plane: "messaging" }));
+
 
 // Flow 1 (docs/04): redeem an Enrollment-issued RSABSSA token by inserting the client's Semaphore
 // `commitment` into the membership accumulator; return the new Merkle root. Replaces the earlier
@@ -111,6 +124,42 @@ router.post("/membership/insert", async (request: IRequest, env: Env) => {
   if (!res.ok) return errorResp(`MerkleTreeDO insert failed (${res.status})`, origin, 502);
   const inserted = (await res.json()) as { merkleRoot: string; size: number };
   return jsonResp(inserted, origin);
+});
+
+// R23 follow-up (2026-07): a client needs its own Merkle proof (siblings path + leaf index) to build a
+// real Semaphore witness for any tree beyond the trivial single-member case. Commitments are PUBLIC BY
+// DESIGN in Semaphore (the proof is "I'm one of these known commitments", not "here's a secret list") —
+// so, like `/membership/insert`'s root response, this deliberately carries no capability gate: it's
+// called BEFORE a session capability can even exist (the client needs this proof to attempt
+// /auth/session in the first place). Rate-limited PER COMMITMENT instead (see `rateGateStub` above) —
+// this is an O(n) tree rebuild on MerkleTreeDO's side per call, and an unauthenticated caller who
+// already knows one commitment (e.g. their own) could otherwise force unlimited rebuilds against it.
+router.get("/membership/proof/:commitment", async (request: IRequest, env: Env) => {
+  const origin = request.headers.get("Origin");
+  const commitment = request.params.commitment;
+  if (!commitment || !HEX64_RE.test(commitment)) {
+    return errorResp("commitment must be a 64-char lowercase hex (32-byte) value", origin, 400);
+  }
+
+  const rateRes = await rateGateStub(env).fetch(
+    new Request("https://do/check", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key: `proof:${commitment}`, limit: PROOF_RATE_LIMIT_PER_EPOCH }),
+    }),
+  );
+  if (!rateRes.ok) return errorResp(`Rate check failed (${rateRes.status})`, origin, 502);
+  const { allowed, count, limit } = (await rateRes.json()) as { allowed: boolean; count: number; limit: number };
+  if (!allowed) {
+    console.log(`[Membership] proof rate limit hit for commitment ${commitment.slice(0, 16)}… (${count}/${limit} this epoch)`);
+    return errorResp("Too many proof requests for this commitment this epoch — try again next epoch", origin, 429);
+  }
+
+  const res = await merkleStub(env).fetch(new Request(`https://do/proof/${commitment}`));
+  if (res.status === 404) return errorResp("commitment not found in the membership tree", origin, 404);
+  if (!res.ok) return errorResp(`MerkleTreeDO proof lookup failed (${res.status})`, origin, 502);
+  const proof = (await res.json()) as { index: number; siblings: string[]; merkleRoot: string };
+  return jsonResp(proof, origin);
 });
 
 // Flow 2 (docs/04): prove membership in zero knowledge -> mint a session capability. The client sends

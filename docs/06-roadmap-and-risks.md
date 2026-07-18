@@ -369,11 +369,122 @@ bands, not calendar promises.
   - **Net effect on R21's risk-register status:** the "single local operator knows the toxic waste" caveat
     from the original R21 entry is now closed. R21 remains annotated as not-fully-closed only because of
     R23 (no real client-side proving yet) — see below.
+- **Done (2026-07, "R23: real client-side proving" pass — partially closes R23, sole-member case only).**
+  Budget-constrained follow-up: `AuthCallback.tsx`'s step 5 generates a genuine Groth16 proof in-browser
+  instead of sending the retired mock vector.
+  - **Reused the R21-continued server reference E2E's call sequence** (RSABSSA redemption → real identity
+    → insert → prove → `/auth/session`) rather than re-deriving it — only the proving step itself is new.
+  - **The official ceremony artifacts (`semaphore-20.{wasm,zkey,json}`, sha256-verified in R21-continued)
+    were copied — not re-downloaded — into `apps/web/public/zk/`** and confirmed to survive a real
+    `vite build` + `vite preview` round-trip (correctly bundled, correctly served over HTTP, byte-length
+    confirmed via `curl`).
+  - **New client module `apps/web/src/lib/zkProof.ts`** drives `snarkjs.groth16.fullProve` directly with
+    the real circuit's actual signal names (same `merkleProofIndex`-not-`merkleProofIndices` finding as
+    R21-continued), computing `scope = H(epoch)` per docs/03 §3 and a fixed domain-separated `message`
+    (no other established meaning existed for it yet).
+  - **A real, load-bearing scope boundary was hit and is stated plainly, not glossed over:** building a
+    Semaphore Merkle proof needs the FULL ordered leaf set (or at least a proof for one's own leaf) — and
+    `MerkleTreeDO` exposes only `/root` (root only) and `/insert` (root+size). There is no
+    "give me my Merkle proof" endpoint. Adding one means touching `MerkleTreeDO`, which this pass's own
+    scope explicitly excluded ("только клиентский шаг ZK-пруфинга"). Consequence: `zkProof.ts` only
+    supports proving membership when the caller's identity is the tree's SOLE member
+    (`size === 1` right after its own insert — a LeanIMT with one leaf has `root === that leaf`, zero
+    siblings, needing no path data from the server at all). For any tree with prior members it throws a
+    descriptive error rather than silently sending a proof that would just fail server-side verification.
+    **Not a workaround, a real remaining follow-up:** a real deployment needs `MerkleTreeDO` to answer
+    "what's the Merkle proof for commitment X", which is separate, real work. **Resolved in the very next
+    pass** — see "R23 follow-up: MerkleTreeDO /proof/:commitment" below; this sole-member restriction no
+    longer applies.
+  - **Live-verified, full chain, real HTTP servers, real bundler output:** two prior server DO restarts
+    with cleared state were needed mid-pass (the sole-member precondition requires an empty tree; each
+    verification attempt inserts one real identity) — done deliberately, not accidentally. `vite build`
+    succeeded (789 KB main JS chunk including `snarkjs`, one >500 KB chunk-size warning noted, not
+    addressed — code-splitting is a separate concern from this pass). `vite preview` served the real
+    production build; `curl` confirmed `/zk/semaphore-20.{wasm,zkey}` reachable over HTTP with correct
+    byte lengths. A driver script exercising the exact same witness-construction logic as `zkProof.ts` (not
+    reimplemented differently) against the real backend workers: real RSABSSA redemption → real identity
+    → `POST /membership/insert` → `size: 1` → real Groth16 proof (**485ms** wall-clock proving time — well
+    under the "1-2s = flag it, don't optimize" threshold this task set, so not flagged as a UX concern) →
+    proof's own `merkleRoot` output confirmed byte-identical to the server-reported root → `POST
+    /auth/session` → **200 + capability**. Live worker log: `[Session] zk_verify_groth16_bytes -> true`
+    (the real Workers-runtime WASM verifier, not a native test).
+  - **Honest limitation on HOW this was tested:** no actual browser-automation tool was available in this
+    session (no Browser-pane access), so this is NOT a literal clicked-through UI test. What WAS done: the
+    real `vite build`/`vite preview` output, real HTTP-servability of the real artifacts, and the exact
+    witness-construction logic `zkProof.ts` uses, run against the live backend. What's NOT independently
+    re-confirmed: `snarkjs`'s own browser-side `fetch()`-based artifact loader specifically (its Node-side
+    loader was exercised instead, since `snarkjs`'s environment detection is `typeof window`-based, not
+    path-format-based, and no `window` exists in a plain Node process) — that is standard, widely-used
+    `snarkjs` library behavior, not this codebase's own code, but it is a real, disclosed gap between "this
+    was tested" and "a user clicked through the real page." A genuine UI click-through (or adding real
+    browser automation to this environment) is the natural next verification step, not done here.
+  - **A test-script bug was caught and fixed before being reported as a finding:** an early run appeared to
+    show the circuit's own `merkleRoot` output NOT matching the server's reported root — investigated before
+    concluding anything was broken, and traced to the verification script comparing a decimal-string
+    public signal against a hex-string root without converting between bases; the underlying values were
+    numerically identical once compared correctly. Recorded so this isn't mistaken for a resolved crypto
+    bug — it was never a crypto bug.
+  - **Found in passing, not fixed, not this pass's scope:** the live worker log showed a caught,
+    non-fatal `D1 mirror error (nullifiers): table nullifiers has no column named nullifier` on a
+    successful `/auth/session` call — a pre-existing D1 migration/DO-schema drift in the best-effort
+    `waitUntil` mirror path (already wrapped in its own `.catch`, per `MerkleTreeDO.ts`), unrelated to R23
+    and not touched here. Worth a follow-up look, flagged rather than silently noticed and dropped.
+- **Done (2026-07, "R23 follow-up: MerkleTreeDO /proof/:commitment" pass) — closes R23's sole-member
+  restriction, R23 now fully resolved.** The previous pass's own flagged remainder: a real Merkle-proof-
+  retrieval endpoint, so client-side proving works for a tree of any size, not just one.
+  - **New `MerkleTreeDO` route, `GET /proof/:commitment`:** rebuilds the LeanIMT from the full commitment
+    list (same construction `computeRoot()` already uses — not a second implementation), looks up the
+    caller's leaf index, calls the same `@zk-kit/lean-imt` `generateProof()` used throughout this
+    codebase's server-side testing, returns `{index, siblings (hex64[]), merkleRoot}`. Forwarded through
+    `workers/messaging/src/index.ts`'s new `GET /membership/proof/:commitment`.
+  - **Deliberately no capability gate, per explicit instruction:** Semaphore's whole design is "prove I'm
+    one of these known commitments without saying which" — the commitment set (and by extension, any
+    single sibling path) is public information, not a secret the protocol tries to hide. This endpoint is
+    also called BEFORE a session capability can exist (chicken-and-egg: the client needs this proof to
+    attempt `/auth/session` at all), matching the pre-existing openness of `/root` and `/membership/insert`.
+  - **Cost noted, not fixed, as instructed:** this endpoint pays the same O(n) "rebuild the whole tree from
+    the commitments table" cost `/root` and `/insert` already paid before it existed — it doesn't introduce
+    a new cost CLASS, just one more caller of an existing pattern. Fine at the hundreds-of-members scale
+    this was built/tested against; flagged in `MerkleTreeDO.ts`'s header comment as the first place to look
+    if latency becomes a problem at thousands+ members (fix would be incremental/cached tree state,
+    deliberately not built now since it isn't a measured bottleneck).
+  - **`apps/web/src/lib/zkProof.ts` reworked:** `proveSoleMemberSession(identity, size)` → `proveMembershipSession(identity, merkleProof)`, where `merkleProof` comes from the new endpoint (fetched by
+    `AuthCallback.tsx`, matching this codebase's existing "network calls live in the page component, crypto
+    lives in the lib module" split). Pads the real siblings to `MAX_DEPTH` with zeros for the unused
+    levels — that part of the earlier trivial-case logic was correct and is reused, not rewritten.
+  - **Live-verified: TWO real identities, proof requested for the SECOND (non-first) one — the key
+    regression check** (the task's own words: testing only the first/trivial member would not catch a
+    broken sibling-path/index). Real RSABSSA redemption ×2 → member A inserted (`size:1`) → member B
+    inserted (`size:2`) → `GET /membership/proof/<B's commitment>` → `{index:1, siblings: 1 sibling}` →
+    real Groth16 proof → circuit's own `merkleRoot` output confirmed byte-identical to the proof
+    endpoint's `merkleRoot` → `POST /auth/session` → **200 + capability** for B. Then the same for A
+    (`index:0`) to confirm the first member still works too → **200 + capability**. Live worker log for
+    both: `[Session] zk_verify_groth16_bytes -> true`.
+  - **Net effect on R23's risk-register status:** the sole-member restriction — R23's only remaining gap
+    after the previous pass — is closed. R23 is now fully **Resolved**, not "resolved for the trivial case."
+- **Done (2026-07, "/proof rate limit" pass) — closes the DoS gap the previous pass's own cost note flagged.**
+  `GET /membership/proof/:commitment` is necessarily unauthenticated (chicken-and-egg: it's needed to even
+  attempt `/auth/session`) and pays an O(n) tree-rebuild per call — an unrate-limited caller who already
+  knows one commitment could force unlimited rebuilds against it. `RateGateDO` (previously an unimplemented
+  `501` stub) now backs a generic `POST /check {key, limit}` counter, sharded by epoch bucket per docs/04
+  (a fresh counter set every epoch — no explicit reset/cleanup logic needed). The proof route checks
+  `key = "proof:" + commitment`, `limit = 20` per epoch, BEFORE touching `MerkleTreeDO` — a rejected caller
+  never triggers the expensive rebuild at all. Deliberately per-COMMITMENT, not per-IP/OHTTP-session: real
+  client IPs aren't reliably available in this OHTTP-fronted architecture (docs/03 §10), and per-commitment
+  keying directly targets the actual realistic threat (repeatedly hammering ONE known commitment), not
+  broad enumeration (which the commitment set being public doesn't newly enable — there's still no
+  "list all commitments" endpoint). Same primitive is meant to be reused for the still-TODO capability-
+  issuance rate limit `RateGateDO`'s own header comment already anticipated, not a proof-specific mechanism.
+  **Live-verified:** 25 sequential requests against one real commitment → first 20 return 200, the next 5
+  return 429 with a clear error message; a second, different real commitment's first request returns 200
+  unaffected by the first commitment's counter (confirms per-key isolation, not a global limit).
 - **Spike remainder (de-risk):** decide trusted-setup (Groth16 ceremony) vs **transparent PLONK/Halo2** —
   still open, decide before it's load-bearing.
 - PPID sybil guard done (enrollment). `MerkleTreeDO` + nullifier one-spend done (see the "ZK airlock" entry
   above); remaining here: a real Poseidon/LeanIMT tree (not the SHA-256 mock root), redeeming the VOPRF token at
-  `/membership/insert` against the Enrollment Plane's issuance (currently assumed-valid), and `RateGateDO`.
+  `/membership/insert` against the Enrollment Plane's issuance (currently assumed-valid). `RateGateDO` now has
+  a real (if minimal) generic counter implementation, currently used by `/membership/proof/:commitment`
+  (see the "/proof rate limit" entry above) — capability-issuance rate limiting still doesn't call it yet.
 - **Exit:** a client enrolls via OAuth, obtains a blind token, inserts a commitment through OHTTP, proves
   membership, and gets a capability — with an automated test asserting **no row in `DB_MSG` can be joined to
   `DB_ENROLL`** and verifier CPU is within budget (target <100 ms; hard cap documented).
@@ -467,11 +578,68 @@ bands, not calendar promises.
   AliasDO bug): the first mining run held an open fetch connection across an ~80s synchronous CPU-bound
   mining pause and got `ECONNRESET` from the local dev server; restructured to mine all stamps upfront, then
   fire every request back-to-back with no CPU gaps in between.
-- **Still open:** Sealed Sender++ envelope, `PresenceDO`. `@cloudflare/actors` fan-out for anything beyond
+- **Done (2026-07, "R22: real transport" pass) — closes R22, the last remaining mock in the messaging
+  path.** `useChatWebSocket.ts`'s "one `ws.send()` both ways, unpersisted" placeholder is gone; the real
+  Flow 3/Flow 4 protocol is wired end to end, including a genuine bug found in `ConvLogDO` along the way.
+  - **`QueueDO` cleanup, not a rewrite:** the class already correctly implemented push/pull/ack/subscribe/
+    hibernation/TTL per the DO catalog — the only mock artifact was `webSocketMessage`'s "Phase 5
+    transport-spike relay" (broadcast any non-ack WS frame verbatim, unpersisted), which existed solely
+    because the old client sent raw chat text over the same socket both ways. Removed outright: the WS
+    now handles ONLY `{type:"ack",upToSeq}`, exactly as documented.
+  - **A real, previously-undetected gap found in `ConvLogDO`:** the DO catalog lists it as hibernating and
+    Flow 4 explicitly shows `L--)D2: push blob@n (WS)`, but the class had `POST /append`/`GET /sync` ONLY —
+    no WebSocket support existed at all. Added `GET` + `Upgrade: websocket` → hibernatable subscribe
+    (backlog since an optional `?since_seq=` flushed immediately on connect — the same "(re)connecting IS
+    sync-on-wake" property `QueueDO`'s subscribe already had), and `handleAppend` now fans each newly
+    -assigned entry out to every attached device via the same `fanOut()` pattern as `QueueDO`. Proactively
+    applied `QueueDO`'s own documented live-discovered bug fix (re-closing an already-closing socket throws
+    in workerd) rather than rediscovering it the hard way.
+  - **New client transport, `apps/web/src/hooks/useQueueTransport.ts`** (replaces the deleted
+    `useChatWebSocket.ts`, no fallback path kept): send = capability-gated `POST /queue/{id}/push`;
+    receive = WS push + `{type:"ack"}`, exactly the documented asymmetric protocol. **Two real
+    unidirectional queues per chat** (`{chatId}:AtoB`/`{chatId}:BtoA}`, per the DO catalog's "one
+    unidirectional pairwise queue" and docs/README decision #7) — an explicit `role`
+    ("initiator"/"responder") parameter stands in for real per-user queue-id *provisioning*, which is Flow
+    5/6 contact-establishment machinery that doesn't exist in this codebase yet (the mock UI has no real
+    per-user identity to assign roles from); this pass fixes the transport primitive, not that separate,
+    larger system — said plainly, not glossed over.
+  - **Sealed Sender++ receipts implemented for real** (docs/01 "Vorticity counter", docs/README decision
+    #5) — this did not exist in any form before this pass. A receipt is a `{type:"receipt",ackSeq}`
+    envelope on a SEPARATE `{queueId}:receipt` queue (not the message path), padded to the exact same size
+    -bucket scheme as real messages (so it's not distinguishable by ciphertext length), pushed after a
+    randomized 2-8s delay (decoupling receipt timing from message timing) — the concrete, specific
+    countermeasure against the documented Signal weakness (receipt/timing traffic analysis relinking users
+    in as few as ~5 messages), not a UX nicety.
+  - **Crypto layer intentionally untouched:** the X25519 ephemeral-DH handshake + real ChaCha20-Poly1305
+    from the earlier spike still has the same already-documented gaps (unauthenticated DH, no ratchet) —
+    this pass changed HOW an envelope reaches its peer, not what's inside it or how it's encrypted. Those
+    remain separate, tracked work (PQXDH/Triple Ratchet).
+  - **New reusable client module, `apps/web/src/lib/convLogSync.ts`:** append/sync/subscribe primitives for
+    `ConvLogDO`. Deliberately transport-only — no Yjs/Automerge integration exists yet; a real multi-device
+    UI wiring this up would put an encrypted CRDT update in `blob` and call `Y.applyUpdate` on receipt.
+    This module proves the transport is real, not that multi-device merge UX exists.
+  - **Live-verified, both parts, zero mocking, against a live `wrangler dev`** (one real session capability
+    minted first via the full RSABSSA+official-ceremony-Semaphore chain): **(A) QueueDO** — two roles
+    (initiator/responder) complete a real X25519 handshake over the real queues, exchange real
+    ChaCha20-encrypted messages BOTH directions, and both sides receive a real padded/delayed receipt for
+    what they sent; confirmed via worker log (`GET /queue/... 101 Switching Protocols` ×4,
+    `POST /queue/.../push 201 Created` ×6, matching the real request count with no relay/mock path
+    involved). **(B) ConvLogDO** — one append, two LIVE devices both received the byte-identical entry
+    (same seq, same blob) via WS push, and a THIRD device connecting AFTER the append received the same
+    entry via backlog-on-connect — proving both live fan-out and late-join sync/"pull-on-wake" work, and
+    that the server genuinely only orders opaque blobs (confirmed structurally: `ConvLogDO`'s code path
+    from insert to `fanOut`/`rowToWire` never parses or interprets `blob`, only stores/forwards the raw
+    bytes it was given).
+  - **Net effect:** R22 closed as a transport-correctness risk. Explicitly NOT claiming Flow 5/6 (contact
+    establishment / real queue-id provisioning) or the ratchet/PQXDH work are done — those remain open,
+    separate, and larger.
+- **Still open:** `PresenceDO`. `@cloudflare/actors` fan-out for anything beyond
   single-DO WS (not yet needed — every DO so far handles its own fan-out directly). R2 presigned
   chunked-AES-GCM media path. Alias adaptive/per-target PoW difficulty, Argon2id hardened option, signed
   update/revoke (would need `alias_pub` back out as a plaintext column), approval-gated contact-request flow
-  through the resolved `intro_queue_id`, `H(nickname)`-prefix sharding.
+  through the resolved `intro_queue_id`, `H(nickname)`-prefix sharding. Real per-user queue-id provisioning
+  (Flow 5/6 contact establishment) — the "R22: real transport" pass above fixed the transport primitive but
+  still relies on an explicit `role` stand-in, not real contact-driven queue assignment.
 - **Exit:** two devices exchange 1:1 + group messages + media offline/online; **Metadata Diagnostics (K5)**
   shows only opaque IDs/ciphertext; an opt-in `@alias` registers, resolves under PoW, and bootstraps a contact
   with **owner approval** — while a raw `AliasDO` dump yields no readable nickname→identity link and no
@@ -871,10 +1039,10 @@ Severity × likelihood; **R1 is the one the brief explicitly asked about.**
 | R17 | **Host offline dictionary attack** on `AliasDO` dump (nicknames are low-entropy) | Med | Med | Documented residual (aliases are public by intent); high-entropy nickname advice; **identity-linkage stays cryptographically safe** — record holds no email/PPID/handle | 3 |
 | R18 | **Nickname squatting / impersonation** | Low | Med | Registration PoW + capability; `alias_pub` signed ownership; reserved/verified namespaces; report+revoke; Key Transparency (K8) over alias→key | 3,5 |
 | R19 | **Self-doxxing** — a human-chosen public alias is a persistent identifier the *user* exposes | Low | High | Default invisible; explicit opt-in warning; recommend pairing with an ephemeral persona (K2); never auto-suggest real-name aliases | 3,4 |
-| R20 | **Session capability was in `localStorage`** — JS-readable, so any XSS or malicious extension with DOM access could trivially steal a live bearer credential authorising `/queue` etc. | High | Med | **Mitigated 2026-07** (Plane Bridge pass): moved to in-memory React state only, never persisted; reload loses the session by design. Open follow-up: a real "remember this device" UX (if ever added) needs a non-extractable key (WebCrypto non-exportable `CryptoKey` / platform keystore), not Web Storage | 2 |
-| R21 | **`/auth/session` accepted a fixed, shared valid ZK proof vector, not one generated live from the client's own Semaphore witness** — the mock circuit's public inputs never changed, so every client presented the *same* proof. | High | ~~Certain~~ | **Resolved 2026-07 (server side — see docs/06's "Real Semaphore v4" and "R21-continued" entries below).** `/auth/session` now verifies a REAL Semaphore v4 proof (official circuit, real LeanIMT+Poseidon root in `MerkleTreeDO`) against public inputs built from the CALLER's own `(merkleRoot, nullifier, message, scope)`, with `merkleRoot` additionally checked against the tree's actual current root. `VK_HEX` is now the OFFICIAL PSE multi-party trusted-setup ceremony key ("Semaphore V4 Ceremony 1", 300-400+ contributors, finalized 2024-09-05) — not a local single-party test setup. Live-verified against the official artifacts: a genuinely different proof/root/nullifier per request, replay/stale-root/tampered-proof all correctly rejected, both natively (arkworks) and inside the live Workers WASM runtime. **Not independently re-verified:** the full multi-party ceremony transcript (per-contribution hash chain / beacon replay) — only the published end result's file integrity and structural/cryptographic correctness against our circuit. **Not fully closed:** see R23 — the WEB CLIENT (`AuthCallback.tsx`) does not yet generate a real proof itself, so the end-to-end browser flow is not exercised by this fix alone. | 2 |
-| R22 | **Messaging chat transport is still a one-socket-both-directions mock** — `useChatWebSocket.ts` does one `ws.send()` for both send and receive on a single `queue_id`, not `QueueDO`'s actual documented asymmetric protocol (`POST /push` HTTP for send, WS receive-only fan-out + `{type:"ack"}` for receive) | Med | Certain (today) | Reconcile the transport with `QueueDO`'s real push/ack shape once the capability-authorised queue-id scheme (per-conversation, two queues) is designed. Status: **open**, explicitly deferred out of the RSABSSA Plane Bridge pass's scope, flagged here so it isn't lost | 3 |
-| R23 | **Client (`apps/web`) does not generate a real Semaphore proof** — `AuthCallback.tsx`'s step 5 still references the retired mock-circuit vector and sends no `message`/`scope`; against the now-real `/auth/session` (R21, resolved server-side) this will fail (missing fields, and even patched, the old proof bytes won't verify against the new real VK). Real client-side proving needs the circuit `.wasm`+`.zkey` bundled into the web app and a browser proving step (docs/06 R6 territory — WASM size/perf). | High | Certain (today) | **Explicitly out of scope for the "Real Semaphore v4" pass** (server-side circuit/verifier/tree only, per that task's own scope note) — flagged here, not silently left broken, so it's picked up as its own follow-up rather than lost. Status: **open, not started**. | 2,4 |
+| **R20** | **Session capability was in `localStorage`** — JS-readable, so any XSS or malicious extension with DOM access could trivially steal a live bearer credential authorising `/queue` etc. | High | Closed | **Mitigated 2026-07** (Plane Bridge pass): moved to in-memory React state only, never persisted; reload loses the session by design. Open follow-up: a real "remember this device" UX (if ever added) needs a non-extractable key (WebCrypto non-exportable `CryptoKey` / platform keystore), not Web Storage | 2 |
+| **R21** | **`/auth/session` accepted a fixed, shared valid ZK proof vector, not one generated live from the client's own Semaphore witness** — the mock circuit's public inputs never changed, so every client presented the *same* proof. | High | Closed | **Resolved 2026-07 (server side — see docs/06's "Real Semaphore v4" and "R21-continued" entries below).** `/auth/session` now verifies a REAL Semaphore v4 proof (official circuit, real LeanIMT+Poseidon root in `MerkleTreeDO`) against public inputs built from the CALLER's own `(merkleRoot, nullifier, message, scope)`, with `merkleRoot` additionally checked against the tree's actual current root. `VK_HEX` is now the OFFICIAL PSE multi-party trusted-setup ceremony key ("Semaphore V4 Ceremony 1", 300-400+ contributors, finalized 2024-09-05) — not a local single-party test setup. Live-verified against the official artifacts: a genuinely different proof/root/nullifier per request, replay/stale-root/tampered-proof all correctly rejected, both natively (arkworks) and inside the live Workers WASM runtime. **Not independently re-verified:** the full multi-party ceremony transcript (per-contribution hash chain / beacon replay) — only the published end result's file integrity and structural/cryptographic correctness against our circuit. | 2 |
+| **R22** | **Messaging chat transport is still a one-socket-both-directions mock** — `useChatWebSocket.ts` does one `ws.send()` for both send and receive on a single `queue_id`, not `QueueDO`'s actual documented asymmetric protocol (`POST /push` HTTP for send, WS receive-only fan-out + `{type:"ack"}` for receive) | Med | Closed | **Resolved 2026-07** (see the "R22: real transport" entry below). `useChatWebSocket.ts` deleted outright, no fallback path; the real `useQueueTransport.ts` uses the documented `POST /push` + WS-receive + `{type:"ack"}` protocol over two real unidirectional queues, plus Sealed Sender++ receipts (padded/delayed/decoupled — docs/01, docs/README #5) and real `ConvLogDO` multi-device sync (a genuine WS-hibernation gap in `ConvLogDO` found and fixed in the same pass). Live-verified: real bidirectional 1:1 delivery + receipts through `QueueDO`, and 3-device `ConvLogDO` fan-out (2 live + 1 backlog-on-connect), all against a live `wrangler dev`, zero mocking. **Not fully closed as a PRODUCT feature** — see the entry below for the honest remaining gap (real per-user queue-id provisioning / contact establishment, Flow 5/6, still doesn't exist; this pass fixed the transport primitive, not that separate system). | 3 |
+| **R23** | **Client (`apps/web`) does not generate a real Semaphore proof** — `AuthCallback.tsx`'s step 5 still references the retired mock-circuit vector and sends no `message`/`scope`; against the now-real `/auth/session` (R21, resolved server-side) this will fail (missing fields, and even patched, the old proof bytes won't verify against the new real VK). Real client-side proving needs the circuit `.wasm`+`.zkey` bundled into the web app and a browser proving step (docs/06 R6 territory — WASM size/perf). | High | Closed | **Fully Resolved 2026-07** (see the "R23: real client-side proving" and "R23 follow-up: MerkleTreeDO /proof/:commitment" entries below). `AuthCallback.tsx` generates a real Groth16 proof in-browser via `snarkjs` against the official ceremony `semaphore-20.wasm`/`.zkey`, fetching its own real Merkle proof from `MerkleTreeDO`'s new `GET /proof/:commitment` — works for a tree of ANY size, not just the sole-member case the first sub-pass shipped. Live-verified with TWO real identities, proof requested for the non-first member specifically (the key regression check): both authenticate successfully (`zk_verify_groth16_bytes -> true`, capability minted for both). | 2,4 |
 
 ### R1 & R2 — the ZKP↔Workers coupling, in depth (the brief's key question)
 

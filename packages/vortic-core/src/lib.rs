@@ -13,6 +13,7 @@ pub mod group;
 pub mod kem;
 pub mod oprf;
 pub mod pow;
+#[cfg(feature = "client-full")]
 pub mod ratchet;
 pub mod ring;
 pub mod seal;

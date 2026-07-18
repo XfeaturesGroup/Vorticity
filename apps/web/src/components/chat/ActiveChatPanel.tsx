@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 import { Lock, MessageSquare, Paperclip, Send } from "lucide-react";
 import { cn } from "@vorticity/ui";
 import type { Chat } from "../../lib/mockChats";
-import type { SocketStatus } from "../../hooks/useChatWebSocket";
+import type { SocketStatus } from "../../hooks/useQueueTransport";
 import { MessageBubble } from "./MessageBubble";
 
 interface ActiveChatPanelProps {
