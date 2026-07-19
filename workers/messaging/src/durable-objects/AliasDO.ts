@@ -19,70 +19,33 @@
 //
 // PROOF-OF-WORK (docs/03 §8.3): stamp = "ver:alg:bits:epoch:resource:salt:counter". A stamp is
 // valid iff SHA-256(stamp) has >= the endpoint's required leading zero bits, `resource` matches
-// the `lookup_key` being targeted (binds the stamp to this alias, not reusable elsewhere), and
-// `epoch` is within +/-1 hour of now (bounds how long a precomputed stamp stays usable). Spent
-// stamps are recorded in a single global set — a stamp minted for /register that happened to also
-// clear /resolve's lower bit bar is still only spendable once, which is the correct semantics
-// (each proof of work should buy exactly one action).
+// the target being spent against (binds the stamp to this specific alias/introduce target, not
+// reusable elsewhere), and `epoch` is within +/-1 hour of now (bounds how long a precomputed
+// stamp stays usable). Spent stamps are recorded in a single global set — a stamp minted for
+// /register that happened to also clear /resolve's lower bit bar is still only spendable once,
+// which is the correct semantics (each proof of work should buy exactly one action).
+// `verifyPowStamp`/`countLeadingZeroBits` moved to `../pow.ts` (2026-07, "alias contact
+// establishment" pass) so the new `/introduce` write-path below reuses this exact,
+// already-tested check rather than a second hand-rolled copy.
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
 import { base64ToBuf, bufToBase64 } from "../base64";
+import { verifyPowStamp, stampExpiryFromEpoch } from "../pow";
 
 const LOOKUP_KEY_RE = /^[0-9a-f]{64}$/; // SHA-256 digest, lowercase hex
-const MAX_STAMP_LEN = 512; // defensive cap, not a protocol limit
-const EPOCH_MS = 60 * 60 * 1000;
-const EPOCH_TOLERANCE = 1; // stamp's epoch may be current +/- this many hours
 const REGISTER_MIN_BITS = 24;
 const RESOLVE_MIN_BITS = 20;
-
-type PowVerdict = { ok: true; epoch: number } | { ok: false; reason: string };
-
-/** Leading zero bits across a byte string, MSB-first — the Hashcash difficulty measure. */
-function countLeadingZeroBits(bytes: Uint8Array): number {
-  let bits = 0;
-  for (const byte of bytes) {
-    if (byte === 0) {
-      bits += 8;
-      continue;
-    }
-    let b = byte;
-    while ((b & 0x80) === 0) {
-      bits++;
-      b = (b << 1) & 0xff;
-    }
-    break;
-  }
-  return bits;
-}
-
-async function verifyPowStamp(stamp: string, expectedResource: string, minBits: number): Promise<PowVerdict> {
-  if (stamp.length === 0 || stamp.length > MAX_STAMP_LEN) {
-    return { ok: false, reason: "stamp length out of bounds" };
-  }
-  const parts = stamp.split(":");
-  if (parts.length !== 7) {
-    return { ok: false, reason: "malformed stamp: expected ver:alg:bits:epoch:resource:salt:counter" };
-  }
-  const [ver, alg, , epochStr, resource] = parts;
-  if (ver !== "1") return { ok: false, reason: `unsupported stamp version: ${ver}` };
-  if (alg !== "sha256") return { ok: false, reason: `unsupported stamp algorithm: ${alg}` };
-  if (resource !== expectedResource) return { ok: false, reason: "stamp resource does not match target lookup_key" };
-
-  const epoch = Number(epochStr);
-  if (!Number.isInteger(epoch)) return { ok: false, reason: "invalid epoch field" };
-  const currentEpoch = Math.floor(Date.now() / EPOCH_MS);
-  if (Math.abs(epoch - currentEpoch) > EPOCH_TOLERANCE) {
-    return { ok: false, reason: "stamp epoch outside acceptance window" };
-  }
-
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(stamp));
-  const actualBits = countLeadingZeroBits(new Uint8Array(digest));
-  if (actualBits < minBits) {
-    return { ok: false, reason: `insufficient PoW: ${actualBits} < ${minBits} leading zero bits` };
-  }
-
-  return { ok: true, epoch };
-}
+// Flow 6 (docs/04): "write to intro queue" PoW, resource = the target intro_queue_id, not a
+// lookup_key. Mid docs/03 §8.3's stated 20-24 bit write range, distinct from RESOLVE_MIN_BITS
+// only as a difficulty choice — the two never collide on which stamp satisfies which endpoint
+// since every stamp is resource-bound (a resolve-shaped stamp targets a lookup_key hex string, an
+// introduce-shaped stamp targets an intro_queue_id — the two id-spaces don't overlap in practice).
+const INTRODUCE_MIN_BITS = 22;
+// A contact request sits in the recipient's inbox until they check it — long enough to be useful,
+// short enough that an unclaimed request doesn't linger forever (same finite-lifetime philosophy
+// as every other queued item in this app; QueueDO's own TTL is the precedent).
+const INTRODUCE_TTL_MS = 3 * 24 * 60 * 60 * 1000;
+const MAX_INTRO_QUEUE_ID_LEN = 256; // defensive cap, matches other opaque-id length checks in this codebase
 
 // Required by `SqlStorage.exec<T extends Record<string, SqlStorageValue>>`.
 interface AliasRow {
@@ -130,6 +93,10 @@ export class AliasDO extends DurableObject<Env> {
     if (request.method === "GET" && resolveMatch) {
       const rawKey = resolveMatch[1];
       if (rawKey) return this.handleResolve(request, decodeURIComponent(rawKey));
+    }
+
+    if (request.method === "POST" && url.pathname === "/introduce") {
+      return this.handleIntroduce(request);
     }
 
     return new Response("Not found", { status: 404 });
@@ -189,7 +156,7 @@ export class AliasDO extends DurableObject<Env> {
       return new Response("alias already registered", { status: 409 });
     }
 
-    const stampExpiresAt = (pow.epoch + EPOCH_TOLERANCE + 1) * EPOCH_MS;
+    const stampExpiresAt = stampExpiryFromEpoch(pow.epoch);
     this.ctx.storage.sql.exec("INSERT INTO aliases (lookup_key, record, created_at) VALUES (?, ?, ?)", lookupKey, record, Date.now());
     this.ctx.storage.sql.exec("INSERT INTO pow_stamps (stamp, expires_at) VALUES (?, ?)", powStamp, stampExpiresAt);
     await this.scheduleStampSweepNoLaterThan(stampExpiresAt);
@@ -223,7 +190,7 @@ export class AliasDO extends DurableObject<Env> {
     // Spend the stamp regardless of hit/miss: a resolve attempt against a nonexistent alias still
     // cost the caller real work, and leaving a miss unspent would let it be retried for free —
     // exactly the scraping/enumeration cost this mechanism exists to impose (docs/03 §8.3).
-    const stampExpiresAt = (pow.epoch + EPOCH_TOLERANCE + 1) * EPOCH_MS;
+    const stampExpiresAt = stampExpiryFromEpoch(pow.epoch);
     this.ctx.storage.sql.exec("INSERT INTO pow_stamps (stamp, expires_at) VALUES (?, ?)", powStamp, stampExpiresAt);
     await this.scheduleStampSweepNoLaterThan(stampExpiresAt);
 
@@ -232,6 +199,85 @@ export class AliasDO extends DurableObject<Env> {
       return new Response("alias not found", { status: 404 });
     }
     return Response.json({ record: bufToBase64(row.record) });
+  }
+
+  // ── introduce (Flow 6: write a sealed contact request into the resolved intro queue) ──────────
+  // The DO never decrypts `ciphertext` — it is opaque to this class exactly like a QueueDO
+  // message body is opaque to QueueDO itself (same isolation property, one layer removed: this
+  // pass adds a PoW-gated FORWARDING step in front of an ordinary push, not a new place that reads
+  // plaintext). `introQueueId` arrives in the clear from the caller because the caller only got it
+  // by successfully decrypting a `/resolve` record themselves — this DO already can't read that
+  // record either, so it was never hiding `intro_queue_id` from a caller who legitimately resolved
+  // the alias to begin with.
+
+  private async handleIntroduce(request: Request): Promise<Response> {
+    let body: unknown;
+    try {
+      body = await request.json();
+    } catch {
+      return new Response("invalid JSON body", { status: 400 });
+    }
+
+    const introQueueId = (body as { introQueueId?: unknown }).introQueueId;
+    const ciphertextB64 = (body as { ciphertext?: unknown }).ciphertext;
+    const powStamp = (body as { powStamp?: unknown }).powStamp;
+    const sizeBucket = (body as { sizeBucket?: unknown }).sizeBucket;
+
+    if (typeof introQueueId !== "string" || introQueueId.length === 0 || introQueueId.length > MAX_INTRO_QUEUE_ID_LEN) {
+      return new Response(`introQueueId must be a non-empty string up to ${MAX_INTRO_QUEUE_ID_LEN} chars`, { status: 400 });
+    }
+    if (typeof ciphertextB64 !== "string" || ciphertextB64.length === 0) {
+      return new Response("ciphertext must be a non-empty base64 string", { status: 400 });
+    }
+    if (typeof powStamp !== "string") {
+      return new Response("powStamp must be a string", { status: 400 });
+    }
+    if (typeof sizeBucket !== "number" || !Number.isInteger(sizeBucket) || sizeBucket < 0) {
+      return new Response("sizeBucket must be a non-negative integer", { status: 400 });
+    }
+
+    let ciphertext: ArrayBuffer;
+    try {
+      ciphertext = base64ToBuf(ciphertextB64);
+      if (ciphertext.byteLength === 0) throw new Error("empty");
+    } catch {
+      return new Response("ciphertext is not valid base64", { status: 400 });
+    }
+
+    // Write-class PoW, resource = introQueueId (docs/04 Flow 6: "mint write PoW, resource =
+    // intro_queue_id"), NOT the lookup_key — a caller only reaches this point after already
+    // resolving the alias, so binding to the queue id (not the alias itself) is what actually
+    // stops someone from grinding one stamp and spamming every queue they can enumerate.
+    const pow = await verifyPowStamp(powStamp, introQueueId, INTRODUCE_MIN_BITS);
+    if (!pow.ok) {
+      return new Response(`PoW rejected: ${pow.reason}`, { status: 403 });
+    }
+
+    const spent = this.ctx.storage.sql.exec<StampRow>("SELECT stamp FROM pow_stamps WHERE stamp = ?", powStamp).toArray();
+    if (spent.length > 0) {
+      return new Response("pow_stamp already used (replay)", { status: 409 });
+    }
+
+    // Spend the stamp before forwarding — same "no free retry" reasoning `handleResolve` already
+    // documents: a downstream QueueDO failure after a genuinely valid PoW is unlucky, not a refund.
+    const stampExpiresAt = stampExpiryFromEpoch(pow.epoch);
+    this.ctx.storage.sql.exec("INSERT INTO pow_stamps (stamp, expires_at) VALUES (?, ?)", powStamp, stampExpiresAt);
+    await this.scheduleStampSweepNoLaterThan(stampExpiresAt);
+
+    const stub = this.env.QUEUE_DO.get(this.env.QUEUE_DO.idFromName(introQueueId));
+    const res = await stub.fetch(
+      new Request("https://do/push", {
+        method: "POST",
+        headers: { "X-Ttl-Ms": String(INTRODUCE_TTL_MS), "X-Size-Bucket": String(sizeBucket) },
+        body: ciphertext,
+      }),
+    );
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      return new Response(text || `QueueDO push failed (${res.status})`, { status: res.status });
+    }
+
+    return new Response(null, { status: 201 });
   }
 
   // ── replay-set eviction (mirrors QueueDO's TTL-alarm pattern) ──────────────────────────────

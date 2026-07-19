@@ -31,6 +31,10 @@ import init, {
   identity_sign_bundle,
   identity_verify_bundle,
   RatchetSession,
+  alias_lookup_key,
+  alias_derive_record_key,
+  pow_mint,
+  pow_verify,
 } from "../pkg/client/vortic_core.js";
 import wasmUrl from "../pkg/client/vortic_core_bg.wasm?url";
 
@@ -207,4 +211,44 @@ export function identitySignBundle(seed: Uint8Array, hybridPublicBytes: Uint8Arr
 /// Verify a signed prekey bundle against a peer's published verifying key. Requires `initCrypto()`.
 export function identityVerifyBundle(verifyingKey: Uint8Array, hybridPublicBytes: Uint8Array, sig: Uint8Array): boolean {
   return identity_verify_bundle(verifyingKey, hybridPublicBytes, sig);
+}
+
+// --- Public @alias discovery (docs/03 §8) + Hashcash PoW (docs/03 §8.3) ---
+// "Alias contact establishment" pass (2026-07): closes the crate's own Phase-0 `todo!()` stubs in
+// alias.rs/pow.rs. See those files' module docs for why the PoW miner lives in Rust/WASM rather
+// than a TS loop over `crypto.subtle.digest` (async per-iteration overhead makes a real 20-26 bit
+// mint impractically slow in plain JS).
+
+/// `H("vortic-alias-v1" || nickname)` as lowercase hex — matches `AliasDO.ts`'s `LOOKUP_KEY_RE`
+/// (`^[0-9a-f]{64}$`) exactly. Requires `initCrypto()`.
+export function aliasLookupKeyHex(nickname: string): string {
+  const bytes = alias_lookup_key(nickname);
+  return Array.from(bytes as Uint8Array)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+/// The 32-byte symmetric key the alias record is AEAD-sealed under — derivable by anyone who
+/// knows `nickname` (the owner, and anyone who later resolves it), by no one else. Requires
+/// `initCrypto()`.
+export function aliasDeriveRecordKey(nickname: string): Uint8Array {
+  return alias_derive_record_key(nickname);
+}
+
+/// Mints a Hashcash stamp for `resource` at `minBits` difficulty. Runs a real synchronous loop
+/// inside WASM (no async per-iteration overhead) — can still take several seconds at the top of
+/// docs/03 §8.3's range (register: 24-26 bits), so callers should invoke this off the main thread
+/// (see `apps/web/src/workers/powMiner.worker.ts`), not directly from a component. `epoch` must be
+/// `Math.floor(Date.now() / 3_600_000)` to match `AliasDO.ts`'s acceptance window. Requires
+/// `initCrypto()`.
+export function powMint(resource: string, minBits: number, epoch: number, salt: string): string {
+  return pow_mint(resource, minBits, epoch, salt);
+}
+
+/// Local sanity-check only (see pow.rs's module doc: the real server-side gate is `AliasDO.ts`'s
+/// own independent, already-tested JS implementation, not this WASM call) — lets a caller confirm
+/// a stamp it just mined actually clears the bar before spending a network round-trip on it.
+/// Requires `initCrypto()`.
+export function powVerify(stamp: string, expectedResource: string, minBits: number): boolean {
+  return pow_verify(stamp, expectedResource, minBits);
 }

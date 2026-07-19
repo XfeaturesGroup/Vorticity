@@ -13,6 +13,7 @@ import { ChatList } from "../components/chat/ChatList";
 import { ActiveChatPanel } from "../components/chat/ActiveChatPanel";
 import { useQueueTransport } from "../hooks/useQueueTransport";
 import { usePresence } from "../hooks/usePresence";
+import { useAliasInbox } from "../hooks/useAliasInbox";
 import { useAuth } from "../contexts/AuthContext";
 import { formatNow, type Chat, type ChatMessage } from "../lib/chat";
 import { loadChatList, saveChatList } from "../lib/chatList";
@@ -33,6 +34,7 @@ import {
   putLinkPayload,
   takeLinkPayload,
 } from "../lib/deviceLink";
+import { buildAcceptedChat, resolveAlias, sendContactRequest, type PendingContactRequest } from "../lib/alias";
 
 export function Chats() {
   const { token: cap } = useAuth();
@@ -159,6 +161,11 @@ export function Chats() {
   // header comment for why this doesn't try to track every background chat's presence too.
   const { peerOnline, peerTyping, sendTyping } = usePresence(activeChatId, activeChat?.presenceEnabled ?? false);
 
+  // Alias contact establishment (docs/03 §8, "alias contact establishment" pass, 2026-07) — polls
+  // this device's own intro queue (if it has a registered alias, see components/AliasPanel.tsx) for
+  // incoming contact requests. See useAliasInbox.ts's header comment for the polling design.
+  const { pending: pendingRequests, markHandled } = useAliasInbox(cap);
+
   const handleSelect = (id: string) => {
     setActiveChatId(id);
     setChats((prev) => prev.map((c) => (c.id === id ? { ...c, unreadCount: 0 } : c)));
@@ -184,6 +191,70 @@ export function Chats() {
         (key) => clearFromStore(key).catch(() => {}),
       ),
     );
+  };
+
+  // Alias contact establishment, requesting side: resolves `nickname` (real PoW-gated lookup),
+  // sends a sealed contact request to whoever holds it (real PoW-gated write), and — mirroring
+  // `parseInviteFromLocation`'s invite-join above — adds the proposed chat locally as role
+  // `"initiator"` immediately, same "waiting for the other side" UX an invite link already has.
+  // The request only reaches the recipient's inbox; nothing here assumes it was seen or accepted.
+  const handleAddByAlias = async (nickname: string): Promise<{ ok: true } | { ok: false; error: string }> => {
+    if (!cap) return { ok: false, error: "Not signed in" };
+    try {
+      const resolved = await resolveAlias(nickname, cap);
+      if (!resolved) return { ok: false, error: `No one has registered @${nickname}` };
+      const proposedChatId = await sendContactRequest(resolved, cap);
+      setChats((prev) => [
+        ...prev,
+        {
+          id: proposedChatId,
+          alias: `@${nickname}`,
+          initials: nickname.slice(0, 2).toUpperCase(),
+          role: "initiator",
+          online: false,
+          unreadCount: 0,
+          lastMessage: "Contact request sent — waiting for them to accept...",
+          lastMessageAt: formatNow(),
+          messages: [],
+          presenceEnabled: false,
+        },
+      ]);
+      setActiveChatId(proposedChatId);
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: (err as Error).message };
+    }
+  };
+
+  // Alias contact establishment, receiving side: the owner accepts an inbox request by adding the
+  // proposed chat as role "responder" (mirrors handleCreateInvite exactly — this device's own
+  // useQueueTransport mount is what publishes the real signed PQXDH prekey bundle onto that queue;
+  // nothing alias-specific happens beyond THIS one-time local bootstrap step) and marks the
+  // request handled so it stops reappearing in the inbox.
+  const handleAcceptRequest = async (request: PendingContactRequest) => {
+    const accepted = buildAcceptedChat(request);
+    setChats((prev) =>
+      prev.some((c) => c.id === accepted.id)
+        ? prev
+        : [
+            ...prev,
+            {
+              ...accepted,
+              online: false,
+              unreadCount: 0,
+              lastMessage: "Contact request accepted — waiting for handshake...",
+              lastMessageAt: formatNow(),
+              messages: [],
+              presenceEnabled: false,
+            },
+          ],
+    );
+    setActiveChatId(accepted.id);
+    await markHandled(request.seq);
+  };
+
+  const handleDeclineRequest = async (request: PendingContactRequest) => {
+    await markHandled(request.seq);
   };
 
   const handleTogglePresence = () => {
@@ -265,6 +336,31 @@ export function Chats() {
 
   return (
     <div className="h-full flex flex-col gap-3">
+      {pendingRequests.map((request) => (
+        <div
+          key={request.seq}
+          className="shrink-0 flex items-center gap-3 rounded-xl border border-fluid-peach/30 bg-fluid-peach/10 px-4 py-2.5 text-sm text-white"
+        >
+          <span className="text-white/70 shrink-0">
+            Contact request{request.fromLabel ? ` from ${request.fromLabel}` : ""} — accept to start a chat.
+          </span>
+          <span className="flex-1" />
+          <button
+            type="button"
+            onClick={() => void handleAcceptRequest(request)}
+            className="shrink-0 px-3 py-1 text-xs rounded-lg bg-fluid-peach/90 hover:bg-fluid-peach text-black transition-colors"
+          >
+            Accept
+          </button>
+          <button
+            type="button"
+            onClick={() => void handleDeclineRequest(request)}
+            className="shrink-0 px-3 py-1 text-xs rounded-lg bg-white/10 hover:bg-white/20 text-white transition-colors"
+          >
+            Decline
+          </button>
+        </div>
+      ))}
       {showInviteBanner && (
         <div className="shrink-0 flex items-center gap-3 rounded-xl border border-fluid-peach/30 bg-fluid-peach/10 px-4 py-2.5 text-sm text-white">
           <span className="text-white/70 shrink-0">Invite link (copied to clipboard):</span>
@@ -316,6 +412,7 @@ export function Chats() {
           onSelect={handleSelect}
           onCreateInvite={handleCreateInvite}
           onDelete={handleDeleteChat}
+          onAddByAlias={handleAddByAlias}
         />
         <ActiveChatPanel
           chat={displayActiveChat}

@@ -329,6 +329,35 @@ async function coreQueuePush(env: Env, queueId: string, req: BhttpRequest): Prom
   return { status: res.status, body: await res.json() };
 }
 
+// `GET /queue/:id/pull` — real bug found + fixed (2026-07, "alias contact establishment" pass,
+// live-caught via the browser inbox: every poll logged `intro-queue pull failed: HTTP 404`). The
+// direct (non-OHTTP) `/queue/:queueId/*` route already forwards ANY method including GET /pull —
+// this gap was specific to the OHTTP-wrapped path, which only ever had a `push` case. Real chat
+// messages never hit this: the live client receives via WS subscribe, not polling. But
+// `apps/web/src/hooks/useAliasInbox.ts` (this same pass) DOES poll its own intro queue on a fixed
+// ~15s cadence — exactly the "fires repeatedly, not one-time" shape every other OHTTP-wrapped route
+// in this file was already wrapped for, and leaving it unwrapped would let the Messaging Worker
+// correlate a real IP with "this device is checking its alias inbox" on every single poll. Same
+// capability-check shape as `coreQueuePush` above.
+async function coreQueuePull(env: Env, queueId: string, req: BhttpRequest): Promise<CoreResult> {
+  const auth = getBhttpHeader(req.headers, "authorization");
+  const cap = auth?.startsWith("Bearer ") ? auth.slice("Bearer ".length) : null;
+  if (!cap) return { status: 401, body: { error: "Missing session capability" } };
+  const verdict = await verifyCapability(env.SESSION_SIGNING_KEY, cap);
+  if (!verdict.valid) return { status: 401, body: { error: `Invalid session capability: ${verdict.reason}` } };
+
+  const stub = env.QUEUE_DO.get(env.QUEUE_DO.idFromName(queueId));
+  const res = await stub.fetch(new Request("https://do/pull", { method: "GET" }));
+  const text = await res.text().catch(() => "");
+  let parsed: unknown = {};
+  try {
+    parsed = text ? JSON.parse(text) : {};
+  } catch {
+    parsed = { error: text };
+  }
+  return { status: res.status, body: parsed };
+}
+
 // PrekeyDO (rotation pass, docs/03 §4) — `POST /prekey/:chatId/publish`, `GET /prekey/:chatId/status`,
 // `GET /prekey/:chatId/fetch`. Wrapped through OHTTP for the same reason `/queue/:id/push` is: these
 // fire on roughly every chat mount / rotation interval, not just once per enrollment, so — like that
@@ -424,6 +453,41 @@ async function coreDeviceLinkRequest(env: Env, linkId: string, sub: "put" | "tak
   return { status: res.status, body: parsed };
 }
 
+// AliasDO (alias contact establishment pass, 2026-07) — `POST /alias/register`,
+// `GET /alias/resolve/:lookupKey`, `POST /alias/introduce`. Wrapped through OHTTP for the same
+// reason `/prekey/*`/`/device-link/*` are: a register/resolve/introduce call reveals "this real IP
+// is claiming/looking up/contacting @nickname" — exactly the metadata docs/03 §8's privacy model
+// (nickname discoverable, identity linkage never) exists to protect, so leaving these unwrapped
+// would leak a real-IP<->nickname correlation the rest of the alias design goes out of its way to
+// avoid. `subpath` is the AliasDO-relative path (`register`, `resolve/<key>`, or `introduce`);
+// `method` is threaded through since resolve is a GET (with `X-PoW-Stamp` as a header, no body)
+// while register/introduce are POST (JSON body).
+async function coreAliasRequest(env: Env, subpath: string, method: "GET" | "POST", req: BhttpRequest): Promise<CoreResult> {
+  const auth = getBhttpHeader(req.headers, "authorization");
+  const cap = auth?.startsWith("Bearer ") ? auth.slice("Bearer ".length) : null;
+  if (!cap) return { status: 401, body: { error: "Missing session capability" } };
+  const verdict = await verifyCapability(env.SESSION_SIGNING_KEY, cap);
+  if (!verdict.valid) return { status: 401, body: { error: `Invalid session capability: ${verdict.reason}` } };
+
+  const stub = env.ALIAS_DO.get(env.ALIAS_DO.idFromName("global"));
+  const headers: Record<string, string> = {};
+  if (method === "POST") headers["Content-Type"] = "application/json";
+  const powStamp = getBhttpHeader(req.headers, "x-pow-stamp");
+  if (powStamp !== null) headers["X-PoW-Stamp"] = powStamp;
+
+  const res = await stub.fetch(
+    new Request(`https://do/${subpath}`, { method, headers, body: method === "POST" ? req.body : null }),
+  );
+  const text = await res.text().catch(() => "");
+  let parsed: unknown = {};
+  try {
+    parsed = text ? JSON.parse(text) : {};
+  } catch {
+    parsed = { error: text };
+  }
+  return { status: res.status, body: parsed };
+}
+
 // Dispatches a DECAPSULATED request (a `BhttpRequest` the Gateway itself constructed from HPKE-sealed
 // bytes — never a real Cloudflare `Request`, so there is no `cf-connecting-ip`/`CF-Connecting-IP`
 // header or any other IP-bearing field for these handlers to even reach for) to the SAME core logic
@@ -449,6 +513,10 @@ async function dispatchBhttpRequest(env: Env, req: BhttpRequest): Promise<CoreRe
   if (req.method === "POST" && queuePushMatch) {
     return coreQueuePush(env, decodeURIComponent(queuePushMatch[1]!), req);
   }
+  const queuePullMatch = /^\/queue\/([^/]+)\/pull$/.exec(req.path);
+  if (req.method === "GET" && queuePullMatch) {
+    return coreQueuePull(env, decodeURIComponent(queuePullMatch[1]!), req);
+  }
   const prekeyMatch = /^\/prekey\/([^/]+)\/(publish|status|fetch)$/.exec(req.path);
   if (prekeyMatch) {
     const sub = prekeyMatch[2] as "publish" | "status" | "fetch";
@@ -472,6 +540,16 @@ async function dispatchBhttpRequest(env: Env, req: BhttpRequest): Promise<CoreRe
     if (req.method === expectedMethod) {
       return coreDeviceLeaseRequest(env, decodeURIComponent(deviceLeaseMatch[1]!), sub, req);
     }
+  }
+  if (req.method === "POST" && req.path === "/alias/register") {
+    return coreAliasRequest(env, "register", "POST", req);
+  }
+  const aliasResolveMatch = /^\/alias\/resolve\/([^/]+)$/.exec(req.path);
+  if (req.method === "GET" && aliasResolveMatch) {
+    return coreAliasRequest(env, `resolve/${aliasResolveMatch[1]}`, "GET", req);
+  }
+  if (req.method === "POST" && req.path === "/alias/introduce") {
+    return coreAliasRequest(env, "introduce", "POST", req);
   }
   return { status: 404, body: { error: "Not found (via OHTTP gateway)" } };
 }
@@ -633,7 +711,18 @@ router.all("/device-lease/:leaseKey/*", async (request: IRequest, env: Env) => {
 // Unlike /q, /conv, /group (sharded per queue/conversation/group id), AliasDO is a single global
 // instance for this pass — the namespace isn't large enough yet to need docs/04's documented
 // H(nickname)-prefix sharding. Revisit if/when alias volume warrants splitting it.
-router.all("/alias/*", (request: IRequest, env: Env) => forwardToDO(request, env.ALIAS_DO, "global", "/alias"));
+//
+// Real bug found + fixed (2026-07, "alias contact establishment" pass): this route forwarded to
+// AliasDO with NO `requireCapability` check at all — every other conversation route in this file
+// gates on it, and docs/03 §8.1 itself lists "a capability gate" as one of the accepted mitigations
+// for the alias plane's low-entropy-nickname residual risk (§8.1: an attacker still needs "one
+// enrolled account per actor" per §8.3's own economics argument — which was silently false as long
+// as this route had no capability check at all). Fixed to match every other route below.
+router.all("/alias/*", async (request: IRequest, env: Env) => {
+  const denied = await requireCapability(request, env);
+  if (denied) return denied;
+  return forwardToDO(request, env.ALIAS_DO, "global", "/alias");
+});
 
 router.all("*", () => error(404, "Not found"));
 

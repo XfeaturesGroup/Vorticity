@@ -1413,11 +1413,14 @@ bands, not calendar promises.
   **Still open:** `@cloudflare/actors` fan-out for anything beyond
   single-DO WS (not yet needed — every DO so far handles its own fan-out directly). R2 presigned
   chunked-AES-GCM media path. Alias adaptive/per-target PoW difficulty, Argon2id hardened option, signed
-  update/revoke (would need `alias_pub` back out as a plaintext column), approval-gated contact-request flow
-  through the resolved `intro_queue_id`, `H(nickname)`-prefix sharding. Real per-user queue-id provisioning
-  (Flow 5/6 contact establishment) — the "R22: real transport" pass fixed the transport primitive and "R24:
-  real Triple Ratchet" fixed the crypto, but both still rely on an explicit `role` stand-in, not real
-  contact-driven queue/identity assignment.
+  update/revoke (would need `alias_pub` back out as a plaintext column), `H(nickname)`-prefix sharding.
+  **Approval-gated contact-request flow through the resolved `intro_queue_id`: done — see the "alias
+  contact establishment" pass further down this phase.** That pass closes discovery specifically (look
+  someone up by `@nickname`, they approve) but, said plainly there too, does NOT close the deeper gap
+  this paragraph originally flagged: "R22: real transport" fixed the transport primitive and "R24: real
+  Triple Ratchet" fixed the crypto, but both still rely on an explicit `role` stand-in for queue
+  bootstrap itself, not real contact-driven queue/identity assignment — a resolved alias contact still
+  starts a chat exactly like an invite link does under the hood.
 - **Exit:** two devices exchange 1:1 + group messages + media offline/online; **Metadata Diagnostics (K5)**
   shows only opaque IDs/ciphertext; an opt-in `@alias` registers, resolves under PoW, and bootstraps a contact
   with **owner approval** — while a raw `AliasDO` dump yields no readable nickname→identity link and no
@@ -1824,6 +1827,126 @@ bands, not calendar promises.
   onboarding, device management, backups, multi-device UX, disappearing messages, safety-number verification +
   Key Transparency (K8).
 - **Exit:** full user journey (onboard → gate → chat → multi-device → recover) on web + Android.
+- **Done (2026-07, "alias contact establishment" pass) — real Flow 5/6 DISCOVERY, closing the
+  long-flagged "real per-user queue-id provisioning" gap for how a chat gets FOUND, not for the
+  `role` (initiator/responder) queue-bootstrap mechanism itself, which is unchanged and still an
+  honest stand-in (said plainly, matching this doc's own convention — see "Still open" below).**
+  Before this pass the only way to start a chat was `lib/inviteLink.ts`'s out-of-band URL; this adds
+  the actual thing Flow 5/6 describes — look someone up by `@nickname`, they approve — on top of
+  `AliasDO.ts`, which existed fully wired (register/resolve, PoW-gated) since an earlier pass but had
+  **no client ever calling it**.
+  **Rust (`packages/vortic-core`): closed two Phase-0 `todo!()` skeletons, not new modules.**
+  `alias.rs`'s `lookup_key`/`derive_record_key` were literal `todo!("Phase 3: ...")` stubs since
+  Phase 0 — now real (`lookup_key = SHA-256("vortic-alias-v1"||nickname)`,
+  `derive_record_key = HKDF-SHA256(ikm=nickname, salt="", info="vortic-alias-enc")`, the same HKDF
+  shape `lib/deviceLink.ts`'s `deriveAeadKey` already uses for an analogous derivation). `pow.rs`'s
+  `mint`/`verify` were the other Phase-0 stub — now a REAL synchronous Hashcash miner.
+  **Why the miner had to be Rust/WASM, not a TS loop:** `crypto.subtle.digest` is async; at the
+  required 18-26 bit difficulties (docs/03 §8.3) the per-call Promise dispatch overhead — not the
+  hash itself — dominates, turning a register-class mint into minutes instead of docs/03's
+  targeted "a few seconds". A synchronous WASM loop has no such overhead. `AliasDO.ts`'s own
+  `verifyPowStamp` is deliberately NOT replaced by the new `pow_verify` WASM export — verification
+  is a single hash, cheap enough server-side that swapping a working, already-tested implementation
+  for a WASM call would be unrelated risk; `pow.rs::verify` exists to close the crate's own TODO and
+  give the Rust test suite a same-language mint/verify round-trip, not to gate real requests.
+  No new `AliasOwnershipKey` type either — reuses `ratchet::identity_verifying_key` (deterministic
+  from a random seed, already wasm-bindgen-exported and tested) for `alias_pub`, since `AliasDO.ts`
+  doesn't verify a signature yet regardless (no signed update/revoke — see its own header comment).
+  Both build profiles re-checked clean (`edge-verify-only` still compiles with zero `client-full`
+  code linked). 40/40 crate tests green (was 33; +7 new: lookup/record-key determinism + a Node-
+  cross-checkable SHA-256 test vector, PoW leading-zero-bit counting, mint→verify round-trip at a
+  real difficulty, wrong-resource/insufficient-bits rejection, malformed-stamp rejection).
+  **Server (`workers/messaging`), two real bugs found and fixed, not just new code:**
+  1. **`/alias/*` had NO `requireCapability` check at all** — every other conversation route in
+     `index.ts` gates on it, and docs/03 §8.1 itself lists "a capability gate" as an accepted
+     mitigation for the alias plane's low-entropy-nickname residual risk; this route silently had
+     none, meaning the "one enrolled account per actor" economics argument in §8.3 was false in
+     practice. Fixed to match every other route.
+  2. **The OHTTP dispatch table had `POST /queue/:id/push` wrapped but no `GET /queue/:id/pull`** —
+     caught LIVE, not by inspection: every real message receive goes over WS subscribe, so nothing
+     had ever exercised a pulled OHTTP GET on this queue path before, but this pass's own
+     `useAliasInbox.ts` polls its owner's intro queue on a ~15s cadence via `ohttpFetch`, and every
+     single poll 404'd (`"Not found (via OHTTP gateway)"`) until `coreQueuePull` was added and wired
+     into `dispatchBhttpRequest` alongside `coreQueuePush`. Left unwrapped, a real deployment would
+     have let the Messaging Worker correlate a real IP with "this device is checking its alias
+     inbox" on every poll — exactly the leak class R25/R25-follow-up already prioritized closing for
+     every other repeating call in this file.
+  **New: `AliasDO.handleIntroduce`** (`POST /introduce`) — Flow 6's "write to intro queue" step.
+  Verifies a WRITE-class PoW stamp (22 bits, mid docs/03's 20-24 range) bound to the target
+  `introQueueId` (not the `lookup_key` — binding to the queue, not the alias, is what actually stops
+  a single ground stamp from spamming every enumerable queue), spends it against the same
+  `pow_stamps` replay set register/resolve already share, then forwards the opaque sealed
+  ciphertext as a normal push into that `QueueDO` instance via `env.QUEUE_DO` — the DO never
+  decrypts it, same isolation property every other DO in this catalog already has. `register`/
+  `resolve`/`introduce` are all now OHTTP-wrapped (`coreAliasRequest`, mirroring
+  `corePrekeyRequest`'s shape) — a register/resolve/introduce call reveals "this real IP is
+  claiming/looking up/contacting @nickname", exactly the correlation docs/03 §8's privacy model
+  exists to prevent leaking. `verifyPowStamp`/`countLeadingZeroBits` extracted from `AliasDO.ts`
+  into a new shared `pow.ts` so `handleIntroduce` reuses the exact already-tested check rather than
+  a second hand-rolled copy.
+  **Client (`apps/web`):** `lib/alias.ts` (new) — nickname validation, `lookup_key`/`rec_key`
+  derivation via the new WASM exports, AEAD seal/unseal (same HKDF+AES-GCM shape as
+  `lib/deviceLink.ts`, but the WASM `rec_key` output IS the final key, no extra HKDF layer needed
+  client-side), `registerAlias`/`resolveAlias`/`sendContactRequest`/`pullContactRequests`, all via
+  `ohttpFetch`. **PoW mining runs in a dedicated Web Worker**
+  (`apps/web/src/workers/powMiner.worker.ts`) — even WASM-fast mining is a genuine multi-second
+  synchronous block at register's 24 bits (observed live: anywhere from ~2s to ~60s depending on
+  luck — Hashcash difficulty is a random search, not a fixed cost), and freezing the whole UI for
+  that is a real, avoidable regression for what's otherwise a rare one-time click; verified live
+  that the main thread stayed responsive (page state/DOM queries kept working) throughout a real
+  mine. `hooks/useAliasInbox.ts` polls the owner's own registered intro queue every 15s; **does NOT
+  use `QueueDO`'s `/ack`** (deliberately) — its "everything `seq <= upToSeq`" cumulative semantics
+  are wrong for an inbox of independent, individually-actionable requests (acking one accepted
+  request could silently drop a different, still-pending, lower-`seq` one) — already-handled
+  requests are instead remembered client-side (a persisted seq set in the vault) and filtered out of
+  future polls, leaving the raw entry to expire via `QueueDO`'s own TTL. `components/AliasPanel.tsx`
+  (Settings: register a nickname, read-only once set — no update/revoke UI, matching `AliasDO.ts`'s
+  own current scope), `ChatList.tsx` gained an "Add contact by @alias" composer alongside the
+  existing invite-link one, `Chats.tsx` gained accept/decline banner cards + `handleAddByAlias`
+  (resolves, sends the request, adds the proposed chat locally as role `"initiator"` immediately —
+  same "waiting for the other side" UX an invite link already has) + `handleAcceptRequest` (adds the
+  chat as role `"responder"`, mirroring `handleCreateInvite` exactly — nothing alias-specific happens
+  past this one-time local bootstrap step, `useQueueTransport.ts` takes over unchanged).
+  **Verified, every layer, real crypto/real network throughout:**
+  1. *Rust*: 40/40 `cargo test --features client-full,issuer-full`; `edge-verify-only` and
+     `edge-verify-only,issuer-full` both still compile clean.
+  2. *WASM vs. independent Node implementations* (real compiled `pkg/client`, `initSync` over raw
+     `.wasm` bytes, no browser): `alias_lookup_key`'s output matched a hand-computed Node
+     `crypto.createHash("sha256")` over the literal byte concatenation; `alias_derive_record_key`'s
+     output matched Node's own built-in `crypto.hkdfSync` computed independently (not sharing code
+     with `util.rs`'s `hkdf_sha256`); confirmed the two derived keys never collide for the same
+     nickname (domain separation genuinely holds). `pow_mint`→`pow_verify` round-tripped, and a
+     WASM-mined stamp's bit count was independently re-measured by the SERVER's own JS algorithm
+     copy, confirming a WASM-mined stamp is one the real server will actually accept.
+  3. *Server, isolated `wrangler dev`, real mined PoW (a Node script, no shortcuts)*: missing
+     capability → 401 on all three new routes; register succeeds with a real 24-bit stamp, a second
+     register on the same `lookup_key` → 409; resolve succeeds with a real 20-bit stamp and returns
+     the exact registered record, a replayed resolve stamp → 409; a stamp mined for the WRONG
+     resource (lookup_key instead of introQueueId) → 403 on introduce; introduce succeeds with a
+     real 22-bit stamp bound to the right resource, a replayed introduce stamp → 409; **pulled the
+     target `QueueDO` directly afterward and confirmed the forwarded message is byte-identical to
+     what was sent** — not just "got a 201", proof the forward genuinely happened.
+  4. *Live, real browser + real independent Node process, zero shortcuts*: registered `@nightowl_test`
+     for real through the Settings UI (real 24-bit PoW mined in the Worker, confirmed the main thread
+     stayed responsive throughout); an independent Node script — using the same real compiled WASM,
+     not the browser's copy — resolved the alias and sent a real sealed, PoW-stamped contact request
+     over the live stack; **the OHTTP `/queue/pull` bug above was caught by this exact step** (the
+     inbox never showed anything until it was fixed); after the fix, the request appeared in the real
+     inbox UI, clicking Accept added a real chat as responder and the console showed a genuine
+     `PrekeyDO` bundle publish for it; a second request was sent and Declined — no chat was created,
+     and after a full page reload NEITHER the accepted nor the declined request resurfaced (the
+     handled-set persisted correctly). Zero console errors across the entire sequence.
+  **Honest scope, stated plainly:** this closes DISCOVERY, not the deeper `role` stand-in
+  `useQueueTransport.ts` still uses for the queue-bootstrap mechanism itself — a resolved contact
+  still starts a chat exactly like an invite link does, just found via alias instead of an
+  out-of-band URL; a genuinely different per-user persistent-identity/queue-directory model is a
+  separate, larger piece of work, not done here. No signed update/revoke (`AliasDO.ts` doesn't
+  verify a signature yet either), no Key Transparency (K8) binding for `alias_pub`, no adaptive
+  per-target PoW difficulty. Register-class PoW timing is a REAL, observed several-seconds-to-
+  roughly-a-minute cost (Hashcash is a random search, not fixed-time) — acceptable for a rare
+  one-time action but worth knowing before assuming it's always fast. The inbox's "handled" set is
+  local-device-only, same honest scope as the rest of `lib/chatList.ts` — declining/accepting on one
+  device doesn't sync that decision to another of the user's own linked devices.
 
 ## Phase 5 — Hardening & audit (M)
 - External crypto + appsec audit; trusted-setup ceremony (if Groth16); binary/circuit transparency (K7);

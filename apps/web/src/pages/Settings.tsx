@@ -3,6 +3,7 @@
 // component + hook, embedded here instead of full-screen, running its own independent scan.
 import { useSecurityScan } from "../hooks/useSecurityScan";
 import { SecureScorePanel } from "../components/SecureScorePanel";
+import { AliasPanel } from "../components/AliasPanel";
 
 export function Settings() {
   const scan = useSecurityScan();
@@ -17,6 +18,11 @@ export function Settings() {
       <div>
         <h2 className="text-lg font-semibold text-white mb-4">Security Status</h2>
         <SecureScorePanel scan={scan} compact />
+      </div>
+
+      <div>
+        <h2 className="text-lg font-semibold text-white mb-4">Contacts</h2>
+        <AliasPanel />
       </div>
     </div>
   );
