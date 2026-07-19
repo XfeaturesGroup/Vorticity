@@ -1,10 +1,18 @@
-// Sharding key: chat id (one instance per chat, same convention as PresenceDO/PrekeyDO). Prevents the
-// real correctness hazard device-linking (docs/06) introduces: TWO of a user's own devices holding
-// the SAME per-chat ratchet state and both independently sending/receiving would desync that shared
-// state — not just against each other, but against the PEER too (the peer's own ratchet only ever
-// expects ONE sender-direction chain advancing in order; two devices concurrently advancing "the
-// same" chain corrupts it from the peer's side as well, a real bug affecting the other party, not
-// just the linked user's own devices).
+// Sharding key: `${chatId}:${role}` — NOT the bare chat id (real bug found + fixed 2026-07, first
+// live use: a chat id is SHARED by both parties of an ordinary 1:1 conversation — queueIds() derives
+// both directions from it — while `role` ("responder"/"initiator") is per-party. Sharding on the bare
+// chat id made the responder and the initiator, i.e. two DIFFERENT PEOPLE, not linked devices at all,
+// race for the SAME lease the instant both had the chat open, and the loser was shown "active on
+// another device" for a completely normal two-person conversation — this DO never learns which shape
+// its own key has, so the fix lives entirely client-side (see lib/deviceLease.ts's header comment),
+// this class just needs the corrected input.
+//
+// Prevents the real correctness hazard device-linking (docs/06) introduces: TWO of a user's own
+// devices holding the SAME per-chat, per-role ratchet state and both independently sending/receiving
+// would desync that shared state — not just against each other, but against the PEER too (the peer's
+// own ratchet only ever expects ONE sender-direction chain advancing in order; two devices
+// concurrently advancing "the same" chain corrupts it from the peer's side as well, a real bug
+// affecting the other party, not just the linked user's own devices).
 //
 // WHAT THIS IS: a simple mutual-exclusion lease, renewed by heartbeat, held by at most one deviceId
 // at a time. It does NOT gate messaging capability (that's `requireCapability`, unchanged) — it only

@@ -567,6 +567,17 @@ export function useQueueTransport(
   // well inside the server's LEASE_TTL_MS (45s) margin; releases on unmount/chat change so a clean
   // tab-close or chat-switch frees the lease immediately rather than waiting out the full TTL.
   //
+  // REAL BUG found + fixed after first live use (2026-07): the lease key was the bare `chatId` —
+  // but `chatId` is the SAME on BOTH sides of an ordinary 1:1 conversation (queueIds() derives both
+  // parties' queue names from it), while `role` ("responder"/"initiator") is what's actually
+  // per-PARTY. Keying the lease by `chatId` alone meant the responder and the initiator — two
+  // DIFFERENT PEOPLE, not linked devices of the same identity at all — raced for the SAME lease the
+  // moment both had the chat open, and whichever lost was shown "active on another device" for an
+  // entirely normal two-person conversation. Device-linking (two devices of the SAME role/identity)
+  // is the only case that should ever contend for one lease — fixed by keying on `${chatId}:${role}`
+  // instead: the responder's lease and the initiator's lease are now independent, while two linked
+  // devices sharing the SAME role still correctly contend for the SAME key.
+  //
   // HYDRATION: on the FIRST successful acquire for this chat (i.e. no live session yet), checks for
   // an imported ratchet-state blob (lib/deviceLink.ts's `applyLinkPayload`, sealed via
   // `ratchet-imported-state:${chatId}`) and, if present, reconstructs the session directly via
@@ -578,10 +589,11 @@ export function useQueueTransport(
     setLeaseHeldByOther(false);
     if (!chatId || !cap) return;
     let cancelled = false;
+    const leaseKey = `${chatId}:${role}`;
 
     const tryAcquire = async () => {
       try {
-        const result = await acquireLease(chatId, cap);
+        const result = await acquireLease(leaseKey, cap);
         if (cancelled) return;
         if (result.granted && !ratchetSessionRef.current) {
           const importedBytes = await unsealFromStore(`ratchet-imported-state:${chatId}`);
@@ -624,9 +636,9 @@ export function useQueueTransport(
     return () => {
       cancelled = true;
       clearInterval(heartbeat);
-      releaseLease(chatId, cap).catch(() => {});
+      releaseLease(leaseKey, cap).catch(() => {});
     };
-  }, [chatId, cap]);
+  }, [chatId, role, cap]);
 
   // Only the "responder" role publishes a signed prekey bundle on (re)connect to a chat — PQXDH's
   // handshake is one-sided (only Bob publishes; Alice verifies + encapsulates on receipt of it).

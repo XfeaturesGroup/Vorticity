@@ -361,19 +361,20 @@ async function corePrekeyRequest(env: Env, chatId: string, sub: "publish" | "sta
   return { status: res.status, body: parsed };
 }
 
-// DeviceLeaseDO (device-linking pass) — `POST /device-lease/:chatId/acquire`, `POST .../release`,
-// `GET .../status`. Wrapped through OHTTP: this fires on a HEARTBEAT cadence (every ~20s per open
-// chat, see useQueueTransport.ts) while a chat is open, so leaving it unwrapped would let the
-// Messaging Worker correlate a real IP with "this device has chat X open right now" continuously —
-// exactly the class of leak R25/R25-follow-up already prioritized wrapping for.
-async function coreDeviceLeaseRequest(env: Env, chatId: string, sub: "acquire" | "release" | "status", req: BhttpRequest): Promise<CoreResult> {
+// DeviceLeaseDO (device-linking pass) — `POST /device-lease/:leaseKey/acquire`, `POST .../release`,
+// `GET .../status`, where `leaseKey` is `${chatId}:${role}` (see DeviceLeaseDO.ts's header comment
+// for why it's not the bare chat id). Wrapped through OHTTP: this fires on a HEARTBEAT cadence (every
+// ~15s per open chat, see useQueueTransport.ts) while a chat is open, so leaving it unwrapped would
+// let the Messaging Worker correlate a real IP with "this device has chat X open right now"
+// continuously — exactly the class of leak R25/R25-follow-up already prioritized wrapping for.
+async function coreDeviceLeaseRequest(env: Env, leaseKey: string, sub: "acquire" | "release" | "status", req: BhttpRequest): Promise<CoreResult> {
   const auth = getBhttpHeader(req.headers, "authorization");
   const cap = auth?.startsWith("Bearer ") ? auth.slice("Bearer ".length) : null;
   if (!cap) return { status: 401, body: { error: "Missing session capability" } };
   const verdict = await verifyCapability(env.SESSION_SIGNING_KEY, cap);
   if (!verdict.valid) return { status: 401, body: { error: `Invalid session capability: ${verdict.reason}` } };
 
-  const stub = env.DEVICE_LEASE_DO.get(env.DEVICE_LEASE_DO.idFromName(chatId));
+  const stub = env.DEVICE_LEASE_DO.get(env.DEVICE_LEASE_DO.idFromName(leaseKey));
   const method = sub === "status" ? "GET" : "POST";
   const res = await stub.fetch(
     new Request(`https://do/${sub}`, {
@@ -616,16 +617,17 @@ router.all("/device-link/:linkId/*", async (request: IRequest, env: Env) => {
   return forwardToDO(request, env.DEVICE_LINK_DO, linkId, `/device-link/${linkId}`);
 });
 
-// DeviceLeaseDO (device-linking pass) — sharded by chat id. See DeviceLeaseDO.ts's header comment for
-// why this exists: without it, two of a user's own linked devices could both run a live ratchet
-// session for the same chat and desync it, corrupting the conversation for the PEER too, not just the
-// linked user. Capability-gated like every other conversation route.
-router.all("/device-lease/:chatId/*", async (request: IRequest, env: Env) => {
+// DeviceLeaseDO (device-linking pass) — sharded by `${chatId}:${role}`, NOT the bare chat id (real
+// bug, see DeviceLeaseDO.ts's header comment: a chat id alone is shared by both parties of an
+// ordinary 1:1 conversation, which made them race for the same lease). This route treats the segment
+// as an opaque key either way — the client is what constructs it correctly (lib/deviceLease.ts).
+// Capability-gated like every other conversation route.
+router.all("/device-lease/:leaseKey/*", async (request: IRequest, env: Env) => {
   const denied = await requireCapability(request, env);
   if (denied) return denied;
-  const chatId = request.params.chatId;
-  if (!chatId) return error(400, "missing chatId");
-  return forwardToDO(request, env.DEVICE_LEASE_DO, chatId, `/device-lease/${chatId}`);
+  const leaseKey = request.params.leaseKey;
+  if (!leaseKey) return error(400, "missing leaseKey");
+  return forwardToDO(request, env.DEVICE_LEASE_DO, leaseKey, `/device-lease/${leaseKey}`);
 });
 
 // Unlike /q, /conv, /group (sharded per queue/conversation/group id), AliasDO is a single global
