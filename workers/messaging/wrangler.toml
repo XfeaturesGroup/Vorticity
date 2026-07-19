@@ -9,14 +9,21 @@
 # send path — see docs/06's R25 entry for why that one was a same-day follow-up, not in the first
 # pass). WebSocket upgrades (`/queue/:id` subscribe, `/conv/:id`) structurally CANNOT be OHTTP-wrapped
 # — see index.ts's header comment near the /queue routes for the honest, permanent residual gap.
+# Same-zone Relay topology note (2026-07): see workers/ohttp-relay/wrangler.toml's header comment —
+# this Worker and the Relay currently share one Cloudflare account (temporary, weaker than the
+# originally-planned cross-zone split; see docs/deploy-checklist.md §5 and docs/06's R26 entry).
 name = "vorticity-messaging"
 main = "src/index.ts"
 compatibility_date = "2026-02-01"
 compatibility_flags = ["nodejs_compat"]
 
+[[routes]]
+pattern = "api.vort.xfeatures.net"
+custom_domain = true
+
 [[d1_databases]]
 binding = "DB_MSG"
-database_name = "vorticity-msg"
+database_name = "vortic-msg-db"
 database_id = "37f7a573-3f7a-4a3c-9f55-ba3c4c4d1966"
 
 # SESSION_SIGNING_KEY is a real secret — local dev loads it from `.dev.vars` (gitignored; see
@@ -48,6 +55,18 @@ name = "PRESENCE_DO"
 class_name = "PresenceDO"
 
 [[durable_objects.bindings]]
+name = "PREKEY_DO"
+class_name = "PrekeyDO"
+
+[[durable_objects.bindings]]
+name = "DEVICE_LINK_DO"
+class_name = "DeviceLinkDO"
+
+[[durable_objects.bindings]]
+name = "DEVICE_LEASE_DO"
+class_name = "DeviceLeaseDO"
+
+[[durable_objects.bindings]]
 name = "ALIAS_DO"
 class_name = "AliasDO"
 
@@ -69,3 +88,14 @@ new_sqlite_classes = [
   "AliasDO",
   "RateGateDO",
 ]
+
+# PrekeyDO (rotation pass, 2026-07) — a genuinely NEW class added after v1 shipped, so it gets its
+# own migration tag rather than editing v1's array (append-only history, per the comment above).
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["PrekeyDO"]
+
+# DeviceLinkDO + DeviceLeaseDO (device-linking pass, 2026-07) — same append-only reasoning as v2 above.
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["DeviceLinkDO", "DeviceLeaseDO"]

@@ -612,6 +612,259 @@ bands, not calendar promises.
     was built for, because the Security Gate's VPN nudge does nothing to stop A2 specifically from
     observing which IP is behind an active receiving session — see R26. An independently-operated
     Relay also remains undeployed (see the residual note above, a separate and lesser concern).
+- **Researched, then implemented — "R26: WS proxy via the OHTTP Relay" pass (2026-07).** User asked
+  specifically whether the existing OHTTP Relay could ALSO proxy the WS upgrade for `/queue/:id`/
+  `/conv/:id` at the network level (not HPKE — OHTTP structurally cannot wrap a persistent connection),
+  hiding the receiving client's IP from the Messaging Worker without falling back to polling.
+  - **Research first, per explicit instruction not to guess by analogy with HTTP proxying:** confirmed
+    via Cloudflare's own official docs (not community posts alone, though those pointed the same
+    direction) that Worker-to-Worker WS proxying is a real, supported pattern —
+    `await fetch(requestWithUpgradeHeader)` returns a `Response` with `.webSocket` set, and simply
+    returning that Response verbatim completes the upgrade transparently; Cloudflare's own docs
+    confirm a pure pass-through proxy (not reading individual frames in the relay's own code) does
+    **not** keep the Worker "in use"/billed for the connection's lifetime — so this is genuinely
+    real-time, not a disguised poll loop, and doesn't add meaningful per-connection cost.
+  - **The actual IP-hiding mechanism, found in Cloudflare's official HTTP-headers reference
+    (`developers.cloudflare.com/fundamentals/reference/http-request-headers/`), not assumed:** two
+    distinct, documented behaviors for a Worker's outbound subrequest to another Worker —
+    (1) **cross-zone** subrequests have `CF-Connecting-IP` automatically replaced by Cloudflare with a
+    fixed internal placeholder "for security reasons" — pure platform behavior, no code needed, but
+    requires the Relay to be deployed under a genuinely SEPARATE Cloudflare zone (apex domain) from
+    the Messaging Worker, a deployment-topology decision this project hasn't made (nothing is deployed
+    to any real zone yet); (2) **same-zone** subrequests have `CF-Connecting-IP` "reflect the value of
+    `x-real-ip`, [which] can be altered by the user in their Worker script" — i.e., the Relay's own
+    code CAN override the header that same-zone `CF-Connecting-IP` derives from, even without a
+    separate zone. Implemented the same-zone lever (`x-real-ip` override in the Relay's WS-proxy
+    branch) since it doesn't depend on an unmade deployment decision, while documenting the
+    cross-zone path as the platform-guaranteed stronger alternative if/when real zones exist.
+  - **The one honest, load-bearing limitation, checked before writing any code, not discovered after:**
+    neither mechanism can be independently live-verified in this project's current environment.
+    Confirmed (not assumed) that Miniflare/`wrangler dev` only simulates the static `request.cf`
+    metadata object, not Cloudflare's dynamic same-zone/cross-zone edge-routing header-rewriting
+    logic — that behavior is real Cloudflare edge-network infrastructure, inseparable from an actual
+    deployed zone. Combined with this project having nothing deployed to a real Cloudflare zone yet
+    (per multiple earlier entries in this doc), the IP-hiding property itself is **currently
+    unverifiable**, full stop — not a gap in this pass's effort, a gap in what's checkable pre-deployment.
+  - **Given this, stopped and reported findings + a size estimate before implementing, per the task's
+    own explicit instruction** ("если сомнения в надёжности платформенного поведения — стоп и отчёт").
+    User reviewed the research and explicitly chose to proceed with a documented-but-unverified
+    implementation rather than wait for real deployment or fall back to polling.
+  - **Implementation:** `workers/ohttp-relay/src/index.ts` gained `proxyWebSocket` — matches
+    `/queue/{id}` or `/conv/{id}` (no trailing segment, so the OHTTP-wrapped `/queue/{id}/push` path
+    is never accidentally caught by this branch) with an `Upgrade: websocket` header, overrides
+    `x-real-ip` before forwarding, and returns the Gateway's response verbatim (the documented
+    pure-pass-through pattern). `useQueueTransport.ts` and `convLogSync.ts`'s `WS_BASE_URL` now point
+    at the Relay instead of the Messaging Worker directly — both carry the same explicit
+    "unverified pending real deployment" comment, not silently presented as fixed.
+  - **Live-verified what CAN be checked locally — functional correctness, explicitly NOT the IP
+    property:** a real capability minted via the full RSABSSA+ZK chain, a WS subscribe opened through
+    the Relay (`ws://127.0.0.1:8789/queue/...`, not the Gateway directly), a real message pushed, and
+    delivery confirmed in real time (~500ms, not a multi-second poll interval) with the exact
+    plaintext round-tripping. Worker logs confirm the full proxy chain fired: `GET /queue/... 101
+    Switching Protocols` on BOTH the Relay's log and the Messaging Worker's log for the SAME queue id
+    — i.e., the upgrade genuinely passed through two separate Worker instances, not a single direct
+    hop mislabeled. This proves the proxy doesn't break real-time delivery; it does **not** and
+    **cannot**, in this environment, prove the IP is actually hidden from the Messaging Worker.
+  - **Net effect:** R26 stays **Open**, deliberately not marked Closed — a documented-but-unverified
+    fix is not the same thing as a verified one, and this project's own standing discipline (every
+    other numbered risk required live proof before "Closed") isn't relaxed just because a plausible
+    fix exists. Marking this Closed should wait for a real Cloudflare deployment where the actual
+    `CF-Connecting-IP` value the Messaging Worker receives can be directly inspected.
+- **Topology revision (2026-07): cross-zone plan reverted to same-zone for the first deploy, not
+  by choice of architecture but of availability.** A brief cross-zone prep pass (separate `account_id`
+  per worker, a schema-lint check enforcing the Relay's account_id differ from the plane workers')
+  was written and then reverted the same window once it became clear only one Cloudflare account with
+  Workers Paid actually exists right now — a second account isn't available. All three workers
+  (`enrollment`, `messaging`, `ohttp-relay`) deploy to that one account for the first closed alpha.
+  This is an explicit, temporary, and structurally weaker choice than the cross-zone plan this section
+  documented above: it relies entirely on `proxyWebSocket`'s `x-real-ip` override (same-zone
+  `CF-Connecting-IP` behavior, already implemented, already the code path this section's live test
+  exercised) rather than Cloudflare's platform-guaranteed cross-zone auto-anonymization, and it does
+  NOT address the residual "colluding relay+gateway operator" gap — Relay and Gateway are one
+  operator's infrastructure under same-zone, full stop. Accepted as the cost of reaching a real,
+  working closed alpha now rather than staying undeployed indefinitely waiting on a second account.
+  **Must be revisited (re-add the account-id split, re-run the R26 same-zone-vs-cross-zone comparison)
+  before this project opens beyond a small trusted alpha circle who has been told this trade-off
+  plainly** — see docs/deploy-checklist.md §5 for the exact steps to reapply once a second account
+  exists.
+- **First real Cloudflare deploy (2026-07-19) — nothing was deployed anywhere before this pass; now all
+  three Workers + the frontend are live on the real domain.** Full step-by-step record in
+  docs/deploy-checklist.md (secrets, D1, hostnames, R26 check — each section has its own "Executed"
+  note); summarized here for the roadmap record.
+  - All 5 secrets landed via `wrangler secret put` (`OAUTH_CLIENT_SECRET`/`ISSUER_SIGNING_KEY_PEM`
+    reused from `.dev.vars` after independently re-deriving and diffing the issuer key's public half
+    against both committed copies; the other 3 generated fresh). Both D1 databases migrated `--remote`
+    with table lists confirmed matching `--local`. All three Workers deployed to real custom domains
+    (`id`/`api`/`relay`.vort.xfeatures.net); `workers/ohttp-relay` needed an `[env.production]` split
+    so its `GATEWAY_ORIGIN` stays `http://127.0.0.1:8787` for plain local `wrangler dev` and only
+    switches to the real Messaging Worker URL under `--env production`. `apps/web` was built fresh and
+    pushed straight to the existing Git-connected `vorticity-frontend` Pages project via
+    `wrangler pages deploy` (not a git commit — none was requested this pass) so the live site actually
+    carries today's changes (contact-bootstrap invite links, same-zone relay URLs) instead of a stale
+    build.
+  - **Two real mistakes made and fixed during this pass, neither swept under the rug:**
+    1. **D1 delete resolved the wrong database.** `wrangler d1 delete vorticity-enroll`, intended to
+       remove a duplicate this pass had just accidentally created, instead resolved via the LOCAL
+       `wrangler.toml`'s `database_name` field (which didn't match the real Cloudflare-side name of the
+       database it pointed to) and deleted the real, pre-existing enrollment database instead. Actual
+       damage was zero (0 tables — migrations had never been applied to it), confirmed before acting
+       further. Fixed by creating a genuine replacement, re-migrating it, and correcting the
+       `database_name` mismatch in BOTH workers' `wrangler.toml`s (a latent version of the same footgun
+       existed in `workers/messaging`'s config too, not exercised yet but fixed proactively).
+    2. **A second, previously-undiscovered `OAUTH_REDIRECT_URI` mismatch**, caught by reading
+       `SecurityGate.tsx`'s actual redirect construction against the live deployed frontend before
+       attempting any real login: `workers/enrollment/wrangler.toml` had
+       `https://id.vort.xfeatures.net/oauth/callback` (the Worker's own API domain, wrong host AND
+       wrong path) while the real client has always sent `${window.location.origin}/auth/callback`
+       (the SPA's own `/auth/callback` route) — on the real deployed frontend, that's
+       `https://vort.xfeatures.net/auth/callback`. Fixed the Worker-side value and confirmed live (a
+       `curl` with the corrected `redirect_uri` now reaches the real IDM and gets `invalid_grant` for a
+       fake code, not this Worker's own `400`). **The IDM's OWN registered redirect_uri for this
+       `client_id` — a separate, external system this repo cannot inspect — still needs to be confirmed
+       or corrected to this same value by whoever has access to that panel; this repo cannot verify
+       that from here.** This is the exact same bug CLASS this file already documented once before
+       (the earlier `redirect_uri`-mismatch entry, Phase 4) — a second, independent instance of it,
+       not a regression of the first fix.
+  - **R26 live-verified for real** (see the R26 risk-register row and the topology-revision entry
+    above): same-zone `x-real-ip` override confirmed working against the real deployed stack via
+    `wrangler tail` (direct request showed the real caller IP; the same request via the Relay showed
+    the override value `0.0.0.0`). Status moved from "Open (unverified)" to "Mitigated (same-zone,
+    live-verified)" — deliberately not "Closed," see the R26 entry for why.
+  - **A THIRD real bug, found by the architect's own first live click-through (not by this pass's own
+    testing) and fixed same-day:** `workers/ohttp-relay` never sent any CORS headers at all, and
+    `POST /ohttp/gateway`'s `Content-Type: message/ohttp-req` isn't a CORS-safelisted content type, so
+    the browser sends a real preflight `OPTIONS` request first — which this Worker answered with a bare
+    404 (`OPTIONS` wasn't in the method-aware path check), failing every OHTTP call from a real browser
+    before it ever reached the Gateway. **Why this was invisible until now:** every prior test of this
+    Worker was `curl` or a Node/vitest script — CORS is enforced by the BROWSER, not the server or a
+    Node `fetch` client, so no amount of scripted testing could have caught it; it took an actual
+    browser session to surface. Fixed with the same allow-list `corsHeaders` convention already used by
+    `workers/enrollment`/`workers/messaging` (`vort.xfeatures.net` + `localhost:5173`, never a
+    wildcard/reflected origin), added to the `OPTIONS` preflight response and both real response paths
+    (`/ohttp/keys`, `/ohttp/gateway`). **Live-verified against the real deployed relay:** `curl` preflight
+    and GET both now carry the correct `Access-Control-Allow-*` headers, AND a real `fetch()` executed
+    from the actual live `https://vort.xfeatures.net` page (via the Browser pane, not a script) to
+    `https://relay.vort.xfeatures.net/ohttp/keys` now succeeds (`ok: true, status: 200`), console clean.
+  - **Diagnostic follow-up, same day: "does reload break an established chat?" — yes, root-caused,
+    then fixed for real, not just diagnosed.** User asked specifically whether it's the Semaphore
+    identity (`new Identity()` in `AuthCallback.tsx`, confirmed regenerating fresh every login) that
+    breaks continuity. **It doesn't** — Semaphore identity only feeds the ZK membership proof, never
+    chat addressing, so a fresh one each login is fine (arguably good for anonymity) and just grows
+    `MerkleTreeDO`'s tree with unused leaves over time, a separate/minor concern. **The real cause:**
+    `useQueueTransport.ts`'s PQXDH ratchet identity/KEM material AND the live ratchet session itself
+    lived only in `useRef`s, wiped on every unmount (reload, chat switch) with no recovery path — the
+    peer's `if (ratchetSessionRef.current) return` guards treated a legitimate re-handshake attempt as
+    a duplicate to silently ignore, meaning a reload on EITHER side could permanently desync an
+    established conversation.
+  - **Full fix built (user's explicit choice over a minimal patch), two new pieces:**
+    1. **`apps/web/src/lib/secureStore.ts`** (new): non-extractable AES-GCM-256 vault, `extractable:
+       false` `CryptoKey` persisted as a structured-clone object in IndexedDB (not raw bytes) — usable
+       for encrypt/decrypt via `crypto.subtle`, but its own key material cannot be exported by ANY
+       code running in this origin, including a future XSS payload. `assertVaultKeyNonExtractable()`
+       exists for exactly this claim to be checked, not just asserted.
+    2. **Ratchet identity persistence + re-handshake recovery** (`useQueueTransport.ts`): the
+       responder's `identitySeed`/`kemKeypair` are now generated ONCE per `chatId` and sealed via the
+       vault instead of freshly regenerated every mount — stable across reloads, so a re-mounted
+       responder republishes the byte-IDENTICAL signed bundle. This turns "peer republished while a
+       session already exists" into a reliable signal: same verifying key + bundle = legitimate
+       reset, redo the handshake; a DIFFERENT identity mid-session is rejected outright, not silently
+       swapped in. Symmetric fix on the responder side for `session_init`: a NEW ciphertext that
+       successfully decapsulates against the stable KEM keypair is accepted as a legitimate recovery
+       (only the real responder holds that private key, so successful decapsulation IS the proof of
+       legitimacy) rather than being ignored as a duplicate.
+    3. **Capability persistence** (`AuthContext.tsx`): the session capability is now ALSO sealed to
+       the same vault on `login()`, restored on mount (with the existing "reload loses the session"
+       R20 tradeoff finally resolved the way that entry's own comment said it eventually should be —
+       "a future 'remember this device' UX should use a non-extractable key... never a plain string in
+       Web Storage"). Expiry (embedded in the capability's own HMAC-signed payload, readable
+       client-side without the server) is checked before trusting a restored value; an expired one is
+       discarded and its vault entry cleared, falling back to the original re-login behavior exactly
+       as before. **A real bug caught before shipping, not after:** `AuthGuard.tsx` redirected on
+       `isAuthenticated` synchronously on the FIRST render, before the now-async vault-restore effect
+       had a chance to run — meaning a reload of an already-authenticated route would always bounce to
+       "/" regardless of a valid persisted capability. Fixed with a new `isRestoring` flag `AuthGuard`
+       waits on before deciding.
+  - **Live-verified, real WASM crypto + a real browser, not just typecheck:** a Node script driving
+    the actual `vortic_core` WASM (same glue file `packages/ohttp/src/live.e2e.test.ts`'s
+    `getRealCapability()` already imports this way) walked the full sequence — first handshake,
+    baseline message round-trip, simulated Bob-reloads (fresh identity regenerated from the SAME seed
+    bytes, confirmed byte-identical to before), Alice recognizing the same peer and re-handshaking,
+    Bob completing the recovery handshake, a NEW message round-tripping correctly post-recovery, and a
+    negative control confirming a genuinely different identity is correctly rejected, not silently
+    accepted — all 9 checks passed. Separately, in a real browser (Browser pane) against the local dev
+    server: `secureStore.ts`'s seal/unseal round-trips correctly; `assertVaultKeyNonExtractable()`
+    returns true; a direct adversarial probe — raw IndexedDB read of the `CryptoKey` object, bypassing
+    the module's own code entirely, then `exportKey('raw', ...)` AND `exportKey('jwk', ...)` — both
+    fail with `InvalidAccessError: key is not extractable`, confirming the property structurally, not
+    just via the module's own self-check; a capability sealed with a future `exp` survives a real
+    reload (`AuthGuard` correctly waits and lets the authenticated route through); one sealed with a
+    past `exp` correctly falls back to the Security Gate AND clears its own stale vault entry.
+  - **Item 4 (remove `mockChats.ts`'s 4 hardcoded contacts) and item 5 (invite-link production
+    polish) done together, same pass** — closely coupled once ratchet identity started surviving
+    reloads: leaving the chat LIST itself as `useState([])`-only would have been a regression (the
+    crypto session would persist in the vault with nothing in the UI able to reach it again). New
+    `lib/chat.ts` (renamed from `mockChats.ts` — once `INITIAL_CHATS` was gone it wasn't mock data
+    anymore, just shared types) + new `lib/chatList.ts` persists chat list METADATA (id/alias/
+    initials/role) through the same vault — deliberately NOT message history, which needs separate,
+    larger work (reading from `ConvLogDO`'s op-log or local plaintext storage, neither built yet); a
+    restored chat starts with empty history and picks up whatever arrives live. `lib/inviteLink.ts`
+    gained an optional cosmetic inviter label (`buildInviteUrl(chatId, label)` → `#/invite/<id>
+    ?from=<label>`), explicitly NOT a public `@alias` (docs/03 §8's Flow 5/6 directory) — no
+    discoverability, no server storage, visible only to whoever already holds the link.
+  - **A FOURTH real bug, found by this pass's own testing (not the architect's) while verifying the
+    invite flow end-to-end for the first time with a genuinely unauthenticated visitor:** opening an
+    invite link while NOT yet logged in hits `AuthGuard`, which redirects via `<Navigate replace>` —
+    and a full-path `Navigate` replaces the ENTIRE URL, hash included. The invite was silently gone
+    before `Chats.tsx` ever mounted to read it, and the OAuth round-trip that follows (SecurityGate ->
+    IDM -> `AuthCallback` -> `/chats`) has no memory of it either — a brand-new contact's invite link,
+    almost certainly the MOST common real use of this feature, would have silently failed. Fixed the
+    same way this codebase already solves "a value must survive a redirect chain": `sessionStorage`,
+    single-use, same convention as `pkce.ts`'s `code_verifier` — `AuthGuard` stashes the invite right
+    before redirecting; `Chats.tsx` checks the stash if the URL itself has no invite hash.
+    **Live-verified in the Browser pane, real app code:** an unauthenticated visit to an invite link
+    correctly cleared the URL hash but landed the invite in `sessionStorage`; simulating login
+    completing and landing on `/chats` picked up the stashed invite and created the chat entry with
+    the correct `Invited by: Kriss` label; the stash was confirmed consumed (single-use, removed
+    after read); console clean throughout.
+  - **A FIFTH real bug — the actual first real two-person test, run by the architect and a friend
+    over a real phone/desktop pair, hit it immediately: a message sent by the joining side never
+    reached the inviter, live or on reconnect.** Root-caused with an independent Node probe against
+    the REAL deployed production stack (mint a real capability via the full RSABSSA+ZK chain, open a
+    real WS, push a real OHTTP-wrapped envelope, check live delivery) — reproduced the exact failure
+    on demand, then bisected it: identical failure with the WS connected DIRECTLY to
+    `api.vort.xfeatures.net`, bypassing the Relay entirely, which ruled out R26's WS-proxy mechanism
+    as the cause and pointed at `workers/messaging` itself.
+    - **Actual cause, found by reading `itty-router`'s own source (not assumed):** `IttyRouter.mjs`
+      extracts route params as raw regex capture groups against `URL.pathname` — no decoding step.
+      `URL.pathname` does NOT percent-decode a colon (`:` isn't in the WHATWG URL spec's path
+      percent-encode set), so a client that `encodeURIComponent`s a queue name containing `:` (every
+      real queue in this app — `${chatId}:AtoB` / `${chatId}:BtoA`, see `useQueueTransport.ts`) hands
+      the direct WS-subscribe route (`forwardToDO`) the STILL-ENCODED name (`...%3AAtoB`), while
+      `coreQueuePush`/`dispatchBhttpRequest` (the OHTTP-wrapped push path) already
+      `decodeURIComponent`s theirs. Two different strings passed to `DurableObjectNamespace.idFromName`
+      address two DIFFERENT Durable Object instances — a push durably lands in one DO, a WS subscribe
+      attaches to a different, empty one. Not a delivery bug, not a Relay/R26 bug: a genuine addressing
+      mismatch that affected EVERY real queue in the app (any chat, not just invite-bootstrapped ones),
+      invisible to every earlier automated test in this project because none of them used a queue name
+      containing a reserved character — a real, structural blind spot in test coverage, now closed by
+      this exact regression being the trigger.
+    - **Fix:** `forwardToDO` (`workers/messaging/src/index.ts`) now decodes its own `id` parameter
+      before calling `idFromName`, matching the OHTTP path's existing behavior — one-line fix, doesn't
+      touch `coreQueuePush`, the Relay, or any crypto code.
+    - **Live-verified the fix on the REAL production stack, not just typecheck:** the SAME independent
+      probe that first reproduced the bug, re-run after deploying the fix — real capability, real WS
+      through the real Relay, real OHTTP push — received the pushed envelope live, byte-correct, no
+      code changes to the probe itself between the failing and passing runs (only the server-side fix
+      was deployed in between).
+  - **Not done in this pass, said plainly:** the final end-to-end "two real people OAuth-login and chat"
+    test still needs a human to actually authenticate through the real Xfeatures IDM (entering real
+    credentials through tooling is out of bounds) — but the architect's own attempt today is what
+    surfaced this fifth bug, and the underlying transport is now independently confirmed working on
+    real production; the next real attempt should not hit this specific failure again. FIVE real
+    blockers found so far across this and the prior pass (redirect_uri mismatch, relay CORS gap,
+    ratchet-reload-breaks-chats gap, invite-link-lost-during-login gap, queue-DO-addressing mismatch)
+    are now fixed; whether anything else surfaces is unknown until someone completes a full real
+    two-person login+chat end to end.
 - **Spike remainder (de-risk):** decide trusted-setup (Groth16 ceremony) vs **transparent PLONK/Halo2** —
   still open, decide before it's load-bearing.
 - PPID sybil guard done (enrollment). `MerkleTreeDO` + nullifier one-spend done (see the "ZK airlock" entry
@@ -843,18 +1096,328 @@ bands, not calendar promises.
     that runs enough alternating turns to observe one.
   - **Net effect:** R24 closed as a crypto-correctness risk for 1:1 messaging. Explicitly NOT claiming:
     MLS/group ratcheting (separate, Phase 1 "still to implement"), a `PrekeyDO`/identity-persistence
-    service (Flow 5/6-adjacent, not built), or a literal root-level (vs. chain-level) PQ remix — all
-    said plainly above, not discovered later.
-- **Still open:** `PresenceDO`. `@cloudflare/actors` fan-out for anything beyond
+    service (Flow 5/6-adjacent, not built — **built in the "PrekeyDO rotation" pass further down this
+    same phase**), or a literal root-level (vs. chain-level) PQ remix — all said plainly above, not
+    discovered later.
+- **Done (2026-07, "contact-bootstrap invite link" pass) — minimal Flow 5/6 stand-in, NOT the real
+  system.** Deploy-prep pass, explicit scope: unblock a first closed alpha (two real people starting a
+  real 1:1 chat) without building AliasDO/PoW/directory infrastructure. `apps/web/src/lib/inviteLink.ts`
+  (new): generates a fresh, high-entropy chat id (`inv-<16 random bytes, base64url>` — NOT a low-entropy
+  `chat-N` mock id, since anyone holding a queue id can push/read on it, no ownership check in
+  `QueueDO`) and a shareable URL (`#/invite/<id>`, pure client-side hash routing, no server involvement).
+  `pages/Chats.tsx` gained: an invite-creation button (role `"responder"` on the new chat — triggers
+  `useQueueTransport`'s existing responder-mount effect to publish a real signed PQXDH prekey bundle
+  immediately, which `QueueDO`'s backlog-flush-on-connect delivers whenever the other side opens the
+  link, even after this tab closes) and an invite-join effect (reads the URL hash on mount, adds the
+  same chat id as role `"initiator"`). `lib/mockChats.ts`'s `Chat` gained a `role: TransportRole` field
+  (moved the `TransportRole` type here from `useQueueTransport.ts`, which now imports it back, to avoid
+  a circular import) — the 4 mock contacts keep their existing implicit `"initiator"` default, unchanged.
+  **Deliberate scoping decision, stated plainly:** the invite link carries ONLY the chat id, not the
+  PQXDH prekey bundle itself (the task that requested this pass described `{queueIds, prekey bundle}`
+  in the link) — the bundle still flows exactly as before, Ed25519-signed over the queue itself and
+  verified by `RatchetSession.handshakeInitiate`. Embedding it a second time in the URL wouldn't add a
+  real security property here (this app has no safety-number/fingerprint-comparison UI, so either path
+  is equally first-use-trust/TOFU), and reusing the existing signed-bundle-over-the-queue flow unchanged
+  avoids needing to persist a generated identity/KEM keypair across a page navigation so it still
+  matches what a URL-embedded bundle would have promised. See `lib/inviteLink.ts`'s header comment for
+  the full reasoning; a future out-of-band-authenticated invite (bundle embedded + a real comparison UI)
+  is a reasonable strengthening, not done here.
+  **Verified:** `pnpm exec tsc --noEmit` clean across `apps/web`; a full `vite build` production build
+  succeeds (bundles the new module with no new warnings beyond this repo's pre-existing, unrelated
+  `@hpke/common` Rollup comment-annotation notices and >500KB chunk-size warning, both already noted
+  elsewhere in this doc as separate, un-addressed concerns). **Honest gap on HOW this was verified:**
+  could NOT be click-tested live in a browser this pass — `/chats` sits behind `AuthGuard`, which needs
+  a real ZK-verified session capability from a real Xfeatures OAuth login (the capability is
+  intentionally React-state-only per `AuthContext.tsx`, not fakeable via storage), and entering real
+  OAuth credentials through tooling is out of bounds. Verified by typecheck + production build +
+  careful code review instead — same honest-gap pattern already used elsewhere in this doc (e.g. R23's
+  first pass) whenever the OAuth gate blocks live browser automation. A genuine two-browser click-through
+  (generate a link in tab A, open it in tab B, confirm a real PQXDH handshake + message round-trip) is
+  the natural next verification step, not done here.
+  **Still not this pass, said plainly:** any directory/discoverability (AliasDO, PoW), invite expiry,
+  a UI affordance for what happens if a link is opened twice or by more than one person, or persisting
+  the invite/chat list itself (still `useState` in `Chats.tsx`, lost on reload — same lifecycle as the
+  session capability it depends on).
+- **Done (2026-07, "PresenceDO" pass) — closes the "Still open: PresenceDO" gap.** Ephemeral, opt-in
+  online/typing presence, contact-scoped per docs/04's DO catalog (one instance per chat id, same
+  high-entropy unguessable id `lib/inviteLink.ts` already generates).
+  **`PresenceDO.ts` holds NO storage at all** (not even SQLite — unlike every other DO in this
+  catalog) — "never persisted" was already this class's own pre-existing TODO comment; this pass
+  keeps that property, not walks it back. On WS attach it tells the new socket about anyone already
+  attached (`{type:"online"}`) and tells everyone already attached about the newcomer; `webSocketClose`/
+  `webSocketError` broadcast `{type:"offline"}`; a client-sent `{type:"typing"}` is relayed verbatim to
+  every OTHER attached socket. **"Sealed" (docs/05) is stated plainly as an architectural property,
+  not per-frame AEAD:** signals are small plaintext control frames, deliberately NOT run through
+  `useQueueTransport.ts`'s Double Ratchet — a "typing" signal fires on every keystroke, and
+  interleaving that volume through the same chain as real messages risks exhausting the ratchet's
+  bounded skipped-key window and breaking real message decryption (`packages/vortic-core/src/
+  ratchet.rs`). Confidentiality instead rests on the same isolation `QueueDO` already relies on:
+  unguessable per-chat id + capability-gated route.
+  **`index.ts` gained `/presence/:chatId/*`**, gated by the same `requireCapability` as `/queue` and
+  `/conv`. **`workers/ohttp-relay`'s `WS_PROXY_PATTERN` extended** from `/(queue|conv)/` to
+  `/(queue|conv|presence)/` — this route's WS upgrade needed the same plain network-level proxy R26
+  already established for the other two, for the same structural reason (RFC 9458 can't wrap a
+  persistent connection).
+  **Client: `apps/web/src/hooks/usePresence.ts`** (new) — opt-in per chat (`Chat.presenceEnabled`,
+  persisted through the existing sealed `lib/chatList.ts` vault, not a new storage primitive), scoped
+  to the active chat only (same documented limitation `useQueueTransport.ts` already has: a
+  background/non-active chat has no live socket of any kind). Exposes `peerOnline`/`peerTyping` +
+  a throttled `sendTyping()` (2s client-side gate, so an onChange-per-keystroke handler doesn't flood
+  the relay) with a 4s client-side typing decay (the protocol has no explicit "stopped typing" frame).
+  Wired into `ActiveChatPanel.tsx` (a "Presence On/Off" toggle button in the header; `peerTyping`
+  replaces the socket-status line with "typing..." while active) and `ChatListItem.tsx`'s existing
+  online dot (previously always `false` — this is the first real signal driving it). Deliberately kept
+  OUT of `chats` state itself (would re-trigger the persist-on-change effect on every online/typing
+  flicker) — rendered from a derived `displayChats`/`displayActiveChat` view instead.
+  **Verified live, real stack, both checkpoints:**
+  1. *Server-side* (isolated `wrangler dev` instance, port 8797, avoiding the port conflict with
+     another already-running session in this same working directory): a Node WS probe minted a real
+     HMAC capability against the local `SESSION_SIGNING_KEY` and confirmed — missing capability -> 401;
+     two sockets on the same chat id see `online` on attach (both directions), `typing` relay, and
+     `offline` on disconnect; a second, different chat id never sees the first one's traffic
+     (isolation). Zero uncaught exceptions in the Worker log across the run.
+  2. *Client-side, real browser* (`apps/web`'s actual Vite dev server + the real, already-running
+     `workers/messaging`/`workers/ohttp-relay` stack): since `/chats` sits behind a real ZK-verified
+     session capability that needs real Xfeatures OAuth credentials (not enterable through this
+     tooling, same recurring honest gap as R23's first pass and the invite-link entry above), a valid
+     capability was seeded directly into the browser's own non-extractable vault via `crypto.subtle`
+     (the exact same primitive `lib/secureStore.ts` itself uses) — not a shortcut around any real
+     code path, only a substitute for the OAuth leg specifically. From there everything exercised was
+     the real app: clicked "Create invite link" through the real UI, toggled "Presence On" through the
+     real button, then a Node script played the peer's role — connecting through the REAL
+     `workers/ohttp-relay` (port 8789, exercising this pass's `WS_PROXY_PATTERN` change), not a
+     shortcut straight to messaging. Confirmed via live DOM inspection: the list row's online dot
+     went from absent to present the moment the peer connected, the header status line showed
+     "typing..." live while the peer sent typing frames, and both cleared correctly the moment the
+     peer disconnected. Toggling presence off in the UI produced zero console errors.
+  **Honest scope, not built here:** presence for any chat other than the currently-active one; a
+  server-side "who's online across all my chats" aggregate; disabling presence automatically under a
+  future paranoia profile (docs/05 "Maximum ... disable presence" — the rule-engine that would drive
+  that doesn't exist yet, tracked separately, not this pass's gap to close).
+- **Done (2026-07, "PrekeyDO rotation" pass) — closes the "real `PrekeyDO`/identity-persistence
+  service" gap the entry above (and R24's own Phase 1 write-up) flagged as separate/deferred: R24
+  generated fresh identity/prekey material per mount but never persisted or published a fetchable
+  bundle anywhere beyond the queue-pushed `prekey_offer`. Full docs/03 §4 X3DH-style bundle now real:
+  identity key (unchanged, long-term per chat) + a ROTATING signed prekey + a pool of ONE-TIME
+  prekeys, all durably published.**
+  **Crypto (`packages/vortic-core`): one-time-prekey mixing is real, not cosmetic.**
+  `kem.rs` gained `combine_with_onetime` (folds a SECOND independent hybrid-KEM root key into the
+  first via HKDF); `ratchet.rs` gained `handshakeInitiateWithOnetime`/`handshakeRespondWithOnetime` —
+  reuses `kem::encapsulate`/`decapsulate` twice rather than inventing new primitives. Security
+  property, stated precisely: even a fully compromised signed-prekey private key is not enough to
+  recover a session's root key on its own — the one-time leg's private key is used exactly once and
+  discarded (PrekeyDO deletes the public half server-side on fetch; the client deletes its matching
+  private half on consumption, `lib/prekeys.ts`'s `consumeFromPool`), so an attacker needs BOTH,
+  and the one-time one is gone by the time any such compromise could matter. cargo: 27/27 (client-full),
+  including a **load-bearing check** (`onetime_prekey_handshake_both_sides_agree_and_the_mix_is_load_bearing`)
+  proving the mix actually changes the resulting root key, not just that both sides agree on *something*.
+  **Real limitation found while writing tests, not swept under the rug:** `#[wasm_bindgen]`-annotated
+  items generally cannot be called from a native (non-wasm) target at all — confirmed empirically
+  (wasm-bindgen's own "cannot call wasm-bindgen imported functions on non-wasm targets" panic), a
+  stronger restriction than "only `JsError` construction panics off-wasm" this file's tests previously
+  assumed. The new adapter functions' own correctness was instead verified via a real compiled-WASM
+  Node script against the actual `pkg/client` build (see the live-verification bullet below), not a
+  native `cargo test` — same gap `handshake_initiate`/`handshake_respond` themselves already had (no
+  adapter-level native test ever existed for those either).
+  **Server: `workers/messaging/src/durable-objects/PrekeyDO.ts`** (new, contact-scoped like
+  PresenceDO — one instance per chat id). Holds NO SQLite table for identity linkage beyond two plain
+  tables (`bundle`: one row, upserted on publish/rotate; `onetime_prekeys`: a pool, atomically
+  popped-and-deleted on fetch — the DO's single-threaded-per-instance execution model makes
+  read-then-delete race-free without needing `DELETE...RETURNING`, same reasoning MerkleTreeDO's
+  nullifier tables already rely on). `POST /publish` (upsert bundle, additive one-time top-up),
+  `GET /status` (bundle presence + pool count, for the client to decide whether to rotate/replenish),
+  `GET /fetch` (the initiator's read: bundle + at most one popped one-time prekey, or `null` if the
+  pool is empty — a graceful degrade, not an error, matching real X3DH). New migration tag `v2`
+  (DO migrations are append-only, per `wrangler.toml`'s own standing comment — `v1`'s array was not
+  edited). Routed at `/prekey/:chatId/*` (direct, capability-gated, same as `/queue`/`/conv`) AND
+  wrapped through the existing OHTTP Gateway (`corePrekeyRequest` in `index.ts`, same reasoning as
+  `/queue/:id/push`'s R25 follow-up: this fires on roughly every chat mount / rotation check, not
+  once per enrollment, so an unwrapped fetch would leak the real client IP on a non-one-time call).
+  `workers/ohttp-relay`'s `WS_PROXY_PATTERN` needed no change here (unlike PresenceDO) — `/prekey` is
+  plain request/response, not a WS upgrade.
+  **Client (`apps/web`):** new `lib/prekeys.ts` — the PrekeyDO HTTP client (always via `ohttpFetch`)
+  plus the RESPONDER's local one-time-prekey pool (sealed in the existing non-extractable vault,
+  `lib/secureStore.ts` — same primitive the persisted ratchet identity already uses). **Honest gap,
+  stated plainly:** this pool is LOCAL-DEVICE-ONLY; if local storage is ever lost while PrekeyDO
+  server-side still remembers having handed out a since-orphaned one-time prekey's public half, that
+  ONE handshake attempt fails to decapsulate — flagged in the module's own header comment as exactly
+  the kind of gap a future multi-device design needs to account for, not solved here.
+  `useQueueTransport.ts`: `getOrCreatePersistentIdentity` became `getOrRotateIdentity` — same persisted
+  identity, but the signed KEM prekey now rotates (fresh keypair, same long-term Ed25519 identity —
+  identity keys don't rotate, only the prekey they sign) once older than `SIGNED_PREKEY_ROTATE_AFTER_MS`
+  (7 days), tracked via a third sealed record (`ratchet-kem-rotated-at`). The responder-mount effect
+  now ALSO publishes to PrekeyDO and tops up the one-time pool (only when actually below
+  `ONETIME_REPLENISH_THRESHOLD`, to avoid needless churn every mount) — the queue-pushed `prekey_offer`
+  fast path is UNCHANGED, both paths coexist exactly like `/queue/:id/push`'s direct-vs-OHTTP split.
+  A NEW initiator-mount effect proactively `GET`s PrekeyDO instead of only passively waiting for a
+  queue push — works even if the responder is currently offline, which the queue-only fast path never
+  could. `handleInboundMessage`'s `prekey_offer`/proactive-fetch handling was unified into one shared
+  `initiateHandshakeFromBundle` callback (both call sites need identical signature-verification and
+  re-handshake-recovery logic — kept as one function so they can't drift). `SessionInitEnvelope` gained
+  an optional `oneTimePrekeyId` field so the responder knows which locally-persisted one-time private
+  keypair to consume; absent means "plain signed-prekey-only handshake" (pool was empty, or the bundle
+  came from the queue fast path, which never carries one) — real X3DH tolerates this, same strength as
+  before this pass.
+  **Verified live, real stack, both checkpoints:**
+  1. *Server-side* (isolated `wrangler dev`, port 8798, same port-conflict avoidance as the PresenceDO
+     pass): a Node probe confirmed — missing capability → 401; fresh chat has no bundle (`GET /fetch`
+     → 404) until published; publish + 3 one-time prekeys → `GET /fetch` pops exactly one DIFFERENT
+     key per call, three calls exhaust the pool; a 4th fetch on an exhausted pool still returns the
+     bundle with `onetimePrekey: null` (graceful degrade, not an error); republishing with a new
+     signed prekey rotates it (`GET /fetch` returns the NEW one, `rotatedAt` advances); replenishing
+     tops up the pool without disturbing the bundle; a second, different chat id has fully independent
+     empty state (isolation). Zero uncaught exceptions in the Worker log.
+  2. *Client + real WASM, end-to-end, against the real already-running dev stack* (not simulated):
+     opened a real invite chat in the browser (responder role) — console showed
+     `[Crypto] Publishing signed prekey bundle (freshly rotated)...` and
+     `[Crypto] PrekeyDO bundle published ..., one-time pool now 20`, confirming the rotation+top-up
+     logic ran for real. A Node script loaded the ACTUAL COMPILED `pkg/client` WASM (via `initSync`
+     over the raw `.wasm` bytes — no browser needed to exercise real WASM), fetched the bundle from
+     PrekeyDO, and ran a REAL `RatchetSession.handshakeInitiateWithOnetime` — ciphertext length
+     confirmed exactly 2240 bytes (`2×(1088+32)`, both KEM legs). Pushed `session_init` onto the real
+     `QueueDO` queue; the browser's console showed
+     `[Crypto] PQXDH handshake completed (responder side) (one-time-prekey strengthened) — ratchet
+     session ready` — confirming the RESPONDER genuinely used `handshakeRespondWithOnetime`, not a
+     silent fallback. The Node script's message decrypted correctly in the browser UI
+     (`"hello from the Node initiator (one-time-prekey session)"`, visible in the chat panel); a reply
+     typed and sent from the real browser UI decrypted correctly on the Node side
+     (`"hello back from the real browser responder"`). Zero console errors throughout. **A stale-HMR
+     false alarm caught and ruled out, not silently ignored:** an OLD browser tab (alive since much
+     earlier in this same session, across many hot-reloads) showed a spurious React
+     "change in the order of Hooks" error that persisted even across `location.reload()`; a BRAND NEW
+     tab against the identical running dev server showed zero such errors and completed the full test
+     cleanly — confirming it was accumulated Vite HMR module-graph drift in that one old tab, not a
+     real hook-order bug in the new code (every hook in `useQueueTransport`/`usePresence` is called
+     unconditionally at the top level; nothing in this diff conditions a hook call).
+  **Done (2026-07, "device-linking" pass) — closes the "Multi-device" gap above. Design chosen by
+  the architect (asked explicitly, both options real): a second device gets the SAME per-chat
+  identity/ratchet state (not a per-device Sesame-style key + sender fan-out) — simpler, reuses the
+  existing single-`RatchetSession` model unchanged, at the cost of only one device ever being "live"
+  for send/receive at a time (a real, accepted tradeoff, not hidden).**
+  **Rust (`packages/vortic-core`): full live-state export/import, not a placeholder.**
+  `ratchet.rs` gained `RatchetSession.exportState()`/`RatchetSession.importState()` — serializes
+  EVERY field of `RatchetState` (both DH keypairs, root/chain keys, the skipped-message-key cache,
+  turn counters, any pending Sparse-PQ offer) to a fixed byte layout, matching this crate's own
+  established "fixed layout, not a serde crate" convention (`kem.rs`'s `to_bytes`/`from_bytes` pairs).
+  `MlKemKeyPair` gained a matching `pub(crate)` `to_bytes`/`from_bytes` (kept crate-private
+  deliberately — a bare ML-KEM private keypair has no legitimate reason to cross the WASM boundary on
+  its own, only bundled inside a whole state export). **The correctness bar was "a linked device can
+  actually continue the conversation," not just "the bytes round-trip"** —
+  `exported_state_round_trips_and_a_linked_device_continues_the_conversation` exchanges real messages
+  BEFORE export, exports mid-conversation, and proves the reconstructed session both decrypts a NEW
+  message from the real peer and sends one the peer can decrypt back. A second test
+  (`exported_state_preserves_skipped_keys_and_pending_pq_offer`) forces an out-of-order skipped-key
+  cache entry and enough turns to populate a Sparse-PQ pending offer specifically to cover the
+  variable-length/optional parts of the layout, not just the always-present fields — and confirms the
+  ONCE-skipped message still decrypts correctly on the linked device (functional, not just
+  byte-identical). A third rejects truncated input at every cut length rather than panicking. cargo:
+  33/33 (client-full+issuer-full). **Real limitation found and worked around, not glossed over:**
+  `#[wasm_bindgen]`-annotated items cannot be called from a native target AT ALL (a stronger
+  restriction than "only `JsError` construction panics off-wasm" the rotation pass's own tests had
+  assumed) — confirmed empirically, so the adapter layer's own correctness was verified separately via
+  a real compiled-WASM Node script against a real browser-produced payload (see the live-verification
+  bullet below), the same "no native adapter-level test, WASM-boundary coverage lives elsewhere" gap
+  `handshake_initiate`/`handshake_respond` themselves already had.
+  **Server: three new contact/chat-scoped DOs**, same convention as PresenceDO/PrekeyDO (opaque ids
+  only, capability-gated one layer up in `index.ts`, own migration tag — `v3` — since these are new
+  classes shipping after `v1`/`v2`):
+  - **`DeviceLinkDO`** — a one-time, TTL'd (10 min) dead-drop keyed by a linkId derived
+    ONE-WAY (SHA-256) from a random "linking secret" that never crosses the server — `POST /put` /
+    `GET /take`, the latter deleting in the same call it reads (same race-free
+    read-then-delete-within-one-DO-instance reasoning as PrekeyDO's one-time-prekey pop). The DO
+    never sees plaintext: the stored blob is AEAD-sealed client-side under a key HKDF-derived from
+    the same secret. Wrapped through OHTTP (`coreDeviceLinkRequest`) — this payload is full private
+    key material, arguably the single most sensitive thing this app ever puts on the wire, so it gets
+    at least the same IP-correlation protection as ordinary message pushes.
+  - **`DeviceLeaseDO`** — the real correctness guard this pass could not skip: without SOME mutual
+    exclusion, two of a user's own linked devices both running a live ratchet session for the same
+    chat would desync it, for the PEER too, not just the linked user (their ratchet only ever expects
+    ONE sender-direction chain advancing in order). A simple heartbeat-renewed lease (45s TTL, one
+    holder at a time, `POST /acquire` returns 409 with the current holder if denied, `POST /release`
+    is a no-op for a non-holder rather than an error, an alarm reclaims an abandoned lease so a
+    crashed/closed device can never permanently lock a chat). Also OHTTP-wrapped (fires on a ~20s
+    heartbeat cadence per open chat — leaving it unwrapped would let the Worker continuously correlate
+    a real IP with "this device has chat X open right now").
+  **Client (`apps/web`):** `lib/deviceLink.ts` (AEAD seal/unseal — HKDF-SHA256 over the linking
+  secret into an AES-GCM key, same WebCrypto primitives `lib/secureStore.ts` already uses — plus
+  `buildLinkPayload`/`applyLinkPayload`, which gather/restore identity+KEM+one-time-pool+live-ratchet-
+  state+message-history under the exact same `secureStore` keys `useQueueTransport.ts`/`lib/prekeys.ts`
+  already use, so neither of those files needed special-casing for "was this chat linked in") and
+  `lib/deviceLease.ts` (a non-secret, plain-`localStorage` `deviceId` label — NOT identity material,
+  safe outside the vault unlike everything else this pass touches — plus the acquire/release HTTP
+  client). `useQueueTransport.ts`: the responder/initiator-mount effects are now gated on a NEW
+  `hasLease` state (acquired + heartbeat-renewed every 15s, well inside the server's 45s TTL); a
+  **real ordering hazard found and fixed while wiring this, not shipped broken:** the pre-existing
+  reset of `ratchetSessionRef`/etc. lived at the TOP of the responder-mount effect and in its cleanup,
+  both of which also fire on every `hasLease` transition — including the transition FROM a just-
+  imported session TO `hasLease=true`, which would have silently wiped a device-link import the
+  instant it landed. Fixed by moving the reset to a SEPARATE effect keyed only on `[chatId]` (so a
+  `hasLease` flip alone can't trigger it) and removing the reset from the responder effect's own
+  cleanup entirely (a transient lease hiccup must not nuke a live session either). The
+  lease-acquire effect itself now hydrates: on first successful acquire with no session yet, checks
+  for a sealed `ratchet-imported-state:${chatId}` record and, if present, reconstructs the session via
+  `RatchetSession.importState` plus the trusted peer bundle (also carried in the transfer payload, so
+  a linked initiator-role device doesn't lose the existing "peer republished, treat as recovery, not
+  attack" detection) instead of starting a fresh handshake — and the initiator's proactive-PrekeyDO-
+  fetch effect now skips entirely once a session already exists, so hydration doesn't needlessly burn
+  a one-time prekey fetching a bundle it will just reject as "different peer" anyway. New hook exports:
+  `hasLease`, `leaseHeldByOther`, `exportRatchetState`, `getTrustedPeerBundle`. `Chats.tsx`/
+  `ActiveChatPanel.tsx`: a "Link Device" button (disabled unless `hasLease`, matching
+  `exportRatchetState`'s own "exporting from a read-only device would hand over stale state" doc
+  comment), a device-link banner (same shape as the invite banner, but explicitly worded — "move to
+  your OWN other device only, valid 10 min" — since this is a materially higher-stakes secret than an
+  invite code, see `lib/deviceLink.ts`'s header comment), a read-only banner when `leaseHeldByOther`,
+  and `#/device-link/<code>` hash redemption alongside the existing `#/invite/<id>` handling in the
+  restore effect (requires `cap` — DeviceLinkDO is capability-gated, so linking does NOT bypass
+  account-level auth; the second device still needs its own real OAuth+ZK login first).
+  **Verified live, real stack, every layer:**
+  1. *DeviceLinkDO in isolation* (isolated `wrangler dev`, same port-conflict-avoidance discipline as
+     every prior pass this phase): missing capability → 401; take before put → 404; put → take →
+     exact blob match; SECOND take on the same link → 404 (single-use confirmed); a different linkId
+     sees nothing (isolation).
+  2. *DeviceLeaseDO in isolation*: device-1 acquires; device-2's acquire on the SAME chat → 409 with
+     `holder: "device-1"`; device-1 renews its own lease successfully; device-2's release attempt (not
+     the holder) is a no-op, lease unaffected; device-1's real release clears it; device-2 can then
+     acquire.
+  3. *Full chain, real browser + real independent Node-side crypto, not simulated*: re-used the
+     rotation pass's live chat (a real prior one-time-prekey-strengthened session with actual exchanged
+     messages). Clicked "Link Device" for real in the browser — zero console errors, a real code
+     appeared. **An independent Node script — using Node's own WebCrypto, NOT importing any of this
+     app's seal/unseal code — fetched the real blob from the live `DeviceLinkDO` and decrypted it
+     successfully**, proving the AEAD scheme genuinely round-trips between two separate
+     implementations, not just "the same code that sealed it can unseal it." The decrypted JSON
+     contained a genuine responder identity/KEM/17-entry one-time pool and real message history
+     including the earlier cross-device exchange. **First attempt correctly showed `ratchetStateB64:
+     null`** — not a bug: no live session existed yet on that fresh page load (the original Node
+     initiator process from the rotation pass had long since exited, and a responder's ratchet session
+     is real in-memory-only state, never persisted across reloads by design). Re-ran a fresh real
+     one-time-prekey handshake against the same chat to establish a genuinely live session, confirmed
+     via the browser's own console (`PQXDH handshake completed (responder side) (one-time-prekey
+     strengthened)`), linked again — this time the payload's `ratchetStateB64` was present, and
+     **`RatchetSession.importState` against the REAL compiled `pkg/client` WASM (via Node's `initSync`
+     over the raw `.wasm` bytes, no browser needed) accepted it and produced a functional session**
+     (non-crashing `pqRemixCount()`, a well-formed encrypted wire frame). A direct `GET
+     /device-lease/:chatId/status` call against the live stack, made WHILE the browser tab had the chat
+     open, confirmed a real, currently-unexpired lease held by that tab's own generated `deviceId` —
+     the heartbeat is genuinely running, not just present in the code. Zero console errors throughout
+     the entire sequence.
+  **Honest scope, stated plainly:** only ONE device is ever live at a time — this is the accepted cost
+  of the chosen design (see the architect's decision at the top of this entry), not an oversight. No
+  UI affordance yet for "see which of my devices currently holds the lease" beyond the read-only
+  banner on the losing side. `lib/prekeys.ts`'s pre-existing local-pool-loss gap is now closable BY
+  linking (a linked device gets the real pool, not a fresh empty one) but is still real for a device
+  that was never linked. Re-linking an already-locally-present chat OVERWRITES local state with the
+  linked payload (`applyLinkPayload`'s own doc comment) — reasonable for "recover this chat on a
+  second device," not yet a considered choice for "merge two devices' independently-diverged history,"
+  which isn't a scenario this design (one-live-device-at-a-time) should actually produce in normal use.
+  **Still open:** `@cloudflare/actors` fan-out for anything beyond
   single-DO WS (not yet needed — every DO so far handles its own fan-out directly). R2 presigned
   chunked-AES-GCM media path. Alias adaptive/per-target PoW difficulty, Argon2id hardened option, signed
   update/revoke (would need `alias_pub` back out as a plaintext column), approval-gated contact-request flow
   through the resolved `intro_queue_id`, `H(nickname)`-prefix sharding. Real per-user queue-id provisioning
   (Flow 5/6 contact establishment) — the "R22: real transport" pass fixed the transport primitive and "R24:
   real Triple Ratchet" fixed the crypto, but both still rely on an explicit `role` stand-in, not real
-  contact-driven queue/identity assignment. A real `PrekeyDO`/identity-persistence service for the ratchet
-  handshake (docs/03 §4) — R24 generates fresh identity/prekey material per mount, not persisted or
-  published anywhere.
+  contact-driven queue/identity assignment.
 - **Exit:** two devices exchange 1:1 + group messages + media offline/online; **Metadata Diagnostics (K5)**
   shows only opaque IDs/ciphertext; an opt-in `@alias` registers, resolves under PoW, and bootstraps a contact
   with **owner approval** — while a raw `AliasDO` dump yields no readable nickname→identity link and no
@@ -891,6 +1454,31 @@ bands, not calendar promises.
   (Couldn't safely intercept `window.location.href` to assert the literal assembled OAuth URL — browsers
   don't allow redefining `window.location` — so that specific line was verified by code review, not live
   capture; everything else was captured live.)
+- **Done (2026-07, "Security Gate de-simulation" pass) — closes the "3 honestly-labeled simulated
+  placeholders" gap above.** No more `Math.random()` coin-flips anywhere in `lib/securityChecks.ts`.
+  **Clock Synchronization** is now a real HTTP round trip to the Enrollment Worker's public `/health`,
+  comparing the local clock against the response's `Date` header (NTP-style round-trip-midpoint
+  correction) — honestly reports "server sent no Date header" rather than fabricating a skew number
+  when one is genuinely unavailable (observed in local `wrangler dev`/Miniflare, which doesn't add
+  one; real Cloudflare edge responses always do). **DNS Resolver Quality → renamed DNS Lookup
+  Latency**, not just re-implemented: a browser has no API surface that reveals which resolver the OS
+  used or its transport (DoH/DoT) — confirmed before writing anything, not assumed — so rather than
+  keep a label promising something structurally unmeasurable, this now reports the real Navigation
+  Timing `domainLookupEnd - domainLookupStart` for what it actually is. **VPN/Egress Exposure**
+  couldn't be made real without either the still-not-built Phase 2 capability endpoint or calling a
+  third-party IP-intelligence service (which would leak "this user is checking VPN status" to that
+  third party — against this project's own no-third-party-leak posture) — kept deterministic and
+  honest instead: a fixed, clearly-worded "not yet verifiable, needs a server-side endpoint" message,
+  replacing the coin-flip. **Two new real checks added** ("add more environment tests," per the task):
+  Automation Detection (`navigator.webdriver`, a real standardized signal — flags Selenium/Playwright/
+  CDP-driven sessions) and Privacy Signal (`navigator.globalPrivacyControl`/`doNotTrack`, purely
+  informational, always "ok" since their absence says nothing about actual risk). 8 checks total now
+  (was 6), `useSecurityScan.ts` needed zero changes (already fully driven by `CHECK_DEFS.length`, no
+  hardcoded count anywhere). **Verified live:** ran the real scan on `/` and the embedded `/settings`
+  widget, zero console errors both times; re-ran the scan a second time and confirmed every result was
+  either byte-identical or explainably different by a real measurement (clock round-trip varying by a
+  few ms between runs, a genuine timing artifact — not the old behavior where VPN/DNS/Clock could
+  flip between "ok" and "warn" on every re-run for no real reason).
 - **Done (2026-07): mock Auth flow + route gating.** `contexts/AuthContext.tsx` (`isAuthenticated`/`login`/
   `logout`, backed by a `localStorage` flag — explicitly documented as a Phase 4 mock, **not** the real
   session model; docs/03 §3's real session is a short-lived capability minted after a Groth16 verify, never
@@ -1197,6 +1785,30 @@ bands, not calendar promises.
   `pnpm wrangler d1 migrations apply <db-name> --local` once per Worker with a `[[d1_databases]]` binding
   before its first request that touches D1** — not currently automated (e.g. via a `predev` script), worth
   adding if this surprises someone else.
+- **Done (2026-07, "logout + contact deletion" pass) — two small, real gaps closed together.**
+  **Sidebar's "End Session" button was a `console.log` stub, not wired to anything** — a real leftover
+  from before `AuthContext` grew a real capability/vault model; nobody had updated the button when
+  that landed. Fixed: calls the real `logout()` (clears in-memory token + the sealed vault entry);
+  `AuthGuard` re-evaluates `isAuthenticated` every render (not just on mount), so it reactively
+  redirects to `/` on the very next render with no manual navigation needed in `Sidebar.tsx` itself.
+  **Verified live:** clicked the real button — landed back on the Security Gate; a direct
+  post-logout navigation to `/chats` correctly bounced back to `/` too (confirms the vault entry was
+  genuinely cleared, not just the in-memory flag). **Contact/chat deletion, not previously possible at
+  all:** `ChatListItem.tsx` gained a hover-revealed delete control (restructured from a single
+  `<button>` wrapper to a `role="button"` div + a real nested `<button>`, since a `<button>` inside a
+  `<button>` isn't valid HTML); `Chats.tsx`'s `handleDeleteChat` removes the chat from the list AND
+  every associated local secureStore record (`ratchet-identity`/`ratchet-kem`/`ratchet-kem-rotated-at`/
+  `ratchet-imported-state`/`onetime-pool`, all keyed by chat id) — a stale identity/prekey-pool record
+  left behind after "deleting" a chat would be a real residual-data leak, not just visual clutter.
+  Native `window.confirm()` gates the action (simple, unblockable-by-accident, no new modal component
+  needed for a single destructive action). **Honest scope:** local-device only, same as the rest of
+  `lib/chatList.ts` — does not notify the peer, does not reach `PrekeyDO`/`PresenceDO`/`DeviceLeaseDO`
+  server-side state for that chat (left to its own existing TTL/alarm cleanup, same as an abandoned
+  chat already is), and does not delete the chat on any other of the user's own linked devices.
+  **Verified live:** created a real chat, confirmed its 4 crypto-state keys existed in the vault,
+  triggered a real delete (list count 3→2), confirmed all 4 keys were gone while a DIFFERENT chat's
+  keys were untouched (isolation), reloaded the page and confirmed the deletion persisted. Zero
+  console errors throughout both checks.
 - **Still open:** (Both the vortic-core WASM build AND VOPRF capability issuance are now **done** — `/oprf/issue`
   is a real Ristretto VOPRF+DLEQ endpoint and `login()` stores a real unblinded token, see the Phase 1 "Real
   WASM"/"Dynamic keys" and Phase 2 "Airlock" entries above.) What remains: redeeming that capability token
@@ -1260,7 +1872,7 @@ Severity × likelihood; **R1 is the one the brief explicitly asked about.**
 | **R23** | **Client (`apps/web`) does not generate a real Semaphore proof** — `AuthCallback.tsx`'s step 5 still references the retired mock-circuit vector and sends no `message`/`scope`; against the now-real `/auth/session` (R21, resolved server-side) this will fail (missing fields, and even patched, the old proof bytes won't verify against the new real VK). Real client-side proving needs the circuit `.wasm`+`.zkey` bundled into the web app and a browser proving step (docs/06 R6 territory — WASM size/perf). | High | Closed | **Fully Resolved 2026-07** (see the "R23: real client-side proving" and "R23 follow-up: MerkleTreeDO /proof/:commitment" entries below). `AuthCallback.tsx` generates a real Groth16 proof in-browser via `snarkjs` against the official ceremony `semaphore-20.wasm`/`.zkey`, fetching its own real Merkle proof from `MerkleTreeDO`'s new `GET /proof/:commitment` — works for a tree of ANY size, not just the sole-member case the first sub-pass shipped. Live-verified with TWO real identities, proof requested for the non-first member specifically (the key regression check): both authenticate successfully (`zk_verify_groth16_bytes -> true`, capability minted for both). | 2,4 |
 | **R24** | **1:1 message transport (R22, resolved) still ran on unauthenticated, non-ratcheting X25519 DH** — a bare ephemeral key swap with no signed prekeys (MITM-able on first contact) and no ratchet at all (one static session key for the whole chat, so a single key compromise exposes every message, past and future) — a direct gap against docs/02's G1-G4 (confidentiality, forward secrecy, post-compromise security, PQ). | High | Closed | **Resolved 2026-07** (see the "R24: real Triple Ratchet" entries in both Phase 1 and Phase 3 below). Real PQXDH-style handshake (Ed25519-signed hybrid ML-KEM-768+X25519 prekey bundle, rejects an unsigned/wrong-key bundle outright) + real Double Ratchet (per-message forward secrecy, DH-turn post-compromise security) + Sparse PQ Ratchet (periodic ML-KEM remix, chain-scoped — see the entry for why root-scoped hit a real symmetry bug and was descoped honestly). `useQueueTransport.ts`'s flat DH deleted, no fallback. Live-verified over a real `wrangler dev` QueueDO: PQXDH handshake, 4 alternating messages, key-rotation proof (identical plaintext → provably distinct ciphertext), and forward-secrecy proof (replaying an old captured message against the receiver's advanced session correctly fails). **Not claiming:** MLS/group ratcheting, a real `PrekeyDO`/identity-persistence service (still a `role`-style stand-in, same honesty standard as R22), or literal root-level (vs. chain-level) PQ propagation. | 1,3 |
 | **R25** | **OHTTP was never implemented, only stub comments claiming it existed "in production"** — `index.ts`/`wrangler.toml` said this Worker "sits behind an OHTTP relay" with no relay, no Gateway route, and no client-side encapsulation anywhere in the codebase. README calls this "load-bearing, not cosmetic": without it Cloudflare sees the real client IP on every anonymity-zone call regardless of cryptographic identity unlinkability (docs/03 §2). | High | Closed | **Resolved 2026-07** (see the "R25: real OHTTP" entry above, plus its same-day follow-up). Real RFC 9458 implementation: new `packages/ohttp` (RFC 9292 Binary HTTP framing + RFC 9458 Key Config/request/response framing, built on the real `@hpke/core` HPKE library — researched first, confirmed no maintained Gateway/framing package exists before writing any protocol code, per this task's own instruction), `workers/messaging`'s new Gateway routes (`/ohttp/keys`, `/ohttp/gateway`), new `workers/ohttp-relay` (the Relay role), `apps/web`'s `ohttpFetch` wired into all FOUR plain request/response routes: the three original ones (`/membership/insert`, `/membership/proof/:commitment`, `/auth/session`) plus `/queue/:id/push` — the real message-send path, added same-day after being flagged as under-prioritized (it's the highest-frequency OHTTP-eligible route, not a one-time enrollment call). Live-verified against real `wrangler dev` for all three roles, including a full round trip that mints a real capability, pushes a real message through OHTTP, and confirms delivery via a direct WS subscribe with the exact plaintext round-tripping. IP-visibility demonstrated structurally (the Gateway-dispatched handlers never receive a `Request` object at all, only a decapsulated `BhttpRequest` with no IP field) rather than via a locally-meaningless header comparison — see the entry above for why. **Not claiming:** WebSocket routes are OHTTP-wrapped (structurally impossible — single-shot scheme vs. persistent connection; a subscriber's IP is handed directly to A2, the Messaging Worker itself — see **R26**, tracked separately because this is a different, more severe adversary category than the network-observer threat R2's VPN/OHTTP mitigation stack targets), or an independently-operated Relay (same-account Cloudflare deploy closes this pass's target gap, not the deeper "colluding relay+gateway operator" threat docs/03 §2 already names). | 2 |
-| **R26** | **A WS subscribe/receive connection (`/queue/:id`, `/conv/:id`) hands its real connecting IP directly to A2 — docs/02's PRIMARY adversary, the host itself** ("reads all D1/R2/DO state, sees Worker inputs incl. client IP, can log & correlate, can be legally compelled") — not merely to a passive network observer (A1/A7). R25's OHTTP cannot wrap this: RFC 9458 is a single-shot request/response scheme, structurally incompatible with a persistent connection, so for the ENTIRE time a client is online receiving messages, its IP is an ordinary Worker input the Messaging Worker (and therefore Cloudflare) sees directly — no wiretap, no traffic analysis required, just an ordinary connection log. **This is a categorically different and more severe risk than R2** ("network-level correlation defeats ZK"): R2 is about an adversary correlating separate requests across time/IP; this is the primary adversary observing, continuously and trivially, exactly which IP is behind an active receiving session. | High | Open | **Not mitigated.** The Security Gate's VPN/Tor nudge (docs/README point 12, R2's own mitigation stack) does **not** close this gap — it changes *which* IP Cloudflare sees (real vs. VPN exit), not *whether* Cloudflare, as the host terminating the WS connection, can observe an IP tied to an active session; it is also voluntary/UX-dependent, not a structural guarantee, and a user who skips the VPN nudge gets no protection at all on this path. No fix implemented. Candidate mitigations, none built: a genuinely independent (non-Cloudflare) relay hop in front of WS connections specifically (distinct from R25's request/response Relay); a poll-based receive fallback that CAN be OHTTP-wrapped, trading real-time delivery latency for this protection; or accepting this as a permanent architectural limit of "real-time push over a host-terminated WebSocket" and scoping docs/02's goals to say so explicitly rather than leaving it implied only by R25's fine print. | 3 |
+| **R26** | **A WS subscribe/receive connection (`/queue/:id`, `/conv/:id`) hands its real connecting IP directly to A2 — docs/02's PRIMARY adversary, the host itself** ("reads all D1/R2/DO state, sees Worker inputs incl. client IP, can log & correlate, can be legally compelled") — not merely to a passive network observer (A1/A7). R25's OHTTP cannot wrap this: RFC 9458 is a single-shot request/response scheme, structurally incompatible with a persistent connection, so for the ENTIRE time a client is online receiving messages, its IP is an ordinary Worker input the Messaging Worker (and therefore Cloudflare) sees directly — no wiretap, no traffic analysis required, just an ordinary connection log. **This is a categorically different and more severe risk than R2** ("network-level correlation defeats ZK"): R2 is about an adversary correlating separate requests across time/IP; this is the primary adversary observing, continuously and trivially, exactly which IP is behind an active receiving session. | High | **Mitigated (same-zone, live-verified 2026-07-19) — not fully Closed** | `workers/ohttp-relay` proxies the WS upgrade for `/queue/:id`/`/conv/:id` at the network level (not HPKE — WS structurally can't be OHTTP-wrapped), preserving genuine real-time delivery (no polling). **Live-verified against the real deployed stack (first real Cloudflare deploy, 2026-07-19 — see docs/deploy-checklist.md), not simulated:** a `wrangler tail` capture on the real `vorticity-messaging` Worker showed a DIRECT request's `cf-connecting-ip` as the real caller IP (`87.110.116.194`, edge-authoritative on real Cloudflare — confirmed different from local `wrangler dev`'s spoofable behavior), and the SAME request routed THROUGH `relay.vort.xfeatures.net` showed `cf-connecting-ip=0.0.0.0` — the literal override value `proxyWebSocket`'s `x-real-ip` sets, confirming the documented same-zone `CF-Connecting-IP`-reflects-`x-real-ip` behavior fires exactly as Cloudflare's own docs describe. **What this DOES prove:** the same-zone mitigation this repo's own code implements genuinely works on real infrastructure, not just in theory. **What this does NOT prove, stated as plainly as the "unverified" status was before:** this is not the platform-guaranteed cross-zone `CF-Connecting-IP` auto-anonymization the original R26 design targeted — it depends on `proxyWebSocket`'s override staying correct forever, and the "colluding relay+gateway operator" gap (docs/03 §2) remains fully open, since Relay and Gateway are the same operator's infrastructure under same-zone (see docs/deploy-checklist.md §5 for the topology decision and why cross-zone isn't available right now). Genuinely a step forward from "unverified" to "verified for the weaker mechanism," not yet the stronger property — hence "Mitigated," not "Closed." **Revisit before opening beyond a small trusted alpha circle who has been told this trade-off plainly.** | 3 |
 
 ### R1 & R2 — the ZKP↔Workers coupling, in depth (the brief's key question)
 

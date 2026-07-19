@@ -139,6 +139,22 @@ fn combine(ml_kem_ss: &[u8], x25519_ss: &[u8]) -> [u8; 32] {
     arr32(&okm)
 }
 
+/// One-time-prekey mixing (docs/03 §4: "one-time prekeys ... all rotated"): folds a SECOND hybrid
+/// root key — from encapsulating to a one-time prekey that PrekeyDO deletes after this single use —
+/// into the signed-prekey root key `combine()` already produced. This is what makes a one-time
+/// prekey a real X3DH-style strengthening rather than a bigger bundle for show: an attacker who
+/// later steals the signed prekey's long-term-ish private key still cannot recover THIS session's
+/// root key without also having captured the one-time prekey's private key before PrekeyDO/the
+/// responder discarded it. `ratchet.rs`'s `handshakeInitiateWithOnetime`/`handshakeRespondWithOnetime`
+/// are the only callers — kept here (not ratchet.rs) since it's a KEM-root-key operation, same
+/// reasoning as `combine` itself living in this module.
+pub fn combine_with_onetime(signed_root: &[u8; 32], onetime_root: &[u8; 32]) -> [u8; 32] {
+    let mut ikm = Vec::with_capacity(64);
+    ikm.extend_from_slice(signed_root);
+    ikm.extend_from_slice(onetime_root);
+    arr32(&hkdf_sha256(&ikm, b"vortic-pqxdh-v1", b"root-key-onetime", 32))
+}
+
 // --- ML-KEM-768 only, no X25519 leg (R24: ratchet.rs's Sparse PQ Ratchet) -------------------------
 //
 // The Triple Ratchet's PQ leg periodically offers a *fresh* ML-KEM keypair in a message header and
@@ -157,6 +173,23 @@ pub struct MlKemKeyPair {
 impl Drop for MlKemKeyPair {
     fn drop(&mut self) {
         self.dk.zeroize();
+    }
+}
+
+impl MlKemKeyPair {
+    /// `pub(crate)`, not `pub`: only `ratchet.rs`'s state export/import (device-linking pass) needs
+    /// this — a bare ML-KEM keypair's private half has no legitimate reason to cross the WASM
+    /// boundary on its own, only bundled inside a whole ratchet state export. Layout: dk(64) || ek(1184).
+    pub(crate) fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(ML_KEM_768_DK_LEN + ML_KEM_768_EK_LEN);
+        out.extend_from_slice(&self.dk);
+        out.extend_from_slice(&self.ek);
+        out
+    }
+
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Self {
+        assert_eq!(bytes.len(), ML_KEM_768_DK_LEN + ML_KEM_768_EK_LEN, "bad MlKemKeyPair length");
+        MlKemKeyPair { dk: bytes[..ML_KEM_768_DK_LEN].to_vec(), ek: bytes[ML_KEM_768_DK_LEN..].to_vec() }
     }
 }
 

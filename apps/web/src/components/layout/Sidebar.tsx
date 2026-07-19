@@ -7,6 +7,7 @@
 import { NavLink } from "react-router-dom";
 import { Shield, MessageSquare, Settings, LogOut } from "lucide-react";
 import { cn } from "@vorticity/ui";
+import { useAuth } from "../../contexts/AuthContext";
 
 type NavItem = {
   path: string;
@@ -34,9 +35,15 @@ const navGroups: NavGroup[] = [
 ];
 
 export function Sidebar() {
+  const { logout } = useAuth();
+
+  // Wired to the REAL session (2026-07 — this was a `console.log` stub predating AuthContext's real
+  // capability/vault model; never updated when that landed). `logout()` clears the in-memory token
+  // AND the sealed vault entry (contexts/AuthContext.tsx) — `AuthGuard` then reactively redirects to
+  // "/" on the next render since it re-evaluates `isAuthenticated` every render, not just on mount,
+  // so no manual navigation is needed here.
   const handleEndSession = () => {
-    // TODO(Phase 4): wire to the real enrollment/session flow once it exists in apps/web.
-    console.log("End session — no real auth wired into apps/web yet (Phase 4).");
+    logout();
   };
 
   return (

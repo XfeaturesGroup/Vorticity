@@ -1,5 +1,5 @@
 import { cn } from "@vorticity/ui";
-import type { ChatMessage } from "../../lib/mockChats";
+import type { ChatMessage } from "../../lib/chat";
 
 export function MessageBubble({ message }: { message: ChatMessage }) {
   const isMine = message.senderId === "me";

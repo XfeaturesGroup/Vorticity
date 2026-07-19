@@ -13,14 +13,39 @@
 # Messaging Worker/Gateway structurally never receives the client's IP in the decapsulated request),
 # but a second, independently-operated relay is the deeper mitigation docs/03 §2 already gestures at
 # ("different hostnames/Workers per plane") — not deployed here, flagged rather than implied.
+#
+# TOPOLOGY (2026-07, revised — see docs/deploy-checklist.md §5): a genuinely SEPARATE Cloudflare
+# account for this Relay was the original plan (closes the "colluding relay+gateway operator" gap
+# above by platform guarantee, not by this Worker's own code) but isn't available right now — Workers
+# Paid is provisioned on only one account. **Deployed SAME-ZONE, on the same account as
+# workers/enrollment + workers/messaging, as an explicit, temporary, structurally-weaker decision.**
+# This means the residual note above is NOT closed even for the target gap (Messaging/Gateway never
+# receiving the client's IP for WS subscribe) the way a cross-zone deploy would close it — same-zone
+# relies entirely on the `x-real-ip` override in `proxyWebSocket` (src/index.ts) staying correct,
+# not on a platform-enforced guarantee. Migrate to a separate account before opening this beyond a
+# small trusted alpha circle — see docs/06's R26 entry and docs/deploy-checklist.md §5/§7.
 name = "vorticity-ohttp-relay"
 main = "src/index.ts"
 compatibility_date = "2026-02-01"
 
 [vars]
-# Local dev: the Messaging Worker's own `wrangler dev` origin. Production would point this at
-# `https://q.vort.xfeatures.net` (or an internal service binding, which is a stronger option worth
-# revisiting — see the residual note above about operator independence not mattering for THIS specific
-# leg, since a service binding vs. a public fetch doesn't change the IP-visibility property this pass
-# is about).
+# Local dev default: the Messaging Worker's own `wrangler dev` origin (see the residual note above
+# about operator independence not mattering for THIS specific leg, since a service binding vs. a
+# public fetch doesn't change the IP-visibility property this pass is about — a service binding
+# remains a worthwhile future revisit, not required). Overridden for prod below, under [env.production]
+# — plain `wrangler dev`/`wrangler deploy` (no --env) always uses THIS value, never the override, so
+# local dev is unaffected by the production deploy below.
 GATEWAY_ORIGIN = "http://127.0.0.1:8787"
+
+# Real production deploy (2026-07): `wrangler deploy --env production` — explicit `name` below keeps
+# the same Worker (wrangler suffixes the name with the env by default otherwise, which would silently
+# create a SECOND, differently-named Worker instead of updating this one).
+[env.production]
+name = "vorticity-ohttp-relay"
+
+[[env.production.routes]]
+pattern = "relay.vort.xfeatures.net"
+custom_domain = true
+
+[env.production.vars]
+GATEWAY_ORIGIN = "https://api.vort.xfeatures.net"

@@ -1,18 +1,23 @@
+import { Trash2 } from "lucide-react";
 import { cn } from "@vorticity/ui";
-import type { Chat } from "../../lib/mockChats";
+import type { Chat } from "../../lib/chat";
 
 interface ChatListItemProps {
   chat: Chat;
   isActive: boolean;
   onClick: () => void;
+  onDelete: () => void;
 }
 
-export function ChatListItem({ chat, isActive, onClick }: ChatListItemProps) {
+export function ChatListItem({ chat, isActive, onClick, onDelete }: ChatListItemProps) {
   return (
-    <button
+    <div
+      role="button"
+      tabIndex={0}
       onClick={onClick}
+      onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && onClick()}
       className={cn(
-        "w-full flex items-center gap-3 px-4 py-3 text-left transition-colors border-b border-white/5",
+        "group w-full flex items-center gap-3 px-4 py-3 text-left transition-colors border-b border-white/5 cursor-pointer",
         isActive ? "bg-white/5" : "hover:bg-white/[0.03]",
       )}
     >
@@ -38,6 +43,17 @@ export function ChatListItem({ chat, isActive, onClick }: ChatListItemProps) {
           )}
         </div>
       </div>
-    </button>
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          onDelete();
+        }}
+        title="Delete this chat (removes local history and crypto state — cannot be undone)"
+        className="shrink-0 p-1.5 rounded-lg text-white/0 group-hover:text-white/40 hover:!text-signal-danger hover:bg-signal-danger/10 transition-colors"
+      >
+        <Trash2 className="w-3.5 h-3.5" />
+      </button>
+    </div>
   );
 }

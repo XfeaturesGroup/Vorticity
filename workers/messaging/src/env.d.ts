@@ -6,6 +6,9 @@ export interface Env {
   GROUP_DO: DurableObjectNamespace;
   CONV_LOG_DO: DurableObjectNamespace;
   PRESENCE_DO: DurableObjectNamespace;
+  PREKEY_DO: DurableObjectNamespace;
+  DEVICE_LINK_DO: DurableObjectNamespace;
+  DEVICE_LEASE_DO: DurableObjectNamespace;
   ALIAS_DO: DurableObjectNamespace;
   RATE_GATE_DO: DurableObjectNamespace;
   /** 32-byte HMAC key (hex) for signing session capabilities issued by /auth/session. Local dev uses

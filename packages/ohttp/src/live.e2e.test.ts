@@ -290,4 +290,44 @@ describe.runIf(serversUp)("R25 live OHTTP over real wrangler dev (Client -> Rela
     });
     expect(res.status).toBe(400);
   });
+
+  it(
+    "R26 FUNCTIONAL test: a WS subscribe proxied through the Relay still delivers a real-time message correctly. " +
+      "NOT a proof the client IP is hidden (see docs/06's R26 entry — that specific property is unverifiable " +
+      "in wrangler dev) — this only confirms the proxy doesn't break real-time delivery / force polling.",
+    async () => {
+      const capability = await getRealCapability();
+      const queueId = `live-ws-proxy-queue-${crypto.randomUUID()}`;
+
+      // Connect through the RELAY (:8789), not the Gateway directly — this is the whole point of R26.
+      const received: { seq: number; ciphertext: string }[] = [];
+      const ws = new WebSocket(`ws://127.0.0.1:8789/queue/${encodeURIComponent(queueId)}?cap=${encodeURIComponent(capability)}`);
+      await new Promise<void>((resolve, reject) => {
+        ws.addEventListener("open", () => resolve());
+        ws.addEventListener("error", () => reject(new Error("WS-via-relay subscribe failed to open")));
+      });
+      ws.addEventListener("message", (event) => {
+        const wire = JSON.parse(event.data as string) as { type: string; seq: number; ciphertext: string };
+        if (wire.type === "message") received.push({ seq: wire.seq, ciphertext: wire.ciphertext });
+      });
+
+      // Push directly to the Gateway (bypassing OHTTP deliberately here — this test isolates the WS
+      // proxy leg specifically, not the request/response OHTTP path already covered by other tests).
+      const plaintextMarker = `real-ws-via-relay-${crypto.randomUUID()}`;
+      const pushRes = await fetch(`${GATEWAY_DIRECT}/queue/${encodeURIComponent(queueId)}/push`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${capability}`, "X-Ttl-Ms": "60000", "X-Size-Bucket": "0" },
+        body: new TextEncoder().encode(plaintextMarker),
+      });
+      expect(pushRes.status).toBe(201);
+      const { seq } = (await pushRes.json()) as { seq: number };
+
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      ws.close();
+      expect(received.length).toBe(1);
+      expect(received[0]!.seq).toBe(seq);
+      expect(Buffer.from(received[0]!.ciphertext, "base64").toString("utf8")).toBe(plaintextMarker);
+    },
+    20000,
+  );
 });

@@ -16,6 +16,13 @@
 //   4. No wrangler.toml `[vars]` block may define a var whose NAME looks like a secret
 //      (`/SECRET|KEY|SIGNING|PRIVATE/i`) — those must be `wrangler secret put` / `.dev.vars`
 //      (gitignored) only, never a plaintext value committed in `[vars]`.
+//   5. workers/ohttp-relay must never bind either plane's D1 database, R2 bucket, or Durable Object —
+//      true regardless of same-zone/cross-zone account topology (2026-07: deployed same-zone,
+//      temporarily, see docs/06's R26 entry and docs/deploy-checklist.md §5/§7 — a real Cloudflare
+//      account split for the Relay was the original plan but isn't available right now). This check
+//      is about the Relay staying a dumb byte-forwarder with zero plane access, not about account
+//      separation, which this file does NOT enforce (that was a stronger, now-reverted requirement —
+//      see git history if it needs to come back once a second account is available).
 //
 // Exit code 0 = clean. Exit code 1 = violation(s) found (printed to stderr).
 
@@ -170,6 +177,32 @@ function extractVarsSection(tomlText) {
   return nextHeader ? rest.slice(0, nextHeader.index) : rest;
 }
 
+/** Check #5: the Relay must never bind either plane's D1/R2/DO — true regardless of account
+ * topology. See this file's header comment for the "why" and for what this check does NOT do
+ * (it no longer enforces account_id separation; same-zone is the current, temporary decision). */
+function findRelayIsolationViolations() {
+  const violations = [];
+  const relayTomlPath = join(WORKERS_DIR, "ohttp-relay", "wrangler.toml");
+  if (!statSync(relayTomlPath, { throwIfNoEntry: false })) return violations;
+  const relayToml = readFileSync(relayTomlPath, "utf8");
+
+  const CROSS_PLANE_BINDINGS_FOR_RELAY = [
+    "DB_ENROLL",
+    "DB_MSG",
+    "MEDIA",
+    "MERKLE_TREE_DO",
+    "QUEUE_DO",
+    "GROUP_DO",
+    "CONV_LOG_DO",
+    "PRESENCE_DO",
+    "ALIAS_DO",
+    "RATE_GATE_DO",
+  ];
+  violations.push(...findForbiddenBindings(relayToml, relayTomlPath, CROSS_PLANE_BINDINGS_FOR_RELAY));
+
+  return violations;
+}
+
 function findVarsSecrets(tomlText, filePath) {
   const violations = [];
   const varsSection = extractVarsSection(tomlText);
@@ -210,6 +243,8 @@ function main() {
     violations.push(...findVarsSecrets(tomlText, tomlPath));
   }
 
+  violations.push(...findRelayIsolationViolations());
+
   if (violations.length > 0) {
     console.error(`schema-lint: ${violations.length} plane-isolation violation(s) found:\n`);
     for (const v of violations) console.error(`  ✗ ${v}`);
@@ -217,7 +252,7 @@ function main() {
     process.exit(1);
   }
 
-  console.log(`schema-lint: OK — scanned ${migrationFiles.length} migration file(s), 2 wrangler.toml(s), no violations.`);
+  console.log(`schema-lint: OK — scanned ${migrationFiles.length} migration file(s), 3 wrangler.toml(s), no violations.`);
 }
 
 main();

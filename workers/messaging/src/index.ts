@@ -13,6 +13,9 @@ export { QueueDO } from "./durable-objects/QueueDO";
 export { GroupDO } from "./durable-objects/GroupDO";
 export { ConvLogDO } from "./durable-objects/ConvLogDO";
 export { PresenceDO } from "./durable-objects/PresenceDO";
+export { PrekeyDO } from "./durable-objects/PrekeyDO";
+export { DeviceLinkDO } from "./durable-objects/DeviceLinkDO";
+export { DeviceLeaseDO } from "./durable-objects/DeviceLeaseDO";
 export { AliasDO } from "./durable-objects/AliasDO";
 export { RateGateDO } from "./durable-objects/RateGateDO";
 
@@ -326,6 +329,100 @@ async function coreQueuePush(env: Env, queueId: string, req: BhttpRequest): Prom
   return { status: res.status, body: await res.json() };
 }
 
+// PrekeyDO (rotation pass, docs/03 §4) — `POST /prekey/:chatId/publish`, `GET /prekey/:chatId/status`,
+// `GET /prekey/:chatId/fetch`. Wrapped through OHTTP for the same reason `/queue/:id/push` is: these
+// fire on roughly every chat mount / rotation interval, not just once per enrollment, so — like that
+// route — a plain unwrapped fetch would leak the real client IP to the Messaging Worker on a call
+// that isn't a one-time setup step. Same capability-verification-off-the-BhttpRequest-header-list
+// shape as `coreQueuePush` above, not a parallel/weaker auth path.
+async function corePrekeyRequest(env: Env, chatId: string, sub: "publish" | "status" | "fetch", req: BhttpRequest): Promise<CoreResult> {
+  const auth = getBhttpHeader(req.headers, "authorization");
+  const cap = auth?.startsWith("Bearer ") ? auth.slice("Bearer ".length) : null;
+  if (!cap) return { status: 401, body: { error: "Missing session capability" } };
+  const verdict = await verifyCapability(env.SESSION_SIGNING_KEY, cap);
+  if (!verdict.valid) return { status: 401, body: { error: `Invalid session capability: ${verdict.reason}` } };
+
+  const stub = env.PREKEY_DO.get(env.PREKEY_DO.idFromName(chatId));
+  const method = sub === "publish" ? "POST" : "GET";
+  const res = await stub.fetch(
+    new Request(`https://do/${sub}`, {
+      method,
+      headers: method === "POST" ? { "Content-Type": "application/json" } : {},
+      body: method === "POST" ? req.body : null,
+    }),
+  );
+  const text = await res.text().catch(() => "");
+  let parsed: unknown = {};
+  try {
+    parsed = text ? JSON.parse(text) : {};
+  } catch {
+    parsed = { error: text };
+  }
+  return { status: res.status, body: parsed };
+}
+
+// DeviceLeaseDO (device-linking pass) — `POST /device-lease/:chatId/acquire`, `POST .../release`,
+// `GET .../status`. Wrapped through OHTTP: this fires on a HEARTBEAT cadence (every ~20s per open
+// chat, see useQueueTransport.ts) while a chat is open, so leaving it unwrapped would let the
+// Messaging Worker correlate a real IP with "this device has chat X open right now" continuously —
+// exactly the class of leak R25/R25-follow-up already prioritized wrapping for.
+async function coreDeviceLeaseRequest(env: Env, chatId: string, sub: "acquire" | "release" | "status", req: BhttpRequest): Promise<CoreResult> {
+  const auth = getBhttpHeader(req.headers, "authorization");
+  const cap = auth?.startsWith("Bearer ") ? auth.slice("Bearer ".length) : null;
+  if (!cap) return { status: 401, body: { error: "Missing session capability" } };
+  const verdict = await verifyCapability(env.SESSION_SIGNING_KEY, cap);
+  if (!verdict.valid) return { status: 401, body: { error: `Invalid session capability: ${verdict.reason}` } };
+
+  const stub = env.DEVICE_LEASE_DO.get(env.DEVICE_LEASE_DO.idFromName(chatId));
+  const method = sub === "status" ? "GET" : "POST";
+  const res = await stub.fetch(
+    new Request(`https://do/${sub}`, {
+      method,
+      headers: method === "POST" ? { "Content-Type": "application/json" } : {},
+      body: method === "POST" ? req.body : null,
+    }),
+  );
+  const text = await res.text().catch(() => "");
+  let parsed: unknown = {};
+  try {
+    parsed = text ? JSON.parse(text) : {};
+  } catch {
+    parsed = { error: text };
+  }
+  return { status: res.status, body: parsed };
+}
+
+// DeviceLinkDO (device-linking pass) — `POST /device-link/:linkId/put`, `GET /device-link/:linkId/take`.
+// Wrapped through OHTTP for an even stronger reason than the routes above: this payload is full
+// private-key material for a chat, not ordinary message ciphertext — correlating "this real IP put/
+// took a device-link blob" is a meaningful metadata leak this route deserves the same protection as
+// any other anonymity-zone call. Same shape as `corePrekeyRequest`.
+async function coreDeviceLinkRequest(env: Env, linkId: string, sub: "put" | "take", req: BhttpRequest): Promise<CoreResult> {
+  const auth = getBhttpHeader(req.headers, "authorization");
+  const cap = auth?.startsWith("Bearer ") ? auth.slice("Bearer ".length) : null;
+  if (!cap) return { status: 401, body: { error: "Missing session capability" } };
+  const verdict = await verifyCapability(env.SESSION_SIGNING_KEY, cap);
+  if (!verdict.valid) return { status: 401, body: { error: `Invalid session capability: ${verdict.reason}` } };
+
+  const stub = env.DEVICE_LINK_DO.get(env.DEVICE_LINK_DO.idFromName(linkId));
+  const method = sub === "put" ? "POST" : "GET";
+  const res = await stub.fetch(
+    new Request(`https://do/${sub}`, {
+      method,
+      headers: method === "POST" ? { "Content-Type": "application/json" } : {},
+      body: method === "POST" ? req.body : null,
+    }),
+  );
+  const text = await res.text().catch(() => "");
+  let parsed: unknown = {};
+  try {
+    parsed = text ? JSON.parse(text) : {};
+  } catch {
+    parsed = { error: text };
+  }
+  return { status: res.status, body: parsed };
+}
+
 // Dispatches a DECAPSULATED request (a `BhttpRequest` the Gateway itself constructed from HPKE-sealed
 // bytes — never a real Cloudflare `Request`, so there is no `cf-connecting-ip`/`CF-Connecting-IP`
 // header or any other IP-bearing field for these handlers to even reach for) to the SAME core logic
@@ -350,6 +447,30 @@ async function dispatchBhttpRequest(env: Env, req: BhttpRequest): Promise<CoreRe
   const queuePushMatch = /^\/queue\/([^/]+)\/push$/.exec(req.path);
   if (req.method === "POST" && queuePushMatch) {
     return coreQueuePush(env, decodeURIComponent(queuePushMatch[1]!), req);
+  }
+  const prekeyMatch = /^\/prekey\/([^/]+)\/(publish|status|fetch)$/.exec(req.path);
+  if (prekeyMatch) {
+    const sub = prekeyMatch[2] as "publish" | "status" | "fetch";
+    const expectedMethod = sub === "publish" ? "POST" : "GET";
+    if (req.method === expectedMethod) {
+      return corePrekeyRequest(env, decodeURIComponent(prekeyMatch[1]!), sub, req);
+    }
+  }
+  const deviceLinkMatch = /^\/device-link\/([^/]+)\/(put|take)$/.exec(req.path);
+  if (deviceLinkMatch) {
+    const sub = deviceLinkMatch[2] as "put" | "take";
+    const expectedMethod = sub === "put" ? "POST" : "GET";
+    if (req.method === expectedMethod) {
+      return coreDeviceLinkRequest(env, decodeURIComponent(deviceLinkMatch[1]!), sub, req);
+    }
+  }
+  const deviceLeaseMatch = /^\/device-lease\/([^/]+)\/(acquire|release|status)$/.exec(req.path);
+  if (deviceLeaseMatch) {
+    const sub = deviceLeaseMatch[2] as "acquire" | "release" | "status";
+    const expectedMethod = sub === "status" ? "GET" : "POST";
+    if (req.method === expectedMethod) {
+      return coreDeviceLeaseRequest(env, decodeURIComponent(deviceLeaseMatch[1]!), sub, req);
+    }
   }
   return { status: 404, body: { error: "Not found (via OHTTP gateway)" } };
 }
@@ -395,8 +516,19 @@ router.post("/ohttp/gateway", async (request: IRequest, env: Env) => {
  * learns anything about the caller beyond that id (see QueueDO.ts / ConvLogDO.ts). `prefix` is the
  * `/<mount>/<id>` segment to strip so the DO sees a path relative to its own root.
  */
+// Real bug found + fixed 2026-07-19 (first genuine two-person live test): `id` here is itty-router's
+// raw path param — confirmed via its own source (`IttyRouter.mjs`: params come straight from a regex
+// match against `URL.pathname`, no decoding step) — which means it's still percent-encoded exactly as
+// the client sent it. `coreQueuePush` and the rest of the OHTTP dispatch path (`dispatchBhttpRequest`
+// above) already `decodeURIComponent` their own path captures. Every real queue name in this app is
+// shaped `${chatId}:AtoB` / `${chatId}:BtoA` — the client always percent-encodes the `:` — so the
+// direct WS-subscribe route (this function) and the OHTTP-wrapped push route were silently addressing
+// TWO DIFFERENT Durable Object instances for the exact same logical queue: a push landed in the DO
+// keyed by the decoded name, a WS subscribe attached to the DO keyed by the still-encoded name. Live
+// messages were never lost or misdelivered — they were durably stored in a DO nothing was ever
+// listening on. Fixed by decoding here too, so both paths derive the identical DO identity.
 function forwardToDO(request: IRequest, ns: DurableObjectNamespace, id: string, prefix: string): Promise<Response> {
-  const stub = ns.get(ns.idFromName(id));
+  const stub = ns.get(ns.idFromName(decodeURIComponent(id)));
   const forwardUrl = new URL(request.url);
   forwardUrl.pathname = forwardUrl.pathname.replace(prefix, "");
   return stub.fetch(new Request(forwardUrl, request as unknown as Request));
@@ -444,6 +576,56 @@ router.all("/group/:groupId/*", async (request: IRequest, env: Env) => {
   const groupId = request.params.groupId;
   if (!groupId) return error(400, "missing groupId");
   return forwardToDO(request, env.GROUP_DO, groupId, `/group/${groupId}`);
+});
+
+// PresenceDO (docs/04 DO catalog: "contact-scoped") — one instance per chat id, same capability gate
+// as /queue and /conv. Unlike those, this route is WS-only (PresenceDO.fetch rejects anything that
+// isn't an Upgrade); there is no push/pull HTTP surface to forward, but `forwardToDO`'s generic
+// "strip the mount prefix, hand the rest to the DO" shape still applies unchanged.
+router.all("/presence/:chatId/*", async (request: IRequest, env: Env) => {
+  const denied = await requireCapability(request, env);
+  if (denied) return denied;
+  const chatId = request.params.chatId;
+  if (!chatId) return error(400, "missing chatId");
+  return forwardToDO(request, env.PRESENCE_DO, chatId, `/presence/${chatId}`);
+});
+
+// PrekeyDO (rotation pass, docs/03 §4) — direct plain-HTTP path, same capability gate as /queue and
+// /conv, coexisting with the OHTTP-wrapped path above (`corePrekeyRequest`/`dispatchBhttpRequest`)
+// exactly the way `/queue/:queueId/push` has both a direct and an OHTTP-wrapped path — the client
+// (useQueueTransport.ts) always goes through OHTTP for these in practice, but this direct route stays
+// available the same way it does for every other conversation route, not removed just because a
+// wrapped alternative exists.
+router.all("/prekey/:chatId/*", async (request: IRequest, env: Env) => {
+  const denied = await requireCapability(request, env);
+  if (denied) return denied;
+  const chatId = request.params.chatId;
+  if (!chatId) return error(400, "missing chatId");
+  return forwardToDO(request, env.PREKEY_DO, chatId, `/prekey/${chatId}`);
+});
+
+// DeviceLinkDO (device-linking pass) — sharded by the linking channel id (derived client-side from a
+// random secret, never sent to the server in the clear — see lib/deviceLink.ts). Capability-gated
+// like every other conversation route: BOTH devices must already hold their own real session
+// capability (see DeviceLinkDO.ts's header comment for why this doesn't bypass account auth).
+router.all("/device-link/:linkId/*", async (request: IRequest, env: Env) => {
+  const denied = await requireCapability(request, env);
+  if (denied) return denied;
+  const linkId = request.params.linkId;
+  if (!linkId) return error(400, "missing linkId");
+  return forwardToDO(request, env.DEVICE_LINK_DO, linkId, `/device-link/${linkId}`);
+});
+
+// DeviceLeaseDO (device-linking pass) — sharded by chat id. See DeviceLeaseDO.ts's header comment for
+// why this exists: without it, two of a user's own linked devices could both run a live ratchet
+// session for the same chat and desync it, corrupting the conversation for the PEER too, not just the
+// linked user. Capability-gated like every other conversation route.
+router.all("/device-lease/:chatId/*", async (request: IRequest, env: Env) => {
+  const denied = await requireCapability(request, env);
+  if (denied) return denied;
+  const chatId = request.params.chatId;
+  if (!chatId) return error(400, "missing chatId");
+  return forwardToDO(request, env.DEVICE_LEASE_DO, chatId, `/device-lease/${chatId}`);
 });
 
 // Unlike /q, /conv, /group (sharded per queue/conversation/group id), AliasDO is a single global

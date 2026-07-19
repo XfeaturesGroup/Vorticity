@@ -363,6 +363,217 @@ fn ratchet_init_bob(root_key: [u8; 32], my_dh_priv: [u8; 32], my_dh_pub: [u8; 32
     }
 }
 
+// ============================ State export/import (device-linking pass) ===========================
+//
+// Serializes the ENTIRE live `RatchetState` — every private key, chain key, and cached skipped-
+// message key currently held — to a flat byte blob, and back. This is the mechanism a second device
+// of the SAME identity uses to pick up an already-established 1:1 session: this project's design is
+// "one shared ratchet, whichever device currently holds it is live" (see docs/06's device-linking
+// entry for why this was chosen over a per-device Sesame-style fan-out), so linking a device means
+// literally handing it this exact state, not deriving a fresh one.
+//
+// **THE EXPORTED BLOB IS MAXIMALLY SENSITIVE — equivalent to full compromise of this specific
+// session if it leaks.** It contains the current sending/receiving chain keys and, if a DH ratchet
+// turn is due, the raw private key for it. This module does not transport, seal, or persist the
+// blob anywhere — it only converts to/from bytes; the caller (apps/web's device-linking flow) is
+// responsible for sealing it under a real AEAD key derived from an out-of-band-authenticated linking
+// secret before it ever leaves the exporting device's memory, and for ensuring only ONE device is
+// ever "live" at a time afterward (a lease mechanism, not this crate's concern — two devices
+// simultaneously advancing the SAME ratchet state would desync it exactly like two independent
+// sessions racing, this module has no way to detect or prevent that misuse from the state shape
+// alone).
+//
+// FIXED LAYOUT (not a generic serde format — this crate's existing convention throughout kem.rs/
+// ratchet.rs's other `to_bytes`/`from_bytes` pairs, kept consistent rather than pulling in a
+// serialization crate for one more struct):
+//   flags(1) — bit0 dhr_pub present, bit1 cks present, bit2 ckr present, bit3 pq_pending_offer
+//              present, bit4 pq_peer_offer_ek present
+//   dhs_priv(32) dhs_pub(32) [dhr_pub(32)] rk(32) [cks(32)] [ckr(32)]
+//   ns(4 LE) nr(4 LE) pn(4 LE) dh_ratchet_turns(4 LE) pq_remix_count(4 LE)
+//   skipped_count(4 LE), then skipped_count × [dh_pub(32) n(4 LE) mk(32)]  (68 bytes each)
+//   [pq_pending_offer: MlKemKeyPair::to_bytes(), 1248 bytes, if flag]
+//   [pq_peer_offer_ek: 1184 bytes, if flag]
+//   pending_handshake_ct_len(4 LE), then that many bytes (usually 0 — see RatchetSession's own doc:
+//   normally already taken/None by the time a session is worth linking a second device into, but
+//   included for full fidelity rather than assuming that timing)
+fn serialize_ratchet_state(state: &RatchetState, pending_handshake_ct: &Option<Vec<u8>>) -> Vec<u8> {
+    let mut flags = 0u8;
+    if state.dhr_pub.is_some() {
+        flags |= 0b00001;
+    }
+    if state.cks.is_some() {
+        flags |= 0b00010;
+    }
+    if state.ckr.is_some() {
+        flags |= 0b00100;
+    }
+    if state.pq_pending_offer.is_some() {
+        flags |= 0b01000;
+    }
+    if state.pq_peer_offer_ek.is_some() {
+        flags |= 0b10000;
+    }
+
+    let mut out = Vec::new();
+    out.push(flags);
+    out.extend_from_slice(&state.dhs_priv);
+    out.extend_from_slice(&state.dhs_pub);
+    if let Some(v) = state.dhr_pub {
+        out.extend_from_slice(&v);
+    }
+    out.extend_from_slice(&state.rk);
+    if let Some(v) = state.cks {
+        out.extend_from_slice(&v);
+    }
+    if let Some(v) = state.ckr {
+        out.extend_from_slice(&v);
+    }
+    out.extend_from_slice(&state.ns.to_le_bytes());
+    out.extend_from_slice(&state.nr.to_le_bytes());
+    out.extend_from_slice(&state.pn.to_le_bytes());
+    out.extend_from_slice(&state.dh_ratchet_turns.to_le_bytes());
+    out.extend_from_slice(&state.pq_remix_count.to_le_bytes());
+
+    out.extend_from_slice(&(state.skipped.len() as u32).to_le_bytes());
+    for ((dh_pub, n), mk) in &state.skipped {
+        out.extend_from_slice(dh_pub);
+        out.extend_from_slice(&n.to_le_bytes());
+        out.extend_from_slice(mk);
+    }
+
+    if let Some(ref kp) = state.pq_pending_offer {
+        out.extend_from_slice(&kp.to_bytes());
+    }
+    if let Some(ref ek) = state.pq_peer_offer_ek {
+        out.extend_from_slice(ek);
+    }
+
+    let ct = pending_handshake_ct.as_deref().unwrap_or(&[]);
+    out.extend_from_slice(&(ct.len() as u32).to_le_bytes());
+    out.extend_from_slice(ct);
+
+    out
+}
+
+fn deserialize_ratchet_state(bytes: &[u8]) -> Result<(RatchetState, Option<Vec<u8>>), String> {
+    let mut pos = 0usize;
+    let need = |pos: usize, n: usize, what: &str| -> Result<(), String> {
+        if bytes.len() < pos + n {
+            return Err(format!("truncated ratchet state (need {n} more bytes for {what})"));
+        }
+        Ok(())
+    };
+
+    need(pos, 1, "flags")?;
+    let flags = bytes[pos];
+    pos += 1;
+
+    need(pos, 32, "dhs_priv")?;
+    let dhs_priv = arr32(&bytes[pos..pos + 32]);
+    pos += 32;
+    need(pos, 32, "dhs_pub")?;
+    let dhs_pub = arr32(&bytes[pos..pos + 32]);
+    pos += 32;
+
+    let dhr_pub = if flags & 0b00001 != 0 {
+        need(pos, 32, "dhr_pub")?;
+        let v = arr32(&bytes[pos..pos + 32]);
+        pos += 32;
+        Some(v)
+    } else {
+        None
+    };
+
+    need(pos, 32, "rk")?;
+    let rk = arr32(&bytes[pos..pos + 32]);
+    pos += 32;
+
+    let cks = if flags & 0b00010 != 0 {
+        need(pos, 32, "cks")?;
+        let v = arr32(&bytes[pos..pos + 32]);
+        pos += 32;
+        Some(v)
+    } else {
+        None
+    };
+    let ckr = if flags & 0b00100 != 0 {
+        need(pos, 32, "ckr")?;
+        let v = arr32(&bytes[pos..pos + 32]);
+        pos += 32;
+        Some(v)
+    } else {
+        None
+    };
+
+    need(pos, 20, "ns/nr/pn/dh_ratchet_turns/pq_remix_count")?;
+    let ns = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+    pos += 4;
+    let nr = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+    pos += 4;
+    let pn = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+    pos += 4;
+    let dh_ratchet_turns = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+    pos += 4;
+    let pq_remix_count = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+    pos += 4;
+
+    need(pos, 4, "skipped_count")?;
+    let skipped_count = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+    pos += 4;
+    let mut skipped = HashMap::with_capacity(skipped_count);
+    for _ in 0..skipped_count {
+        need(pos, 68, "a skipped-key entry")?;
+        let dh_pub = arr32(&bytes[pos..pos + 32]);
+        pos += 32;
+        let n = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+        pos += 4;
+        let mk = arr32(&bytes[pos..pos + 32]);
+        pos += 32;
+        skipped.insert((dh_pub, n), mk);
+    }
+
+    let pq_pending_offer = if flags & 0b01000 != 0 {
+        need(pos, 1248, "pq_pending_offer")?;
+        let v = MlKemKeyPair::from_bytes(&bytes[pos..pos + 1248]);
+        pos += 1248;
+        Some(v)
+    } else {
+        None
+    };
+    let pq_peer_offer_ek = if flags & 0b10000 != 0 {
+        need(pos, kem::ML_KEM_768_EK_LEN, "pq_peer_offer_ek")?;
+        let v = bytes[pos..pos + kem::ML_KEM_768_EK_LEN].to_vec();
+        pos += kem::ML_KEM_768_EK_LEN;
+        Some(v)
+    } else {
+        None
+    };
+
+    need(pos, 4, "pending_handshake_ct_len")?;
+    let ct_len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+    pos += 4;
+    need(pos, ct_len, "pending_handshake_ct")?;
+    let pending_handshake_ct = if ct_len > 0 { Some(bytes[pos..pos + ct_len].to_vec()) } else { None };
+
+    let state = RatchetState {
+        dhs_priv,
+        dhs_pub,
+        dhr_pub,
+        rk,
+        cks,
+        ckr,
+        ns,
+        nr,
+        pn,
+        skipped,
+        dh_ratchet_turns,
+        pq_remix_count,
+        pq_pending_offer,
+        pq_peer_offer_ek,
+    };
+    Ok((state, pending_handshake_ct))
+}
+
 fn skip_message_keys_to(state: &mut RatchetState, until: u32) -> Result<(), String> {
     let Some(ckr) = state.ckr else { return Ok(()) }; // Bob before his first receive: nothing to skip
     if until.saturating_sub(state.nr) > MAX_SKIP {
@@ -583,6 +794,89 @@ impl RatchetSession {
         RatchetSession { state, pending_handshake_ct: None }
     }
 
+    /// Alice's side, WITH a one-time prekey (docs/03 §4's full X3DH-style bundle: identity + signed
+    /// prekey + one-time prekeys). Strictly stronger than `handshakeInitiate` above: the final root
+    /// key folds in a SECOND independent hybrid encapsulation, this one against a prekey PrekeyDO
+    /// deletes after this single fetch — so recovering this session's root key later requires BOTH
+    /// the signed prekey's private key AND the one-time prekey's (already-discarded) private key, not
+    /// either alone. Same signature-verification gate as `handshakeInitiate` (unchanged — the identity
+    /// key signs only the signed prekey, matching real X3DH; one-time prekeys ride on that same
+    /// authenticated channel rather than being individually signed). `peer_onetime_bytes` empty means
+    /// "PrekeyDO's pool was empty" — real X3DH tolerates this; use `handshakeInitiate` instead in that
+    /// case rather than calling this with an empty slice (kept as two functions, not one with a
+    /// sometimes-empty argument, to make that caller-side branch explicit rather than silently baked
+    /// into this one's control flow).
+    #[wasm_bindgen(js_name = handshakeInitiateWithOnetime)]
+    pub fn handshake_initiate_with_onetime(
+        kem_seed: &[u8],
+        onetime_kem_seed: &[u8],
+        dh_seed: &[u8],
+        peer_verifying_key: &[u8],
+        peer_bundle_bytes: &[u8],
+        peer_bundle_sig: &[u8],
+        peer_onetime_bytes: &[u8],
+    ) -> Result<RatchetSession, JsError> {
+        let vk_arr: [u8; 32] = peer_verifying_key
+            .try_into()
+            .map_err(|_| JsError::new("peer_verifying_key must be 32 bytes"))?;
+        let sig_arr: [u8; 64] = peer_bundle_sig
+            .try_into()
+            .map_err(|_| JsError::new("peer_bundle_sig must be 64 bytes"))?;
+        let peer_hp = HybridPublicKey::from_bytes(peer_bundle_bytes);
+        if !bundle_verify(&vk_arr, &peer_hp, &sig_arr) {
+            return Err(JsError::new(
+                "peer prekey bundle signature is invalid — refusing to establish a session (possible MITM)",
+            ));
+        }
+        let peer_onetime_hp = HybridPublicKey::from_bytes(peer_onetime_bytes);
+
+        let (signed_ct, signed_root) = kem::encapsulate(&arr32(kem_seed), &peer_hp);
+        let (onetime_ct, onetime_root) = kem::encapsulate(&arr32(onetime_kem_seed), &peer_onetime_hp);
+        let root_key = kem::combine_with_onetime(&signed_root, &onetime_root);
+
+        let bob_dh_pub = peer_hp.x25519_pk;
+        let state = ratchet_init_alice(root_key, bob_dh_pub, &arr32(dh_seed));
+        // Fixed-length concatenation (both ciphertexts are always ML_KEM_768_CT_LEN + 32 bytes), not a
+        // length-prefixed framing — `handshakeRespondWithOnetime` below knows the exact split point.
+        let mut ct_bytes = signed_ct.to_bytes();
+        ct_bytes.extend_from_slice(&onetime_ct.to_bytes());
+        Ok(RatchetSession { state, pending_handshake_ct: Some(ct_bytes) })
+    }
+
+    /// Bob's side, WITH a one-time prekey. `my_onetime_keypair_bytes` must be the SPECIFIC one-time
+    /// keypair whose public half PrekeyDO handed out to this particular initiator (looked up by the
+    /// id the initiator's `session_init` envelope references — see useQueueTransport.ts) — using the
+    /// wrong one-time keypair fails to decapsulate to the same root key Alice derived, same as using
+    /// the wrong signed-prekey keypair would. Callers MUST discard/never reuse this one-time keypair
+    /// after this call succeeds (PrekeyDO already deletes the public half server-side on fetch; this
+    /// is the client-side half of that same single-use guarantee).
+    #[wasm_bindgen(js_name = handshakeRespondWithOnetime)]
+    pub fn handshake_respond_with_onetime(
+        my_hybrid_keypair_bytes: &[u8],
+        my_onetime_keypair_bytes: &[u8],
+        handshake_ct_bytes: &[u8],
+    ) -> Result<RatchetSession, JsError> {
+        let ct_pair_len = 2 * (kem::ML_KEM_768_CT_LEN + 32);
+        if handshake_ct_bytes.len() != ct_pair_len {
+            return Err(JsError::new(&format!(
+                "handshake_ct_bytes must be {ct_pair_len} bytes (signed-prekey ct || one-time-prekey ct), got {}",
+                handshake_ct_bytes.len()
+            )));
+        }
+        let (signed_ct_bytes, onetime_ct_bytes) = handshake_ct_bytes.split_at(kem::ML_KEM_768_CT_LEN + 32);
+
+        let kp = HybridKeyPair::from_bytes(my_hybrid_keypair_bytes);
+        let onetime_kp = HybridKeyPair::from_bytes(my_onetime_keypair_bytes);
+        let signed_root = kem::decapsulate(&kp, &HybridCiphertext::from_bytes(signed_ct_bytes));
+        let onetime_root = kem::decapsulate(&onetime_kp, &HybridCiphertext::from_bytes(onetime_ct_bytes));
+        let root_key = kem::combine_with_onetime(&signed_root, &onetime_root);
+
+        let my_dh_priv = kp.x25519_secret();
+        let my_dh_pub = kp.public.x25519_pk;
+        let state = ratchet_init_bob(root_key, my_dh_priv, my_dh_pub);
+        Ok(RatchetSession { state, pending_handshake_ct: None })
+    }
+
     /// Alice only: the hybrid KEM ciphertext to deliver to Bob alongside her first ratchet message.
     /// Returns an empty vec once already taken (or on a Bob-side session, which never has one).
     #[wasm_bindgen(js_name = takeHandshakeCiphertext)]
@@ -615,6 +909,26 @@ impl RatchetSession {
         let seeds = Entropy::from_bytes(entropy).map_err(|e| JsError::new(&e))?;
         let plaintext = ratchet_decrypt(&mut self.state, wire, &seeds).map_err(|e| JsError::new(&e))?;
         String::from_utf8(plaintext).map_err(|_| JsError::new("decrypted bytes are not valid UTF-8"))
+    }
+
+    /// Device-linking pass: serialize the ENTIRE live session state to bytes — see this file's
+    /// "State export/import" module doc for the exact layout and, more importantly, the load-bearing
+    /// warning that the result is as sensitive as this session's full compromise. The caller MUST
+    /// seal this under a real AEAD key before it leaves device memory; this method itself performs
+    /// no sealing, no transport, and no persistence — it only converts state to bytes.
+    #[wasm_bindgen(js_name = exportState)]
+    pub fn export_state(&self) -> Vec<u8> {
+        serialize_ratchet_state(&self.state, &self.pending_handshake_ct)
+    }
+
+    /// The other half of `exportState` — reconstructs a live session from a previously exported blob.
+    /// Errors on a truncated/malformed blob rather than silently producing a partially-initialized
+    /// session. Callers are responsible for the same "only one device live at a time" discipline
+    /// `exportState`'s doc comment describes; this constructor has no way to enforce it.
+    #[wasm_bindgen(js_name = importState)]
+    pub fn import_state(bytes: &[u8]) -> Result<RatchetSession, JsError> {
+        let (state, pending_handshake_ct) = deserialize_ratchet_state(bytes).map_err(|e| JsError::new(&e))?;
+        Ok(RatchetSession { state, pending_handshake_ct })
     }
 }
 
@@ -746,5 +1060,122 @@ mod tests {
             alice.pq_remix_count > 0 || bob.pq_remix_count > 0,
             "expected at least one Sparse PQ Ratchet remix after 14 alternating turns"
         );
+    }
+
+    // ============================ State export/import (device-linking pass) =========================
+
+    #[test]
+    fn exported_state_round_trips_and_a_linked_device_continues_the_conversation() {
+        let (mut alice, mut bob) = setup();
+        // Exchange a couple of messages first so the exported state isn't the trivial just-initialized
+        // case — advances chain keys, ns/nr, and forces a DH ratchet turn (sender flips).
+        let wire1 = encrypt(&mut alice, "before linking", 90);
+        assert_eq!(decrypt(&mut bob, &wire1, 91).unwrap(), "before linking");
+        let wire2 = encrypt(&mut bob, "reply before linking", 92);
+        assert_eq!(decrypt(&mut alice, &wire2, 93).unwrap(), "reply before linking");
+
+        // "Link a second device": export Bob's live state, reconstruct it into a fresh RatchetState —
+        // this is exactly what apps/web's device-linking transfer does, minus the AEAD sealing around
+        // the blob (out of this crate's scope, see this module's own doc comment).
+        let exported = serialize_ratchet_state(&bob, &None);
+        let (mut bob_linked_device, pending_ct) = deserialize_ratchet_state(&exported).expect("a freshly exported blob must deserialize");
+        assert!(pending_ct.is_none(), "an established session (past the handshake) has no pending handshake ciphertext to carry");
+
+        // The linked device must be able to CONTINUE the conversation — decrypt a new message from
+        // Alice, and have Alice successfully decrypt a message the linked device sends back. This is
+        // the real correctness bar: not just "the bytes round-trip", but "the ratchet still agrees".
+        let wire3 = encrypt(&mut alice, "after linking, does the new device see this?", 94);
+        assert_eq!(decrypt(&mut bob_linked_device, &wire3, 95).unwrap(), "after linking, does the new device see this?");
+        let wire4 = encrypt(&mut bob_linked_device, "yes, the linked device replies", 96);
+        assert_eq!(decrypt(&mut alice, &wire4, 97).unwrap(), "yes, the linked device replies");
+    }
+
+    #[test]
+    fn exported_state_preserves_skipped_keys_and_pending_pq_offer() {
+        let (mut alice, mut bob) = setup();
+        // Force an out-of-order skipped-key entry AND enough alternating turns to populate a pending
+        // Sparse-PQ offer on one side, so the export covers BOTH optional/variable-length parts of the
+        // layout, not just the always-present fields the test above already exercises.
+        let wire_a = encrypt(&mut alice, "skip me first", 100);
+        let wire_b = encrypt(&mut alice, "arrives first", 101);
+        assert_eq!(decrypt(&mut bob, &wire_b, 102).unwrap(), "arrives first"); // bob now has a skipped-key cache entry for wire_a's seq
+
+        for i in 0..7u8 {
+            if i % 2 == 0 {
+                let w = encrypt(&mut bob, "ping", 110 + i);
+                decrypt(&mut alice, &w, 130 + i).unwrap();
+            } else {
+                let w = encrypt(&mut alice, "pong", 110 + i);
+                decrypt(&mut bob, &w, 130 + i).unwrap();
+            }
+        }
+        assert!(!bob.skipped.is_empty(), "precondition: bob must have at least one cached skipped key before export");
+
+        let exported = serialize_ratchet_state(&bob, &None);
+        let (bob_linked_device, _) = deserialize_ratchet_state(&exported).expect("must deserialize");
+        assert_eq!(bob_linked_device.skipped, bob.skipped, "the skipped-key cache must survive export/import exactly");
+        assert_eq!(bob_linked_device.pq_remix_count, bob.pq_remix_count);
+        assert_eq!(bob_linked_device.pq_pending_offer.is_some(), bob.pq_pending_offer.is_some());
+        assert_eq!(bob_linked_device.pq_peer_offer_ek, bob.pq_peer_offer_ek);
+
+        // The originally-skipped message must still decrypt correctly on the linked device, proving
+        // the skipped-key cache isn't just byte-identical but actually functional after import.
+        let mut bob_linked_device = bob_linked_device;
+        let seeds = entropy(140);
+        let recovered = ratchet_decrypt(&mut bob_linked_device, &wire_a, &seeds).expect("the linked device must still recover the skipped message");
+        assert_eq!(String::from_utf8(recovered).unwrap(), "skip me first");
+    }
+
+    #[test]
+    fn deserialize_rejects_truncated_state() {
+        let (_, bob) = setup();
+        let exported = serialize_ratchet_state(&bob, &None);
+        for cut in [0usize, 1, 32, 65, 100] {
+            assert!(
+                deserialize_ratchet_state(&exported[..cut]).is_err(),
+                "truncating to {cut} bytes must be rejected, not silently accepted or panic"
+            );
+        }
+    }
+
+    // ============================ One-time-prekey handshake (rotation pass) =========================
+    // Same convention as `setup()` above and for the same reason, not just "JsError panics off-wasm":
+    // `#[wasm_bindgen]`-annotated items generally can't be called on a native target at all (confirmed
+    // empirically while writing this test — an adapter-level attempt panics with wasm-bindgen's own
+    // "cannot call wasm-bindgen imported functions on non-wasm targets", even for a call that never
+    // reaches an error branch). `handshakeInitiateWithOnetime`/`handshakeRespondWithOnetime`'s adapter
+    // layer is thin glue over the logic this test already exercises directly (concatenate/split two
+    // fixed-length ciphertexts) — real coverage of the compiled WASM adapter itself happens via a
+    // Node script against the actual built `pkg/client` output, not a native `cargo test`, matching
+    // how `handshake_initiate`/`handshake_respond` themselves have never had a native adapter-level
+    // test either.
+
+    #[test]
+    fn onetime_prekey_handshake_both_sides_agree_and_the_mix_is_load_bearing() {
+        let bob_kem_keypair = kem::generate_keypair(&seed(1));
+        let bob_onetime_keypair = kem::generate_keypair(&seed(50));
+        let bob_identity = identity_generate(&seed(2));
+        let sig = bundle_sign(&bob_identity, &bob_kem_keypair.public);
+        assert!(bundle_verify(&bob_identity.verifying, &bob_kem_keypair.public, &sig));
+
+        // Alice encapsulates to BOTH the signed prekey and the one-time prekey, combines the two
+        // resulting root keys — this is exactly what `handshakeInitiateWithOnetime` does internally.
+        let (signed_ct, alice_signed_root) = kem::encapsulate(&seed(3), &bob_kem_keypair.public);
+        let (onetime_ct, alice_onetime_root) = kem::encapsulate(&seed(51), &bob_onetime_keypair.public);
+        let alice_root = kem::combine_with_onetime(&alice_signed_root, &alice_onetime_root);
+
+        let bob_signed_root = kem::decapsulate(&bob_kem_keypair, &signed_ct);
+        let bob_onetime_root = kem::decapsulate(&bob_onetime_keypair, &onetime_ct);
+        let bob_root = kem::combine_with_onetime(&bob_signed_root, &bob_onetime_root);
+
+        assert_eq!(alice_root, bob_root, "both sides must derive the same one-time-strengthened root key");
+        // Load-bearing, not cosmetic: the one-time-prekey mix must actually CHANGE the root key
+        // relative to the signed-prekey-only path — otherwise it would add no real security property.
+        assert_ne!(alice_root, alice_signed_root, "mixing the one-time prekey must change the resulting root key");
+
+        let mut alice_state = ratchet_init_alice(alice_root, bob_kem_keypair.public.x25519_pk, &seed(4));
+        let mut bob_state = ratchet_init_bob(bob_root, bob_kem_keypair.x25519_secret(), bob_kem_keypair.public.x25519_pk);
+        let wire = encrypt(&mut alice_state, "onetime-strengthened hello", 60);
+        assert_eq!(decrypt(&mut bob_state, &wire, 61).unwrap(), "onetime-strengthened hello");
     }
 }

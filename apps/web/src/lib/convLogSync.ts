@@ -5,8 +5,14 @@
 // fanned out; a real chat UI wiring this up would put an encrypted Yjs update in `blob` and run
 // `Y.applyUpdate` on receipt. That integration is separate, not-yet-built work (see docs/06) — this
 // module proves the transport is real, not that multi-device merge UX exists yet.
+// `appendToConvLog`/`syncConvLog` below (plain HTTP POST/GET) are NOT OHTTP-wrapped — out of R25's
+// scope (only /membership/insert, /membership/proof/:commitment, /auth/session, /queue/:id/push were
+// wired) and not touched by R26 either. `subscribeConvLog`'s WS connection, per R26 (2026-07), now
+// goes through workers/ohttp-relay instead of the Messaging Worker directly — see
+// useQueueTransport.ts's header comment (same reasoning, same unverified-pending-real-deployment
+// caveat) and docs/06's R26 entry.
 const MESSAGING_API_URL = import.meta.env.DEV ? "http://localhost:8787" : "https://api.vort.xfeatures.net";
-const WS_BASE_URL = import.meta.env.DEV ? "ws://localhost:8787/conv" : "wss://api.vort.xfeatures.net/ws/conv";
+const WS_BASE_URL = import.meta.env.DEV ? "ws://localhost:8789/conv" : "wss://relay.vort.xfeatures.net/conv";
 
 export interface ConvLogEntry {
   seq: number;
