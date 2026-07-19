@@ -291,3 +291,54 @@ trade-off above. A second Cloudflare account becoming available is the trigger t
 prep (re-add per-worker `account_id`, re-add the schema-lint account-separation check — both were written
 once already this project, see git history for the exact diff to reapply) and re-run §4's R26 check
 against the stronger cross-zone topology before claiming that gap closed.
+
+---
+
+## 6. Real incident (2026-07-19): the git-triggered Pages build is structurally broken, and always has been
+
+**What happened:** pushing a real commit (`8db0eb1`) to `main` triggered `vorticity-frontend`'s
+connected Cloudflare Pages build, which failed:
+```
+Could not resolve "../pkg/client/vortic_core.js" from "../../packages/vortic-core/js/crypto.ts"
+```
+Cloudflare correctly kept serving the last-good deployment (the site never actually went down for
+users), but the NEW frontend code was not live — a real, user-visible gap between "workers deployed"
+and "frontend deployed" until this was caught and fixed the same session.
+
+**Root cause, confirmed not assumed:** `packages/vortic-core/pkg/` (the `wasm-pack build` output
+`js/crypto.ts` imports) is deliberately git-ignored (a build artifact, never committed — `git log --all
+-- packages/vortic-core/pkg/` returns nothing, confirmed before writing this). Cloudflare Pages' build
+image runs `pnpm install` + `npm run build` (`apps/web`'s own `vite build`, since the Pages project's
+root directory is `apps/web`) — it never runs `wasm-pack build`, has no Rust/cargo/wasm-pack toolchain
+invoked anywhere in that pipeline, and `apps/web/package.json`'s own `"build": "vite build"` script has
+no step that would build the dependency first. **This has been true since the very first pass that made
+`crypto.ts` import from `pkg/` (Phase 1, "Real WASM") — it did not newly break today.** The deployment
+history shows exactly this: some earlier deployments of the SAME commit succeeded, others of that same
+commit failed — the only way that's possible is if the "successful" ones were never a git-triggered CI
+build at all, but a manual `wrangler pages deploy <local-dist>` upload from a machine that already had
+`pkg/` built on disk (bypassing Cloudflare's build pipeline entirely). That was never written down
+until now.
+
+**Fix applied THIS incident (a workaround, not a structural fix — said plainly):** built `apps/web`
+locally (`pkg/` already present on disk from this session's own WASM rebuild) and deployed the resulting
+`dist/` directly — `wrangler pages deploy dist --project-name=vorticity-frontend --branch=main`. Verified
+live: the direct deployment URL and, ~20s later, the custom domain `vort.xfeatures.net` both served the
+new build's asset hash, matching the local build exactly. This is the SAME mechanism the historical
+successful deployments must have used, now written down.
+
+**Standing gap, NOT closed by this incident, needs a real decision before the next push to `main`:**
+every future push to `main` will trigger the SAME auto-build, and it will fail the SAME way, every
+time, until one of these is actually done:
+- Give the Pages build environment a way to produce `pkg/` (a Rust+`wasm-pack` toolchain in the build
+  command, if Cloudflare's build image supports installing one — not yet investigated), **or**
+- Change `apps/web/package.json`'s `build` script to build `vortic-core`'s WASM first (would still need
+  cargo/wasm-pack available in that CI image — same open question as above), **or**
+- Deliberately commit the built `pkg/client` output (a real, if unusual, pattern for exactly this kind
+  of "CI can't build a non-JS toolchain's output" constraint) — reverses this project's own stated
+  "`pkg/` is a git-ignored build artifact" convention on purpose, would need to be re-generated and
+  re-committed on every `vortic-core` source change, **or**
+- Formalize "manual `wrangler pages deploy` after every push that touches `vortic-core`/`apps/web`" as
+  the actual documented process, disconnect or ignore the auto-build entirely.
+None of these was decided or implemented — this incident's fix got the CURRENT push live, it did not
+prevent the next one from failing its auto-build the same way. Whoever pushes to `main` next should
+expect the same Cloudflare build-failure notification and know it does not mean the site is down.
