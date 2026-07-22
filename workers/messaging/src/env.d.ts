@@ -1,6 +1,12 @@
 export interface Env {
   DB_MSG: D1Database;
   MEDIA: R2Bucket;
+  /** R2 bucket for optional E2EE cloud backups (docs/03 §11, R12). Deliberately separate from
+   * MEDIA (a distinct data class — full local identity/ratchet/message state, not chat media) so
+   * prod can apply a different lifecycle/access policy without touching the media bucket. Object
+   * key = `backup/<opaque 32-byte id derived client-side from the phrase>`; the Worker stores and
+   * returns raw ciphertext bytes and never sees a phrase, a derived key, or plaintext state. */
+  BACKUP: R2Bucket;
   MERKLE_TREE_DO: DurableObjectNamespace;
   QUEUE_DO: DurableObjectNamespace;
   GROUP_DO: DurableObjectNamespace;

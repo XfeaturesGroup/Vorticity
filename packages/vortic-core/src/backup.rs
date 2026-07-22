@@ -73,6 +73,24 @@ fn derive_backup_key_inner(phrase: &str) -> Result<[u8; 32], String> {
     Ok(key)
 }
 
+/// Derive the opaque 32-byte cloud-backup slot ID from the master backup key (docs/03 §11: "the
+/// same ciphertext blob may be stored in R2 keyed by an opaque backup ID; the server holds an
+/// unreadable blob"). Domain-separated via HKDF from the encryption key itself — the server-facing
+/// ID and the client-only decryption key must never be the same value or derivable from one
+/// another without this step, or leaking/logging the ID (which the Worker necessarily sees and can
+/// log) would narrow the search space for the key it's supposed to be independent of. Deterministic
+/// from the phrase alone (no caller-supplied salt) so a restore ("re-enroll + phrase") can recompute
+/// the same slot ID without storing anything locally beyond the phrase.
+fn derive_backup_id_inner(key: &[u8]) -> Result<[u8; 32], String> {
+    if key.len() != KEY_LEN {
+        return Err(format!("key must be {KEY_LEN} bytes, got {}", key.len()));
+    }
+    let id = crate::util::hkdf_sha256(key, &[], b"vortic-backup-id-v1", 32);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&id);
+    Ok(out)
+}
+
 fn cipher_from_key(key: &[u8]) -> Result<Aes256Gcm, String> {
     if key.len() != KEY_LEN {
         return Err(format!("key must be {KEY_LEN} bytes, got {}", key.len()));
@@ -128,6 +146,16 @@ pub fn backup_generate_mnemonic(entropy: &[u8]) -> Result<String, JsError> {
 #[wasm_bindgen]
 pub fn backup_derive_key(phrase: &str) -> Result<Vec<u8>, JsError> {
     derive_backup_key_inner(phrase).map(|k| k.to_vec()).map_err(|e| JsError::new(&e))
+}
+
+/// Derive the opaque cloud-backup slot ID (hex-encoded, 64 chars) from the master backup key
+/// returned by `backup_derive_key`. See `derive_backup_id_inner`'s doc for why this is a distinct
+/// HKDF-derived value, not the key itself or a substring of it.
+#[wasm_bindgen]
+pub fn backup_derive_id(key: &[u8]) -> Result<String, JsError> {
+    derive_backup_id_inner(key)
+        .map(|id| id.iter().map(|b| format!("{b:02x}")).collect::<String>())
+        .map_err(|e| JsError::new(&e))
 }
 
 #[wasm_bindgen]
@@ -233,5 +261,35 @@ mod tests {
     fn wrong_length_key_is_rejected() {
         assert!(export_inner(b"x", &[0u8; 16]).is_err());
         assert!(import_inner("AAAAAAAAAAAAAAAA", &[0u8; 16]).is_err());
+    }
+
+    #[test]
+    fn backup_id_is_deterministic_and_key_sensitive() {
+        let key_a = derive_backup_key_inner(&generate_mnemonic_inner(&ENTROPY_A).unwrap()).unwrap();
+        let key_b = derive_backup_key_inner(&generate_mnemonic_inner(&ENTROPY_B).unwrap()).unwrap();
+
+        let id_a1 = derive_backup_id_inner(&key_a).unwrap();
+        let id_a2 = derive_backup_id_inner(&key_a).unwrap();
+        let id_b = derive_backup_id_inner(&key_b).unwrap();
+
+        assert_eq!(id_a1, id_a2);
+        assert_ne!(id_a1, id_b);
+        assert_eq!(id_a1.len(), 32);
+    }
+
+    #[test]
+    fn backup_id_is_domain_separated_from_the_encryption_key_itself() {
+        // The whole point of HKDF-deriving the ID is that it must not equal (or trivially reveal)
+        // the master key the server must never see. Guard against a copy-paste regression that
+        // accidentally returns `key` unchanged.
+        let key = derive_backup_key_inner(&generate_mnemonic_inner(&ENTROPY_A).unwrap()).unwrap();
+        let id = derive_backup_id_inner(&key).unwrap();
+        assert_ne!(id.to_vec(), key.to_vec());
+    }
+
+    #[test]
+    fn backup_id_rejects_wrong_length_key() {
+        assert!(derive_backup_id_inner(&[0u8; 16]).is_err());
+        assert!(derive_backup_id_inner(&[0u8; 33]).is_err());
     }
 }

@@ -107,6 +107,69 @@ bands, not calendar promises.
   unconstrained-memory environments, not a mobile browser) — both explicitly out of this pass's
   scope (crate-only, per the task's own boundary) and worth a dedicated follow-up before relying on
   this for a real user-facing recovery flow.
+- **Done (2026-07, "R12: blind cloud backup" pass) — closes the SERVER half of R12** (the crate half
+  above already closed the crypto pipeline; this pass wires docs/03 §11's "optional cloud copy: the
+  same ciphertext blob may be stored in R2 keyed by an opaque backup ID; the server holds an
+  unreadable blob" into a real, live-tested `workers/messaging` endpoint).
+  **Backend-only scope, deliberately** — no `apps/web` UI (still the crate entry's own stated gap;
+  not widened here).
+  - New `backup.rs::derive_backup_id_inner` / `#[wasm_bindgen] backup_derive_id`: HKDF-derives the
+    opaque 32-byte R2 key from the phrase-derived master key, domain-separated (distinct `info`
+    string) so the ID the Worker necessarily sees and can log is never the encryption key itself or
+    trivially related to it — a real, tested invariant (`backup_id_is_domain_separated_from_the_
+    encryption_key_itself`), not just a comment.
+  - **Two independent, non-overlapping authorization factors**, deliberately not one: (1) a valid
+    session capability (ties storage cost to a real ZK-membership-proven account, the same
+    Sybil-resistance argument AliasDO's capability gate already relies on) AND (2) knowledge of the
+    256-bit backup ID (computable only from the recovery phrase). Neither alone suffices — a stolen
+    capability without the phrase can't even address a specific victim's slot (2^256 search space);
+    a leaked ID without a live capability can't touch storage at all. Same "belt and suspenders"
+    shape this codebase already uses for alias register/resolve (capability + PoW), applied to a
+    different pair of factors appropriate to this route's threat (targeted storage abuse, not
+    directory scraping — PoW would be the wrong tool here).
+  - New dedicated `BACKUP` R2 bucket (`wrangler.toml`), deliberately NOT reusing `MEDIA` — separates
+    the lifecycle/access policy for "a user's full local identity/ratchet/message state" (extremely
+    sensitive) from ordinary chat media at the infra level, at zero extra code cost.
+  - `PUT`/`GET`/`DELETE /backup/:backupId` (both a direct route AND wrapped through the existing R25
+    OHTTP Gateway dispatch, reusing the exact same core handlers either way so the two paths cannot
+    drift — same discipline as every other dual-path route in `index.ts`). Wrapped because "this real
+    IP is uploading/fetching/deleting THIS specific backup ID" is genuinely sensitive metadata —
+    arguably worse than the alias-route metadata already wrapped, since a repeated GET on the same ID
+    fingerprints a returning device across sessions.
+  - Wire format follows this codebase's established base64-in-JSON convention for opaque binary
+    payloads (same shape as `msg`/`sig`/`proof` elsewhere in `index.ts`) rather than a raw-bytes body
+    or a presigned-direct-to-R2 upload — a deliberate, stated choice NOT to reuse docs/04's
+    presigned-URL pattern earmarked for the (still unbuilt) media path: that split exists to keep the
+    Worker off the hot path for large files, which backup blobs (capped well below media sizes)
+    don't need, and funneling them through the Worker keeps the capability+rate-limit gate as the
+    single enforcement point instead of a second one at the storage layer.
+  - Real size cap (8 MiB, enforced before the R2 write, not just documented) and per-backup-ID rate
+    limits via the existing generic `RateGateDO` primitive (PUT 10/epoch — the only one of the three
+    that costs real storage/write-unit money, so bounded hardest; GET 20/epoch, DELETE 5/epoch) —
+    keyed by the backup ID itself, not the capability's nullifier, so the limiter can't become a
+    second identity-correlation surface for the very session the capability already represents.
+    `DELETE` is idempotent and always returns 200 (existing-or-not), so the response itself can't be
+    used to oracle whether a guessed ID currently holds data.
+  - **Live-verified twice, both real, zero mocking:** (1) 20 checks against the direct routes over a
+    real `wrangler dev` + real `BACKUP` R2 bucket — a REAL `backup_export`-produced ciphertext
+    (compiled `pkg/client` WASM, not a stub) PUT, GET'd back byte-identical, and successfully
+    `backup_import`-decrypted back to the original plaintext through the real WASM boundary;
+    overwrite (latest-wins) semantics; cross-ID isolation; 401 on missing/tampered capability; 400 on
+    a malformed ID; 413 on an 8 MiB+1 body; DELETE-then-404; idempotent re-DELETE; and the PUT rate
+    limit tripping at exactly the 10th call for one ID while a different ID's budget stayed
+    unaffected. (2) 8 checks of the SAME flow routed entirely through the real OHTTP Gateway dispatch
+    (`encapsulateRequest`/`decapsulateResponse` from `@vorticity/ohttp`, confirmed the plaintext
+    backup ID never appears in the encapsulated wire bytes) — real PUT/GET/DELETE through
+    `/ohttp/gateway`, real WASM decrypt of the round-tripped blob, 401 on a missing capability with
+    the real check running (not bypassed).
+  - **Not done, stated plainly:** the "Forward-secret backup option: rotating backup keys" line from
+    docs/03 §11 — explicitly scoped out rather than half-built; would need a real key-rotation design
+    (which epoch owns which R2 slot, how an old key is retired) that deserves its own pass rather than
+    a bolted-on parameter. `apps/web` wiring (unchanged from the crate entry's own gap). No D1 mirror
+    of backup metadata into the pre-existing `blobs_meta` table — deliberately: R2's own object
+    metadata (exact byte length, exact upload timestamp) is already visible to the host on every GET
+    regardless of what a separate D1 row says, so a bucketed/rounded mirror column would be
+    security-theater, not a real mitigation; noted here rather than silently added for its own sake.
 - **Done (2026-07, "real MLS group encryption" pass) — closes the crate-core half of the "MLS
   wrapper" item below (R7's own progress note above this phase already flagged the gap this
   closes).** New module `group.rs`, `MlsGroupSession` (`client-full`-gated), built on `openmls`
@@ -2509,6 +2572,7 @@ Severity × likelihood; **R1 is the one the brief explicitly asked about.**
 | R11 | **Enrollment Sybil** via multiple OAuth accounts | Med | Med | PPID quota per `sub`; invite-only closed network; per-epoch nullifier rate limits | 2 |
 | **R12** | **Key-loss / recovery** without linkage is hard UX | Med | High | Recovery phrase + optional blind cloud backup; clear "no phrase = no recovery" contract | 1,4 |
 | — | *(R12 progress, 2026-07, "Argon2id/BIP39 backup" pass — Mitigated, not fully Closed):* the crypto pipeline is real and live-WASM-verified — see the Phase 1 entry above. **Not done:** `apps/web` UI (generate/enter phrase, wire to real local state), optional blind cloud backup to R2, live browser/mobile Argon2id-at-256MiB memory verification. | | | | |
+| — | *(R12 progress, 2026-07, "blind cloud backup" pass — Mitigated, not fully Closed):* the optional cloud-backup gap the row above named is now closed — real capability+opaque-ID-gated `PUT`/`GET`/`DELETE /backup/:backupId` in `workers/messaging`, both direct and OHTTP-wrapped, backed by a dedicated `BACKUP` R2 bucket, live-verified end-to-end with real WASM-produced ciphertext (see the Phase 1 entry below for the full write-up). **Not done:** `apps/web` UI (unchanged), forward-secret key rotation (docs/03 §11's own explicitly-optional line, deliberately not built this pass), live browser/mobile Argon2id-at-256MiB memory verification. | | | | |
 | R13 | **Legal compulsion** of Cloudflare | High | Low | "Can't produce what we can't compute": design ensures no email↔handle data exists to hand over; warrant-canary | all |
 | R14 | **CDN/circuit swap** (malicious WASM) | Med | Low | Reproducible builds, binary transparency, client-side circuit-hash pinning (K7) | 5 |
 | **R15** | **Alias directory enumeration/scraping** — public aliases reintroduce a discoverable namespace | Med | Med | PoW-per-resolve + encrypted records (dump is inert) + capability gate; adaptive/per-target difficulty; opt-in & default-off | 3 |

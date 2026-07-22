@@ -1,7 +1,12 @@
 # Messaging Plane. See docs/04-serverless-architecture.md.
-# HARD RULE: this config may bind DB_MSG, MEDIA (R2), and the Messaging-Plane Durable Objects
-# below — nothing else. It must never gain a binding to DB_ENROLL or any Enrollment-Plane
-# secret (OAUTH_CLIENT_SECRET, PPID_HMAC_SECRET) — schema-lint checks this file for exactly that.
+# HARD RULE: this config may bind DB_MSG, MEDIA (R2), BACKUP (R2), and the Messaging-Plane
+# Durable Objects below — nothing else. It must never gain a binding to DB_ENROLL or any
+# Enrollment-Plane secret (OAUTH_CLIENT_SECRET, PPID_HMAC_SECRET) — schema-lint checks this file
+# for exactly that.
+# BACKUP (2026-07, R12 cloud-backup pass): a second, dedicated R2 bucket for optional E2EE cloud
+# backups (docs/03 §11) — deliberately not reusing MEDIA, so prod can set a different retention/
+# access policy for "a user's full local state" than for chat media without touching either the
+# other bucket or this file's own MEDIA-related comments below.
 # R25 (2026-07): real OHTTP (RFC 9458) is implemented, not a stub — this Worker's `/ohttp/keys` +
 # `/ohttp/gateway` routes are the Gateway role (src/index.ts, @vorticity/ohttp); a separate
 # `workers/ohttp-relay` is the Relay role clients actually connect to in front of it. Wraps the three
@@ -33,6 +38,10 @@ database_id = "37f7a573-3f7a-4a3c-9f55-ba3c4c4d1966"
 [[r2_buckets]]
 binding = "MEDIA"
 bucket_name = "vorticity-media"
+
+[[r2_buckets]]
+binding = "BACKUP"
+bucket_name = "vorticity-backup"
 
 [[durable_objects.bindings]]
 name = "MERKLE_TREE_DO"

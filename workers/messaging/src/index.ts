@@ -2,6 +2,7 @@ import { Router, error } from "itty-router";
 import type { IRequest } from "itty-router";
 import type { Env } from "./env";
 import { corsHeaders, errorResp, jsonResp } from "./response";
+import { bufToBase64, base64ToBuf } from "./base64";
 import { verifyGroth16 } from "./zk-wasm";
 import { verifyBlindSig } from "./blindsig-wasm";
 import { CURRENT_ISSUER_PK_PEM } from "./issuer-keys";
@@ -67,6 +68,22 @@ const CONSISTENCY_RATE_LIMIT_PER_EPOCH = 20;
 // per-target keying) so one replayed/hammered attempt can't burn unlimited CPU, while distinct
 // honest attempts (distinct nullifiers) are unaffected by each other's counters.
 const SESSION_RATE_LIMIT_PER_EPOCH = 5;
+
+// R12 cloud-backup pass (2026-07, docs/03 §11): opaque-ID-keyed E2EE state blobs in R2. Rate-gated
+// PER BACKUP ID (not per capability — a capability's nullifier is itself real identity residue for
+// the SESSION, and keying the limiter by it would let the host build a "how often does this session
+// touch backups" profile; the backup ID is already the correct, purpose-built unlinkable key, same
+// reasoning as `proof:${commitment}` above). PUT gets a materially lower budget than GET/DELETE: it
+// is the only one of the three that costs real R2 storage/write-unit money per call, so it is the
+// one worth bounding hardest against a stolen-capability churn/flood attempt; a legitimate client
+// backs up on its own schedule (app close, periodic timer), not in a tight loop.
+const BACKUP_PUT_RATE_LIMIT_PER_EPOCH = 10;
+const BACKUP_GET_RATE_LIMIT_PER_EPOCH = 20;
+const BACKUP_DELETE_RATE_LIMIT_PER_EPOCH = 5;
+// 8 MiB: generous for "identity keys, ratchet state, message DB" (docs/03 §11) — this is NOT the
+// media path (docs/03 §10, separate, still-unbuilt presigned-R2 flow for large files) — enforced
+// BEFORE the R2 write, not just documented, so an oversized/malicious body can't buy free storage.
+const BACKUP_MAX_BYTES = 8 * 1024 * 1024;
 
 function rateGateStub(env: Env) {
   const epoch = Math.floor(Date.now() / 1000 / 3600);
@@ -292,6 +309,123 @@ async function coreAuthSession(env: Env, rawBody: unknown): Promise<CoreResult> 
   return { status: 200, body: { capability } };
 }
 
+// R12 cloud-backup pass (2026-07, docs/03 §11): "the same ciphertext blob may be stored in R2 keyed
+// by an opaque backup ID; the server holds an unreadable blob." The client derives `backupId` from
+// its own phrase-derived master key via HKDF (`vortic-core`'s `backup_derive_id`, domain-separated
+// from the encryption key itself — see backup.rs's header comment) — this Worker never sees a
+// phrase or a key, only a 32-byte value it cannot invert and a base64 AES-256-GCM ciphertext it
+// cannot decrypt. Authorization is TWO independent factors, same "belt and suspenders" shape as
+// AliasDO's capability+PoW gate: (1) a valid session capability (a real ZK-membership-proven
+// session — ties storage cost to a real, Sybil-guarded account, not an anonymous crawler) AND
+// (2) knowledge of the 256-bit backup ID itself (which requires the recovery phrase to compute) —
+// neither alone is sufficient, and guessing a specific target's ID without their phrase is
+// information-theoretically infeasible (2^256 space). Wire format follows this codebase's existing
+// base64-in-JSON convention for opaque binary payloads (msg/sig/msgRandomizer, proof) rather than
+// raw-bytes bodies, so the direct and OHTTP-dispatched paths below share byte-for-byte identical
+// parsing — deliberately NOT the presigned-direct-to-R2 pattern docs/04 describes for the (still
+// unbuilt) MEDIA path: that split exists to keep the Worker off the hot path for large files;
+// backup blobs (identity/ratchet/message state, capped well below media sizes) don't need it, and
+// funneling them through the Worker keeps the capability + rate-limit gate as the single point of
+// enforcement instead of a second one at the storage layer.
+function backupR2Key(backupId: string): string {
+  return `backup/${backupId}`;
+}
+
+async function coreBackupPut(env: Env, backupId: string | undefined, rawBody: unknown): Promise<CoreResult> {
+  if (!backupId || !HEX64_RE.test(backupId)) {
+    return { status: 400, body: { error: "backupId must be a 64-char lowercase hex (32-byte) value" } };
+  }
+  const body = rawBody as { blob?: unknown };
+  if (typeof body.blob !== "string") {
+    return { status: 400, body: { error: "Missing blob (base64)" } };
+  }
+  let bytes: ArrayBuffer;
+  try {
+    bytes = base64ToBuf(body.blob);
+  } catch {
+    return { status: 400, body: { error: "blob is not valid base64" } };
+  }
+  if (bytes.byteLength === 0) {
+    return { status: 400, body: { error: "blob must not be empty" } };
+  }
+  if (bytes.byteLength > BACKUP_MAX_BYTES) {
+    return { status: 413, body: { error: `blob exceeds the ${BACKUP_MAX_BYTES}-byte backup size cap` } };
+  }
+
+  const rateRes = await rateGateStub(env).fetch(
+    new Request("https://do/check", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key: `backup:put:${backupId}`, limit: BACKUP_PUT_RATE_LIMIT_PER_EPOCH }),
+    }),
+  );
+  if (!rateRes.ok) return { status: 502, body: { error: `Rate check failed (${rateRes.status})` } };
+  const { allowed, count, limit } = (await rateRes.json()) as { allowed: boolean; count: number; limit: number };
+  if (!allowed) {
+    console.log(`[Backup] PUT rate limit hit for ${backupId.slice(0, 16)}… (${count}/${limit} this epoch)`);
+    return { status: 429, body: { error: "Too many backup writes for this ID this epoch — try again next epoch" } };
+  }
+
+  await env.BACKUP.put(backupR2Key(backupId), bytes);
+  console.log(`[Backup] PUT ${backupId.slice(0, 16)}… (${bytes.byteLength}B)`);
+  return { status: 200, body: { ok: true, size: bytes.byteLength, updatedAt: Date.now() } };
+}
+
+async function coreBackupGet(env: Env, backupId: string | undefined): Promise<CoreResult> {
+  if (!backupId || !HEX64_RE.test(backupId)) {
+    return { status: 400, body: { error: "backupId must be a 64-char lowercase hex (32-byte) value" } };
+  }
+
+  const rateRes = await rateGateStub(env).fetch(
+    new Request("https://do/check", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key: `backup:get:${backupId}`, limit: BACKUP_GET_RATE_LIMIT_PER_EPOCH }),
+    }),
+  );
+  if (!rateRes.ok) return { status: 502, body: { error: `Rate check failed (${rateRes.status})` } };
+  const { allowed, count, limit } = (await rateRes.json()) as { allowed: boolean; count: number; limit: number };
+  if (!allowed) {
+    console.log(`[Backup] GET rate limit hit for ${backupId.slice(0, 16)}… (${count}/${limit} this epoch)`);
+    return { status: 429, body: { error: "Too many backup reads for this ID this epoch — try again next epoch" } };
+  }
+
+  const object = await env.BACKUP.get(backupR2Key(backupId));
+  if (!object) return { status: 404, body: { error: "no backup stored for this ID" } };
+  const buf = await object.arrayBuffer();
+  return {
+    status: 200,
+    body: { blob: bufToBase64(buf), size: buf.byteLength, updatedAt: object.uploaded.getTime() },
+  };
+}
+
+async function coreBackupDelete(env: Env, backupId: string | undefined): Promise<CoreResult> {
+  if (!backupId || !HEX64_RE.test(backupId)) {
+    return { status: 400, body: { error: "backupId must be a 64-char lowercase hex (32-byte) value" } };
+  }
+
+  const rateRes = await rateGateStub(env).fetch(
+    new Request("https://do/check", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key: `backup:delete:${backupId}`, limit: BACKUP_DELETE_RATE_LIMIT_PER_EPOCH }),
+    }),
+  );
+  if (!rateRes.ok) return { status: 502, body: { error: `Rate check failed (${rateRes.status})` } };
+  const { allowed, count, limit } = (await rateRes.json()) as { allowed: boolean; count: number; limit: number };
+  if (!allowed) {
+    console.log(`[Backup] DELETE rate limit hit for ${backupId.slice(0, 16)}… (${count}/${limit} this epoch)`);
+    return { status: 429, body: { error: "Too many backup deletes for this ID this epoch — try again next epoch" } };
+  }
+
+  // Idempotent: R2 delete of a missing key is not an error, and returning a uniform 200 either way
+  // avoids using the response to oracle whether a given (guessed) backup ID currently has data —
+  // the rate limit above already bounds the guessing rate regardless.
+  await env.BACKUP.delete(backupR2Key(backupId));
+  console.log(`[Backup] DELETE ${backupId.slice(0, 16)}…`);
+  return { status: 200, body: { ok: true } };
+}
+
 router.post("/membership/insert", async (request: IRequest, env: Env) => {
   const origin = request.headers.get("Origin");
   let body: unknown;
@@ -391,6 +525,36 @@ router.post("/auth/session", async (request: IRequest, env: Env) => {
     return errorResp("Invalid JSON body", origin, 400);
   }
   const result = await coreAuthSession(env, body);
+  return jsonResp(result.body, origin, result.status);
+});
+
+// R12 cloud-backup direct routes — capability-gated like every other post-airlock route (see
+// `coreBackupPut`/`Get`/`Delete`'s header comment above for the full two-factor design).
+router.put("/backup/:backupId", async (request: IRequest, env: Env) => {
+  const origin = request.headers.get("Origin");
+  const denied = await requireCapability(request, env);
+  if (denied) return denied;
+  let body: unknown;
+  try {
+    body = await request.json();
+  } catch {
+    return errorResp("Invalid JSON body", origin, 400);
+  }
+  const result = await coreBackupPut(env, request.params.backupId, body);
+  return jsonResp(result.body, origin, result.status);
+});
+router.get("/backup/:backupId", async (request: IRequest, env: Env) => {
+  const origin = request.headers.get("Origin");
+  const denied = await requireCapability(request, env);
+  if (denied) return denied;
+  const result = await coreBackupGet(env, request.params.backupId);
+  return jsonResp(result.body, origin, result.status);
+});
+router.delete("/backup/:backupId", async (request: IRequest, env: Env) => {
+  const origin = request.headers.get("Origin");
+  const denied = await requireCapability(request, env);
+  if (denied) return denied;
+  const result = await coreBackupDelete(env, request.params.backupId);
   return jsonResp(result.body, origin, result.status);
 });
 
@@ -663,6 +827,28 @@ async function dispatchBhttpRequest(env: Env, req: BhttpRequest): Promise<CoreRe
   }
   if (req.method === "POST" && req.path === "/alias/revoke") {
     return coreAliasRequest(env, "revoke", "POST", req);
+  }
+  // R12 cloud-backup OHTTP-wrapped path: "this real IP is uploading/fetching/deleting THIS backup
+  // ID" is at least as sensitive as the alias-route metadata wrapped above (arguably more —
+  // repeated GETs of the same ID directly fingerprint a returning device across sessions), so it
+  // gets the same treatment. Capability check re-expressed against the BhttpRequest header list,
+  // same shape (and same underlying `verifyCapability` call) as every other wrapped route above.
+  const backupMatch = /^\/backup\/([0-9a-f]{64})$/.exec(req.path);
+  if (backupMatch && (req.method === "PUT" || req.method === "GET" || req.method === "DELETE")) {
+    const auth = getBhttpHeader(req.headers, "authorization");
+    const cap = auth?.startsWith("Bearer ") ? auth.slice("Bearer ".length) : null;
+    if (!cap) return { status: 401, body: { error: "Missing session capability" } };
+    const verdict = await verifyCapability(env.SESSION_SIGNING_KEY, cap);
+    if (!verdict.valid) return { status: 401, body: { error: `Invalid session capability: ${verdict.reason}` } };
+
+    const backupId = backupMatch[1]!;
+    if (req.method === "PUT") {
+      const parsed = parseJsonBody(req.body);
+      if (!parsed.ok) return { status: 400, body: { error: "Invalid JSON body" } };
+      return coreBackupPut(env, backupId, parsed.value);
+    }
+    if (req.method === "GET") return coreBackupGet(env, backupId);
+    return coreBackupDelete(env, backupId);
   }
   return { status: 404, body: { error: "Not found (via OHTTP gateway)" } };
 }
