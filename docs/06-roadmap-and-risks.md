@@ -568,6 +568,44 @@ bands, not calendar promises.
   remeasurement of the Argon2id timing used to derive the discount, and any UI affordance for a user
   to actually CHOOSE the hardened mode (this pass makes the server accept it; nothing client-side
   offers it yet).
+- **Done (2026-07, "adaptive difficulty for register/introduce" pass) — closes R15/R16's last named
+  "Not done" scope note** ("adaptive difficulty on `/register`/`/introduce` (scoped to resolve only,
+  per R15's specific enumeration-scraping angle)"). `AliasDO.ts`'s `adaptiveResolveBits` generalized
+  into a shared `adaptivePowBits` method (same RateGateDO-counter-driven escalation, no cliff, just
+  parameterized per action) plus a pure `adaptiveBits(count, base, step, bitsPerStep, max)`
+  calculator — resolve's own behavior is BYTE-FOR-BYTE unchanged (same constants, same call shape),
+  just reached through the shared helper instead of a copy-pasted method body.
+  **Tuned independently per action, not copy-pasted from resolve's own numbers:** register
+  (base=24, step every 3 attempts, +2 bits/step, cap 32) escalates FASTER than resolve (step every 5,
+  +1 bit/step) — a registration attempt is rarer and higher-value than a lookup, so a repeat-target
+  attacker (racing to grab a specific name, or grinding stamps against one about to be revoked)
+  should hit escalating cost sooner. Introduce keeps resolve's own cadence (step every 5, +1/step,
+  cap 30) starting from its existing 22-bit base — repeat-target intro-queue spam is closer in shape
+  to repeat-target scraping than to a land-grab race.
+  **Live-verified with 26 real checks total across two runs against a real `wrangler dev` AliasDO**
+  (the second run fixed a TEST bug in the first — a wrong `sizeBucket` for a 23-byte ciphertext
+  tripped `bucketing.ts`'s real validation on the introduce path's very last assertion; caught and
+  fixed the same way this project's other "verify the comparison itself before concluding something
+  is broken" lessons have been, not silently patched over): the required-bits number reported in a
+  403 genuinely climbs from 24→26 after 4 garbage-stamp attempts against one `lookup_key` (and from
+  22→23 after 6 against one `introQueueId`) — proving the counter-driven escalation is really wired,
+  not just documented; a REAL stamp mined for the OLD base price (24 bits) is REJECTED once that
+  same target has escalated to 26 (not a coin-flip risk — the pre-mined stamp's own real bit count,
+  25, is shown directly in the rejection message, genuinely below the new 26-bit bar); a REAL stamp
+  freshly mined AT the escalated 26-bit target for register (352s of real mining — the slowest single
+  mint measured in this project so far, a real reminder that 26 bits is a meaningfully heavier ask
+  than 24) is ACCEPTED; a REAL stamp mined at the escalated 23-bit target for introduce is ACCEPTED;
+  and — cross-target isolation, the same check every rate-limit feature in this codebase carries —
+  a completely different, never-touched `lookup_key` still only needs the unescalated BASE 24 bits,
+  proving one hot target's counter never bleeds into another's. Mining was done fully upfront before
+  firing any requests, same documented fix as the Argon2id-wiring pass above for the exact same
+  `wrangler dev` local-connection-drop issue, which recurred here too (the very first attempt at this
+  live test hit it again, this time because a 208-second mining pause left an idle connection stale)
+  before being fixed.
+  **Honest scope:** off-thread client miner unaffected (same standing gap named in every PoW-related
+  row); no UI surfaces the current required-bits number to a user before they start mining (a client
+  today only finds out the price was too low from a 403 after the fact, same UX gap resolve already
+  had).
 - **Still to implement (crate-core):** none remaining from this doc's original Phase 1 primitive
   list — VOPRF DLEQ (Phase 2 Airlock pass), MLS (real MLS group encryption pass), Argon2id/BIP39
   backup, bLSAG ring sigs, and now Argon2id-hardened PoW are all landed. Remaining Phase 1 work is
@@ -2720,6 +2758,7 @@ Severity × likelihood; **R1 is the one the brief explicitly asked about.**
 | — | *(R15/R16 progress, 2026-07, "adaptive resolve difficulty" pass — Mitigated, not fully Closed):* per-target adaptive PoW bits for `/alias/resolve` are real and live-verified — see the Phase 3 entry below. **Not done:** the Argon2id memory-hard PoW option, off-thread/worker-thread client miner, adaptive difficulty on `/register`/`/introduce` (scoped to resolve only, per R15's specific enumeration-scraping angle). | | | | |
 | — | *(R16 progress, 2026-07, "Argon2id hardened PoW" pass — Mitigated, not fully Closed):* the memory-hard Argon2id `Hpow` option the row above named is now real and live-verified (crate-core, both native and real compiled WASM, both build profiles) — see the Phase 1 entry above for the full write-up, including real measured costs (~2.66ms/hash at m=4MiB,t=1,p=1) rather than assumed ones. **Not done:** off-thread/worker-thread client miner for this mode specifically, wiring into `AliasDO.ts`'s production verifier or any adaptive-difficulty policy (checked directly: `workers/messaging/src/pow.ts` still only accepts `alg==="sha256"`), and choosing real per-action bit targets under the new param set. | | | | |
 | — | *(R16 progress, 2026-07, "wire Argon2id PoW into AliasDO" pass — Mitigated, not fully Closed):* the DO-wiring gap the row above named is now closed — `pow.ts` dispatches on the stamp's own `alg`, argon2id verified via real WASM, and every existing call site's bit target now automatically has a derived (not guessed) Argon2id-equivalent via `argonEquivalentBits`, live-verified with real mined stamps on both register and resolve (see the Phase 1 entry below). **Not done:** off-thread client miner (unaffected — unchanged from the row above), UI to let a user choose the hardened mode, in-Worker/WASM remeasurement of the timing the bit-discount is derived from (currently a native figure). | | | | |
+| — | *(R15/R16 progress, 2026-07, "adaptive difficulty for register/introduce" pass — Mitigated, not fully Closed):* the "adaptive difficulty on `/register`/`/introduce`" gap the first row above named (scoped out of the original resolve-only pass) is now closed — both endpoints escalate required bits per-target the same way resolve already did, live-verified with real mined stamps proving both the escalation AND that a stamp mined only for the old base price is rejected once a target has heated up (see the Phase 3 entry below). **Not done:** off-thread client miner (unaffected, same gap as the rows above), UI to surface the current required-bits number to a user before they mine. | | | | |
 | R17 | **Host offline dictionary attack** on `AliasDO` dump (nicknames are low-entropy) | Med | Med | Documented residual (aliases are public by intent); high-entropy nickname advice; **identity-linkage stays cryptographically safe** — record holds no email/PPID/handle | 3 |
 | **R18** | **Nickname squatting / impersonation** | Low | Med | Registration PoW + capability; `alias_pub` signed ownership; reserved/verified namespaces; report+revoke; Key Transparency (K8) over alias→key | 3,5 |
 | — | *(R18 progress, 2026-07, "signed alias revoke" pass — Mitigated, not fully Closed):* `alias_pub` signed ownership + revoke are now real — see the entry below. **Not done:** reserved/verified namespaces, update-in-place (revoke + re-register covers the same outcome for now). | | | | |

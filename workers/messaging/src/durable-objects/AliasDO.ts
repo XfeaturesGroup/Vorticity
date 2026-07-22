@@ -90,12 +90,35 @@ const RESOLVE_BASE_BITS = 20;
 const RESOLVE_ADAPTIVE_STEP = 5; // every this-many resolve attempts against one lookup_key this epoch...
 const RESOLVE_ADAPTIVE_BITS_PER_STEP = 1; // ...adds this many required bits...
 const RESOLVE_MAX_BITS = 28; // ...capped here (docs/03 §8.3's 18-26 bit range, +2 headroom for this cap)
+
+// R15/R16 (2026-07, "adaptive difficulty for register/introduce" pass): the adaptive-bits pass above
+// scoped itself explicitly to resolve only ("R15's specific enumeration-scraping angle"), disclosed
+// as a "Not done" gap in docs/06 for register/introduce ever since. Real gap this closes for those
+// two endpoints specifically: register's flat 24-bit price meant repeated ATTEMPTS against one
+// specific lookup_key (e.g. racing to grab a name the instant it becomes available, or grinding
+// stamps against a desirable soon-to-be-revoked nickname) always cost the same per try, no matter
+// how many times that exact target had already been hit this epoch — introduce had the identical
+// flat-cost gap against one target intro_queue_id (repeat-target spam/harassment). Same mechanism as
+// resolve's (a RateGateDO counter raises the bit target smoothly, no cliff), generalized into one
+// shared helper below instead of copy-pasting `adaptiveResolveBits`'s body a second and third time.
+function adaptiveBits(count: number, base: number, stepEvery: number, bitsPerStep: number, max: number): number {
+  const extraSteps = Math.floor((count - 1) / stepEvery);
+  return Math.min(base + extraSteps * bitsPerStep, max);
+}
+const REGISTER_BASE_BITS = REGISTER_MIN_BITS; // unchanged baseline — see declaration below
+const REGISTER_ADAPTIVE_STEP = 3; // registrations are rarer/higher-value than resolves -> escalate faster
+const REGISTER_ADAPTIVE_BITS_PER_STEP = 2;
+const REGISTER_MAX_BITS = 32;
 // Flow 6 (docs/04): "write to intro queue" PoW, resource = the target intro_queue_id, not a
 // lookup_key. Mid docs/03 §8.3's stated 20-24 bit write range, distinct from RESOLVE_BASE_BITS
 // only as a difficulty choice — the two never collide on which stamp satisfies which endpoint
 // since every stamp is resource-bound (a resolve-shaped stamp targets a lookup_key hex string, an
 // introduce-shaped stamp targets an intro_queue_id — the two id-spaces don't overlap in practice).
 const INTRODUCE_MIN_BITS = 22;
+const INTRODUCE_BASE_BITS = INTRODUCE_MIN_BITS;
+const INTRODUCE_ADAPTIVE_STEP = 5;
+const INTRODUCE_ADAPTIVE_BITS_PER_STEP = 1;
+const INTRODUCE_MAX_BITS = 30;
 // A contact request sits in the recipient's inbox until they check it — long enough to be useful,
 // short enough that an unclaimed request doesn't linger forever (same finite-lifetime philosophy
 // as every other queued item in this app; QueueDO's own TTL is the precedent).
@@ -292,9 +315,22 @@ export class AliasDO extends DurableObject<Env> {
       return new Response("record is not valid base64", { status: 400 });
     }
 
-    const pow = await verifyPowStamp(powStamp, lookupKey, REGISTER_MIN_BITS);
+    // R15/R16 (2026-07, "adaptive difficulty for register/introduce" pass): bump the per-lookup_key
+    // register-attempt counter unconditionally, same "no free probing at the old price" reasoning
+    // resolve's own adaptive check already documents — repeated attempts against ONE target
+    // (a land-grab race, or grinding stamps against a soon-to-be-available name) now cost more the
+    // more they're tried, rather than a flat 24 bits forever regardless of how hot the target is.
+    const requiredBits = await this.adaptivePowBits(
+      "register",
+      lookupKey,
+      REGISTER_BASE_BITS,
+      REGISTER_ADAPTIVE_STEP,
+      REGISTER_ADAPTIVE_BITS_PER_STEP,
+      REGISTER_MAX_BITS,
+    );
+    const pow = await verifyPowStamp(powStamp, lookupKey, requiredBits);
     if (!pow.ok) {
-      return new Response(`PoW rejected: ${pow.reason}`, { status: 403 });
+      return new Response(`PoW rejected: ${pow.reason} (required ${requiredBits} bits this epoch for this name)`, { status: 403 });
     }
 
     const spent = this.ctx.storage.sql.exec<StampRow>("SELECT stamp FROM pow_stamps WHERE stamp = ?", powStamp).toArray();
@@ -435,21 +471,30 @@ export class AliasDO extends DurableObject<Env> {
   // (this call exists to read back a running COUNT, not to hard-block) — the block-or-allow
   // decision stays entirely in `verifyPowStamp`'s bit-difficulty check below, matching this
   // endpoint's existing "spend real work even on a miss" philosophy rather than introducing a
-  // second, differently-shaped rejection path.
-  private async adaptiveResolveBits(lookupKey: string): Promise<number> {
+  // second, differently-shaped rejection path. Shared by resolve/register/introduce — each passes
+  // its OWN key prefix (so the three counters are fully independent per action type, never sharing
+  // a target's count across different actions) and its own tuned base/step/max (see the constants'
+  // declaration above for why register/introduce escalate differently than resolve).
+  private async adaptivePowBits(
+    keyPrefix: string,
+    resource: string,
+    base: number,
+    stepEvery: number,
+    bitsPerStep: number,
+    max: number,
+  ): Promise<number> {
     const res = await rateGateStub(this.env).fetch(
       new Request("https://do/check", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ key: `resolve:${lookupKey}`, limit: Number.MAX_SAFE_INTEGER }),
+        body: JSON.stringify({ key: `${keyPrefix}:${resource}`, limit: Number.MAX_SAFE_INTEGER }),
       }),
     );
     // RateGateDO unreachable: fail toward the MAX difficulty, not the base — falling back to the
     // cheapest price would make "make RateGateDO unreachable" a perverse incentive for an attacker.
-    if (!res.ok) return RESOLVE_MAX_BITS;
+    if (!res.ok) return max;
     const { count } = (await res.json()) as { count: number };
-    const extraSteps = Math.floor((count - 1) / RESOLVE_ADAPTIVE_STEP);
-    return Math.min(RESOLVE_BASE_BITS + extraSteps * RESOLVE_ADAPTIVE_BITS_PER_STEP, RESOLVE_MAX_BITS);
+    return adaptiveBits(count, base, stepEvery, bitsPerStep, max);
   }
 
   private async handleResolve(request: Request, lookupKey: string): Promise<Response> {
@@ -464,7 +509,14 @@ export class AliasDO extends DurableObject<Env> {
     // R15/R16: bump the per-lookup_key attempt counter FIRST (unconditionally — an under-difficulty
     // probe should still push the bar up, not get a free look at the old price) and derive this
     // attempt's required bits from the resulting count, before spending any real work verifying it.
-    const requiredBits = await this.adaptiveResolveBits(lookupKey);
+    const requiredBits = await this.adaptivePowBits(
+      "resolve",
+      lookupKey,
+      RESOLVE_BASE_BITS,
+      RESOLVE_ADAPTIVE_STEP,
+      RESOLVE_ADAPTIVE_BITS_PER_STEP,
+      RESOLVE_MAX_BITS,
+    );
 
     const pow = await verifyPowStamp(powStamp, lookupKey, requiredBits);
     if (!pow.ok) {
@@ -539,9 +591,20 @@ export class AliasDO extends DurableObject<Env> {
     // intro_queue_id"), NOT the lookup_key — a caller only reaches this point after already
     // resolving the alias, so binding to the queue id (not the alias itself) is what actually
     // stops someone from grinding one stamp and spamming every queue they can enumerate.
-    const pow = await verifyPowStamp(powStamp, introQueueId, INTRODUCE_MIN_BITS);
+    // R15/R16 (2026-07, "adaptive difficulty for register/introduce" pass): repeat-target spam
+    // against ONE intro_queue_id (harassment: flooding a specific victim's queue) now escalates in
+    // cost per attempt this epoch, same mechanism as register/resolve, instead of a flat 22 bits.
+    const requiredBits = await this.adaptivePowBits(
+      "introduce",
+      introQueueId,
+      INTRODUCE_BASE_BITS,
+      INTRODUCE_ADAPTIVE_STEP,
+      INTRODUCE_ADAPTIVE_BITS_PER_STEP,
+      INTRODUCE_MAX_BITS,
+    );
+    const pow = await verifyPowStamp(powStamp, introQueueId, requiredBits);
     if (!pow.ok) {
-      return new Response(`PoW rejected: ${pow.reason}`, { status: 403 });
+      return new Response(`PoW rejected: ${pow.reason} (required ${requiredBits} bits this epoch for this queue)`, { status: 403 });
     }
 
     const spent = this.ctx.storage.sql.exec<StampRow>("SELECT stamp FROM pow_stamps WHERE stamp = ?", powStamp).toArray();
