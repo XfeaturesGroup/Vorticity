@@ -40,10 +40,41 @@ import { base64ToBuf, bufToBase64 } from "../base64";
 import { verifyPowStamp, stampExpiryFromEpoch } from "../pow";
 import { verifyAliasOwnership, aliasRevokeMessage } from "../alias-wasm";
 import { hexToBytes } from "../session";
+import { namespaceAuthorityPubkeys } from "../namespace-authority-key";
 
 const LOOKUP_KEY_RE = /^[0-9a-f]{64}$/; // SHA-256 digest, lowercase hex
 const ALIAS_PUB_RE = /^[0-9a-f]{64}$/; // raw 32-byte Ed25519 public key, lowercase hex
 const REGISTER_MIN_BITS = 24;
+
+// R18 (2026-07, "reserved/verified namespaces" pass): closes the exact gap named "Not done" across
+// three prior R18 progress notes in docs/06. A `lookup_key` in `reserved_namespaces` (added via
+// `/reserve`, gated by an OFFLINE authority signature — see namespace-authority-key.ts / the
+// namespace-authority.mts tool's header comment for the full design) cannot be claimed by ordinary
+// PoW alone: `handleRegister` additionally requires a `registrant_sig` binding the SAME authority's
+// approval to the SPECIFIC `alias_pub` attempting to register — so a reserved name is strictly
+// HARDER to claim than an ordinary one (PoW AND an authority signature), never easier, and the
+// ordinary (non-reserved) path is completely unchanged. Two domain-separated message prefixes so a
+// signature for one action can never verify as the other (see the two builder functions below).
+function reserveMessage(lookupKey: Uint8Array): Uint8Array {
+  const prefix = new TextEncoder().encode("vortic-reserve-v1:");
+  const out = new Uint8Array(prefix.length + lookupKey.length);
+  out.set(prefix, 0);
+  out.set(lookupKey, prefix.length);
+  return out;
+}
+function registrantMessage(lookupKey: Uint8Array, aliasPub: Uint8Array): Uint8Array {
+  const prefix = new TextEncoder().encode("vortic-registrant-v1:");
+  const out = new Uint8Array(prefix.length + lookupKey.length + aliasPub.length);
+  out.set(prefix, 0);
+  out.set(lookupKey, prefix.length);
+  out.set(aliasPub, prefix.length + lookupKey.length);
+  return out;
+}
+/** Verifies `sig` over `message` against ANY currently-known authority key (supports rotation — see
+ * namespace-authority-key.ts's header comment), not just a single hardcoded one. */
+function verifyAgainstAnyAuthorityKey(message: Uint8Array, sig: Uint8Array): boolean {
+  return namespaceAuthorityPubkeys().some((pk) => verifyAliasOwnership(pk, message, sig));
+}
 
 // R15/R16 (2026-07, "adaptive resolve difficulty" pass): resolve used to require a FLAT 20 bits no
 // matter how many times a given lookup_key had already been resolved this epoch — the risk
@@ -144,6 +175,10 @@ export class AliasDO extends DurableObject<Env> {
         expires_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_pow_stamps_expires_at ON pow_stamps(expires_at);
+      CREATE TABLE IF NOT EXISTS reserved_namespaces (
+        lookup_key  TEXT PRIMARY KEY,
+        reserved_at INTEGER NOT NULL
+      );
     `);
     // R18 migration for DOs created before `alias_pub` existed: `CREATE TABLE IF NOT EXISTS` above
     // is a no-op against an already-existing table, so a pre-R18 instance needs the column added in
@@ -167,6 +202,10 @@ export class AliasDO extends DurableObject<Env> {
 
     if (request.method === "POST" && url.pathname === "/revoke") {
       return this.handleRevoke(request);
+    }
+
+    if (request.method === "POST" && url.pathname === "/reserve") {
+      return this.handleReserve(request);
     }
 
     const resolveMatch = url.pathname.match(/^\/resolve\/([^/]+)$/);
@@ -198,6 +237,7 @@ export class AliasDO extends DurableObject<Env> {
     const recordB64 = (body as { record?: unknown }).record;
     const powStamp = (body as { pow_stamp?: unknown }).pow_stamp;
     const aliasPub = (body as { alias_pub?: unknown }).alias_pub;
+    const registrantSigB64 = (body as { registrant_sig?: unknown }).registrant_sig;
 
     if (typeof lookupKey !== "string" || !LOOKUP_KEY_RE.test(lookupKey)) {
       return new Response("lookup_key must be a 64-char lowercase hex SHA-256 digest", { status: 400 });
@@ -212,6 +252,36 @@ export class AliasDO extends DurableObject<Env> {
     // header comment above for why this doesn't weaken the nickname-isolation property.
     if (typeof aliasPub !== "string" || !ALIAS_PUB_RE.test(aliasPub)) {
       return new Response("alias_pub must be a 64-char lowercase hex (32-byte) Ed25519 public key", { status: 400 });
+    }
+
+    // R18 (2026-07, "reserved/verified namespaces" pass): a reserved lookup_key additionally
+    // requires a `registrant_sig` binding an authority approval to THIS specific alias_pub — checked
+    // BEFORE the (more expensive) PoW verification below, cheap-check-first, same discipline as
+    // every other gate in this codebase. Ordinary (non-reserved) names are completely unaffected —
+    // this `SELECT` is the only new cost on that path, one indexed lookup.
+    const reserved = this.ctx.storage.sql
+      .exec<{ lookup_key: string; [key: string]: SqlStorageValue }>(
+        "SELECT lookup_key FROM reserved_namespaces WHERE lookup_key = ?",
+        lookupKey,
+      )
+      .toArray();
+    if (reserved.length > 0) {
+      if (typeof registrantSigB64 !== "string" || registrantSigB64.length === 0) {
+        return new Response("this namespace is reserved: registrant_sig is required", { status: 403 });
+      }
+      let registrantSig: Uint8Array;
+      try {
+        registrantSig = new Uint8Array(base64ToBuf(registrantSigB64));
+        if (registrantSig.byteLength !== 64) throw new Error("wrong length");
+      } catch {
+        return new Response("registrant_sig must be a valid base64-encoded 64-byte Ed25519 signature", { status: 400 });
+      }
+      const message = registrantMessage(hexToBytes(lookupKey), hexToBytes(aliasPub));
+      const validRegistrant = verifyAgainstAnyAuthorityKey(message, registrantSig);
+      console.log(`[Alias] reserved-namespace registrant signature valid -> ${validRegistrant} (lookup_key ${lookupKey.slice(0, 16)}…)`);
+      if (!validRegistrant) {
+        return new Response("registrant_sig verification failed against every known authority key", { status: 401 });
+      }
     }
 
     let record: ArrayBuffer;
@@ -306,6 +376,56 @@ export class AliasDO extends DurableObject<Env> {
 
     this.ctx.storage.sql.exec("DELETE FROM aliases WHERE lookup_key = ?", lookupKey);
     await appendToTransparencyLog(this.env, lookupKey, row.alias_pub, "revoke");
+    return new Response(null, { status: 204 });
+  }
+
+  // ── reserve (R18: reserved/verified namespaces) ────────────────────────────────────────────
+  // Adds `lookup_key` to the namespace-authority-gated set (see this file's header comment and
+  // namespace-authority.mts). Deliberately requires NO PoW and NO pre-existing alias row — a
+  // reservation exists to BLOCK ordinary registration ahead of time, so it must be attachable to a
+  // name nobody has (or will ever be allowed to) register without the matching authorization. The
+  // signature itself is the entire authorization, same "signature as capability" pattern `/revoke`
+  // already established — this write path is idempotent (re-reserving an already-reserved name is a
+  // harmless no-op, not an error) since two independent reserve calls for the same name are not a
+  // conflict of any kind.
+  private async handleReserve(request: Request): Promise<Response> {
+    let body: unknown;
+    try {
+      body = await request.json();
+    } catch {
+      return new Response("invalid JSON body", { status: 400 });
+    }
+
+    const lookupKey = (body as { lookup_key?: unknown }).lookup_key;
+    const reserveSigB64 = (body as { reserve_sig?: unknown }).reserve_sig;
+
+    if (typeof lookupKey !== "string" || !LOOKUP_KEY_RE.test(lookupKey)) {
+      return new Response("lookup_key must be a 64-char lowercase hex SHA-256 digest", { status: 400 });
+    }
+    if (typeof reserveSigB64 !== "string" || reserveSigB64.length === 0) {
+      return new Response("reserve_sig must be a non-empty base64 string", { status: 400 });
+    }
+
+    let reserveSig: Uint8Array;
+    try {
+      reserveSig = new Uint8Array(base64ToBuf(reserveSigB64));
+      if (reserveSig.byteLength !== 64) throw new Error("wrong length");
+    } catch {
+      return new Response("reserve_sig must be a valid base64-encoded 64-byte Ed25519 signature", { status: 400 });
+    }
+
+    const message = reserveMessage(hexToBytes(lookupKey));
+    const valid = verifyAgainstAnyAuthorityKey(message, reserveSig);
+    console.log(`[Alias] reserve signature valid -> ${valid} (lookup_key ${lookupKey.slice(0, 16)}…)`);
+    if (!valid) {
+      return new Response("reserve_sig verification failed against every known authority key", { status: 401 });
+    }
+
+    this.ctx.storage.sql.exec(
+      "INSERT INTO reserved_namespaces (lookup_key, reserved_at) VALUES (?, ?) ON CONFLICT(lookup_key) DO NOTHING",
+      lookupKey,
+      Date.now(),
+    );
     return new Response(null, { status: 204 });
   }
 

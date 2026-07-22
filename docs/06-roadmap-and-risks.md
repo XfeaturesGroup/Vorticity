@@ -426,6 +426,50 @@ bands, not calendar promises.
   discover and run). No `apps/web` client-side verification wiring (unchanged from the STH pass's own
   gap) — a monitor is a server-operator/community tool, not a per-user browser check, so this is a
   deliberate scope boundary, not an oversight.
+- **Done (2026-07, "reserved/verified namespaces" pass) — closes R18's last remaining "Not done"
+  item repeated across three prior progress notes.** New `POST /alias/reserve` in `AliasDO.ts`: a
+  `lookup_key` added to a new `reserved_namespaces` table can no longer be claimed by ordinary PoW
+  alone — `handleRegister` additionally requires a `registrant_sig` binding an offline "namespace
+  authority" key's approval to the SPECIFIC `alias_pub` attempting to register. A reserved name is
+  therefore strictly HARDER to claim (PoW **and** an authority signature), never easier; the ordinary
+  (non-reserved, overwhelming majority) path gained exactly one indexed `SELECT` and is otherwise
+  byte-for-byte unchanged — checked BEFORE the PoW verification (cheap-check-first, same discipline
+  as every other gate in this file).
+  **Zero new Rust code — reused the crate's existing Ed25519 sign/verify (`alias_sig.rs`) wholesale,**
+  the same primitive `/revoke` already uses: `verify(pubkey, message, sig)` doesn't care what the
+  pubkey/message mean semantically, only that the bytes check out, so a second signed-action TYPE
+  needed only new domain-separated message-prefix bytes (`"vortic-reserve-v1:"` /
+  `"vortic-registrant-v1:"`) in TS, not a new crypto primitive.
+  **Deliberately, the authority's signing key never touches Cloudflare at all** — unlike the RSABSSA
+  issuer or the KT STH key (both sign LIVE per-request and therefore need `.dev.vars`/`wrangler
+  secret put`), this authority signs rarely, offline, on an operator's own machine. New
+  `workers/messaging/scripts/namespace-authority.mts` (`keygen`/`reserve`/`authorize` subcommands,
+  reusing the crate's own `alias_lookup_key`/`identity_verifying_key`/`alias_sign_action` WASM
+  exports — no second Ed25519 implementation) is the only place the seed is ever handled, and never
+  writes it to disk itself. Only the PUBLIC key is committed, in new
+  `src/namespace-authority-key.ts` (`kid`-keyed lookup table, same rotation-ready shape as
+  `issuer-keys.ts`/`kt-sth-key.ts`) — a real, generated keypair for this pass, not a placeholder.
+  **Live-verified with 10 checks against a real `wrangler dev` AliasDO, using the actual offline tool
+  end-to-end (not a hand-crafted signature):** reserve without a capability -> 401 (the existing
+  `/alias/*` capability gate applies to `/reserve` too, no special-casing needed); reserve with a
+  tampered signature -> 401; a REAL reserve with a valid authority signature -> 204, idempotent
+  re-reserve -> 204; registering the reserved name with no `registrant_sig` -> 403; a
+  `registrant_sig` signed for a DIFFERENT `alias_pub` (an impostor trying to reuse someone else's
+  grant) -> 401; a correct `registrant_sig` paired with garbage PoW -> still 403, proving the
+  authority signature does **not** bypass PoW; the REAL full path (authority-authorized registrant +
+  a genuinely mined 24-bit PoW stamp) -> 201; re-registering the same now-taken name -> 409 (same as
+  any ordinary alias); and — the regression check that matters most — an ORDINARY, never-reserved
+  nickname still registers with PoW alone, no `registrant_sig`, exactly as before. A separate 2-check
+  pass confirmed the SAME reserve flow through the real OHTTP Gateway dispatch, including that the
+  plaintext `lookup_key` never appears on the encapsulated wire.
+  **Honest scope:** no UI for an operator to manage reservations (this is a `curl`/script-driven
+  admin action, matching this feature's inherently-rare, offline-authority nature); no "list all
+  reserved names" endpoint (not needed — an operator already knows what they reserved, and exposing
+  the list publicly would hand squatters a target list of upcoming verified names); update-in-place
+  for a registrant grant is not implemented (re-running `authorize` for the same name/different
+  `alias_pub` produces a second valid signature, but nothing revokes the first — both remain
+  independently valid until the name is actually claimed, an accepted, disclosed simplification for
+  this pass, not a bug).
 - **Done (2026-07, "Argon2id hardened PoW" pass) — R16 progress: `pow.rs` gets the SECOND `Hpow`
   option docs/03 §8.3 names** (`SHA-256 baseline | Argon2id hardened: memory-hard, botnet/GPU-
   resistant`) — only the SHA-256 mode existed before this pass. Same stamp grammar
@@ -2683,6 +2727,7 @@ Severity × likelihood; **R1 is the one the brief explicitly asked about.**
 | — | *(R18 progress, 2026-07, "Key Transparency consistency proofs" pass — Mitigated, not fully Closed):* the cross-time consistency-proof gap the row above named is now closed — real `GET /transparency/consistency?first=m&second=n`, live-verified against a real running log including a genuine fork/equivocation test (see the Phase 1/3 entries below for the full write-up, including a real soundness question this pass's own adversarial testing raised and resolved: the math authenticates root CONTENT consistency, not the numeric size label — that binding is a separate, still-not-built Signed-Tree-Head mechanism). **Not done:** independent monitors/gossip, client-side (`apps/web`) verification wiring, the STH signature itself, reserved/verified namespaces. | | | | |
 | — | *(R18 progress, 2026-07, "Signed Tree Head" pass — Mitigated, not fully Closed):* the STH signature gap the row above named is now closed — real Ed25519-signed `(size, root, timestamp)` via `GET /transparency/sth`, live-verified against a real running log (see the Phase 3 entry below for the full write-up, including the honest "signing alone doesn't prevent equivocation, it makes it DETECTABLE" framing this pass states plainly). **Not done:** independent monitors/gossip (the piece that actually USES a captured STH for detection), client-side (`apps/web`) verification wiring, reserved/verified namespaces. | | | | |
 | — | *(R18 progress, 2026-07, "KT gossip/monitor" pass — Mitigated, not fully Closed):* the "independent monitors/gossip" gap the row above named is now closed AS A MECHANISM — `workers/messaging/scripts/kt-monitor.mts` persists its own STH history independently of the server and alarms on equivocation/shrink/rewritten-history, live-verified with 3 real alarm scenarios plus a real growth scenario driven by an actual mined PoW + alias registration (see the Phase 3 entry below). **Not done, and this is the load-bearing gap:** actual THIRD-PARTY deployment — running this from a separately-controlled account/machine/schedule against the public prod endpoint is what makes equivocation detection real rather than theoretical; a single operator running their own monitor against their own log proves the code, not the trust property. Also still not done: client-side (`apps/web`) verification wiring, reserved/verified namespaces. | | | | |
+| — | *(R18 progress, 2026-07, "reserved/verified namespaces" pass — R18's last named "Not done" item, now closed):* `POST /alias/reserve` + a `registrant_sig` requirement on `handleRegister` mean a reserved name needs BOTH real PoW and an offline namespace-authority Ed25519 signature to claim — live-verified with 10 real checks (direct) + 2 (OHTTP) including the key regression that ordinary names are completely unaffected (see the Phase 3 entry below). R18 now has no remaining item marked "Not done" across any of its progress notes except the still-open client-side (`apps/web`) verification wiring for R18's OTHER sub-features (KT consistency/STH), which this pass didn't touch. | | | | |
 | R19 | **Self-doxxing** — a human-chosen public alias is a persistent identifier the *user* exposes | Low | High | Default invisible; explicit opt-in warning; recommend pairing with an ephemeral persona (K2); never auto-suggest real-name aliases | 3,4 |
 | **R20** | **Session capability was in `localStorage`** — JS-readable, so any XSS or malicious extension with DOM access could trivially steal a live bearer credential authorising `/queue` etc. | High | Closed | **Mitigated 2026-07** (Plane Bridge pass): moved to in-memory React state only, never persisted; reload loses the session by design. Open follow-up: a real "remember this device" UX (if ever added) needs a non-extractable key (WebCrypto non-exportable `CryptoKey` / platform keystore), not Web Storage | 2 |
 | **R21** | **`/auth/session` accepted a fixed, shared valid ZK proof vector, not one generated live from the client's own Semaphore witness** — the mock circuit's public inputs never changed, so every client presented the *same* proof. | High | Closed | **Resolved 2026-07 (server side — see docs/06's "Real Semaphore v4" and "R21-continued" entries below).** `/auth/session` now verifies a REAL Semaphore v4 proof (official circuit, real LeanIMT+Poseidon root in `MerkleTreeDO`) against public inputs built from the CALLER's own `(merkleRoot, nullifier, message, scope)`, with `merkleRoot` additionally checked against the tree's actual current root. `VK_HEX` is now the OFFICIAL PSE multi-party trusted-setup ceremony key ("Semaphore V4 Ceremony 1", 300-400+ contributors, finalized 2024-09-05) — not a local single-party test setup. Live-verified against the official artifacts: a genuinely different proof/root/nullifier per request, replay/stale-root/tampered-proof all correctly rejected, both natively (arkworks) and inside the live Workers WASM runtime. **Not independently re-verified:** the full multi-party ceremony transcript (per-contribution hash chain / beacon replay) — only the published end result's file integrity and structural/cryptographic correctness against our circuit. | 2 |

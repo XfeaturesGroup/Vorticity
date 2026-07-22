@@ -828,6 +828,9 @@ async function dispatchBhttpRequest(env: Env, req: BhttpRequest): Promise<CoreRe
   if (req.method === "POST" && req.path === "/alias/revoke") {
     return coreAliasRequest(env, "revoke", "POST", req);
   }
+  if (req.method === "POST" && req.path === "/alias/reserve") {
+    return coreAliasRequest(env, "reserve", "POST", req);
+  }
   // R12 cloud-backup OHTTP-wrapped path: "this real IP is uploading/fetching/deleting THIS backup
   // ID" is at least as sensitive as the alias-route metadata wrapped above (arguably more —
   // repeated GETs of the same ID directly fingerprint a returning device across sessions), so it

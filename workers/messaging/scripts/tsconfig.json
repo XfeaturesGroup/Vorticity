@@ -7,5 +7,12 @@
     "moduleResolution": "Bundler",
     "noEmit": true
   },
-  "include": ["kt-monitor.mts", "../src/sth.ts", "../src/merkleConsistency.ts", "../src/ktHash.ts", "../src/kt-sth-key.ts"]
+  "include": [
+    "kt-monitor.mts",
+    "namespace-authority.mts",
+    "../src/sth.ts",
+    "../src/merkleConsistency.ts",
+    "../src/ktHash.ts",
+    "../src/kt-sth-key.ts"
+  ]
 }
