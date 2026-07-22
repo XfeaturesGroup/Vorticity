@@ -73,8 +73,302 @@ bands, not calendar promises.
   real symmetry bugs found and fixed while building the Sparse PQ Ratchet, and live-verification
   results — the crypto-core module itself (`ratchet.rs`) lives here in Phase 1's scope; kept the
   detailed write-up in one place rather than duplicating it across two phase sections.
-- **Still to implement:** **MLS** wrapper (`mls-rs`), **bLSAG ring sigs**, **Argon2id/BIP39 backup**.
-  VOPRF DLEQ proof (Phase 2 spike, per docs/03 §2).
+- **Done (2026-07, "R12: Argon2id/BIP39 backup" pass) — closes the crate-side half of R12
+  ("Key-loss / recovery").** New module `backup.rs` (`client-full`-gated at `lib.rs` — the whole
+  module is new, unlike previous passes that just added a `dep:` to an existing gate), implementing
+  docs/03 §11's pipeline literally: 32-byte caller-supplied entropy → BIP39 (`bip39` crate) → 24-word
+  phrase → BIP39's own standard seed derivation (PBKDF2-HMAC-SHA512) → 64-byte seed → Argon2id
+  (`argon2` crate, `hash_password_into` — used as a raw KDF, not the crate's PHC-string
+  password-hashing API) at the spec's own stated params (m=256MiB, t=3, p=1) → 32-byte master key →
+  AES-256-GCM (`aes-gcm` crate) encrypt/decrypt of arbitrary local state. `bip39`/`argon2`/`aes-gcm`
+  added to `client-full`'s dependency list (never linked into `edge-verify-only` — confirmed via
+  `cargo tree`, same plane-separation check every prior pass runs). Real ecosystem API checked by
+  reading each crate's actual source in the local registry cache BEFORE writing code (`Params::new`'s
+  argument order, `Mnemonic::parse_normalized`/`to_seed_normalized`, `Aes256Gcm` needing the crate's
+  `aes` feature flag) — avoided guessing wrong signatures. Entropy is caller-supplied, not drawn from
+  an internal RNG, matching `kem.rs`'s established "seed-threaded" convention. The Argon2id salt is a
+  FIXED, domain-separated constant (not random) — deliberately, not an oversight: see `backup.rs`'s
+  header comment for why a fixed salt is correct when the thing being stretched is already a
+  high-entropy BIP39 seed rather than a low-entropy human password.
+  **Verified two ways, not just typed:** `cargo test` (54/54 crate-wide, up from 45 — 9 new, covering
+  round-trip, phrase/entropy determinism, wrong-phrase and wrong-key rejection, GCM tamper detection,
+  fresh-nonce-per-call) AND a separate Node probe against the actual COMPILED `pkg/client` WASM (not
+  just native Rust) exercising all four `wasm-bindgen` exports end-to-end — same real-vs-mock
+  discipline this doc's other entries hold themselves to. Real, observed Argon2id cost on this
+  machine inside the actual WASM binary: **~485 ms per derivation** — comfortably under the "flag if
+  1-2s" threshold this project has used elsewhere, so not flagged as a UX concern; noted as a real
+  number, not assumed. `edge-verify-only` still builds clean (both with and without `issuer-full`)
+  and `cargo tree` confirms none of the three new deps (nor `ml-kem`/`x25519-dalek`/`kem`) appear in
+  that profile.
+  **Honest scope, stated plainly:** this closes the CRATE half only — no `apps/web` UI wiring (a
+  "generate/enter recovery phrase" screen, wiring `backup_export`/`backup_import` to actual local
+  state serialization) and no live browser/mobile verification of Argon2id's real memory behavior at
+  256 MiB inside a constrained WASM linear memory (this pass's own native + Node tests are
+  unconstrained-memory environments, not a mobile browser) — both explicitly out of this pass's
+  scope (crate-only, per the task's own boundary) and worth a dedicated follow-up before relying on
+  this for a real user-facing recovery flow.
+- **Done (2026-07, "real MLS group encryption" pass) — closes the crate-core half of the "MLS
+  wrapper" item below (R7's own progress note above this phase already flagged the gap this
+  closes).** New module `group.rs`, `MlsGroupSession` (`client-full`-gated), built on `openmls`
+  0.8.1 + `openmls_rust_crypto` — a real, decision-recorded choice over the AWS `mls-rs`
+  alternative (see Cargo.toml's own comment for the full reasoning): neither has a confirmed
+  third-party audit, but openmls's dedicated `openmls-wasm` package and CI wasm32 build target were
+  a stronger WASM-maturity signal, and its RustCrypto-backed provider builds on the SAME
+  `curve25519-dalek`/`ml-kem` family this crate already trusts elsewhere — a familiar, not novel,
+  trust surface at the primitive level. **This was a genuine user decision, not a default this
+  session picked alone** — asked explicitly given the real, disclosed audit-status uncertainty on
+  BOTH candidate libraries, and a documented pure-Rust alternative (fan a group message out over N
+  already-audited-adjacent pairwise Triple Ratchet sessions, zero new crypto dependency, real O(N)
+  cost) was also on the table and explicitly declined in favor of real MLS.
+  **A real ciphersuite gap found by actually running the code, not assumed from reading dependency
+  lists:** the original intent was the X-Wing hybrid (ML-KEM-768 + X25519) ciphersuite, matching
+  this crate's PQ-hybrid commitment for 1:1 (`kem.rs`) — `hpke-rs-rust-crypto`'s source confirms
+  X-Wing support exists in the ecosystem, but the FIRST test run against `openmls_rust_crypto`
+  0.5.1 panicked: X-Wing isn't wired through its own `OpenMlsCrypto` implementation yet. Fell back
+  to `MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519` (openmls's own official example's
+  ciphersuite, chosen for maximum confidence of real end-to-end support). **Real, disclosed
+  consequence: group messages are NOT post-quantum-resistant with the current provider, unlike 1:1
+  messages** — a genuine gap from this project's own hybrid-PQ ambition, not swept under the rug.
+  **`libcrux-provider` (the other in-tree crypto backend, which DOES wire up X-Wing) was
+  investigated and rejected**: it pulls `rayon` (real-thread data-parallelism) into the dependency
+  graph, meaningless-to-risky on `wasm32-unknown-unknown` (no OS threads by default) — confirmed via
+  `cargo build --target wasm32-unknown-unknown` comparison between the two providers before deciding,
+  not assumed.
+  **Architecture:** openmls's own state model (a storage-provider keystore + a reloadable `MlsGroup`
+  handle) doesn't fit this crate's usual pure-function style, so `MlsGroupSession` follows
+  `ratchet.rs`'s `RatchetSession` precedent instead — a `#[wasm_bindgen]` class, opaque state handle,
+  `exportState`/`importState` for persistence (length-prefixed binary framing of the provider's
+  key-value store, mirroring openmls's own `examples/large-groups.rs` persistence approach
+  structurally, different encoding). `GroupDO.ts` (workers/messaging) needed **zero changes** —
+  confirmed, not assumed: Commit and Application messages are both just opaque bytes to it, exactly
+  matching its pre-existing "blind ordering, can't tell a Commit from an Application message" design
+  claim. A Welcome message (delivered to the new member only, never broadcast per RFC 9420)
+  deliberately does NOT go through `GroupDO` at all — documented in that file's header as needing the
+  existing 1:1 `QueueDO` infrastructure instead, not built in this pass.
+  **A second real bug found by running the code:** `StagedWelcome::new_from_welcome` failed "No
+  ratchet tree available to build initial tree after receiving a Welcome message" until
+  `use_ratchet_tree_extension(true)` was set on group creation — without it, nothing ships the tree
+  structure a joiner needs at all. Fixed, not worked around.
+  **A third real (and correctly scoped) finding:** a tamper-rejection test panicked under plain
+  `cargo test` (debug profile) — traced to openmls's OWN `debug_assert!(false, "Ciphertext
+  decryption failed")` in its AEAD-open failure path, a no-op in release builds (what `wasm-pack`
+  and this crate's own `[profile.release]` actually ship). Confirmed the same test passes clean
+  under `cargo test --release` — an upstream debug-only artifact, not a bug in this module.
+  **Verified two ways:** `cargo test --release --features client-full,issuer-full` — 59/59 (crate-
+  wide, up from 54; 5 new: 2-member create/add/Welcome/join/bidirectional-application-message round
+  trip, distinct-ciphertext-per-call, export/import state survival, an outsider's unrelated group
+  correctly failing to process another group's ciphertext, tamper rejection). AND a separate live
+  Node probe against the actual COMPILED `pkg/client` WASM (not native Rust) driving the exact same
+  Alice/Bob flow end-to-end through the real wasm-bindgen boundary — group creation, real Commit+
+  Welcome (707B/811B), real join, bidirectional real encrypted messages, distinct ciphertext for
+  identical plaintext, state export/import survival (8771B exported session), and tamper rejection —
+  all confirmed working through the actual browser-shipped artifact, not just its Rust source.
+  `edge-verify-only` (with and without `issuer-full`) still builds clean for `wasm32-unknown-unknown`
+  and `cargo tree` confirms `openmls`/`rayon` (and the pre-existing `ml-kem`/`x25519-dalek`/`kem`)
+  remain absent from that profile — plane separation holds with the new dependency tree too.
+  **Honest scope, stated plainly:** this closes the CRYPTO CORE only. Not done: `apps/web` UI/state
+  wiring (create/join a group, persist a live `MlsGroupSession` across reloads, route a Welcome to
+  the right `QueueDO`), member removal / self-update tested only implicitly (not a dedicated live
+  test in this pass), no PQ ciphersuite (stated above), and bLSAG ring signatures remain untouched
+  (a separate, previously-investigated-and-declined item — see the nazgul-crate rejection note
+  earlier in this doc).
+- **Done (2026-07, "bLSAG ring signatures" pass) — the last remaining Phase 1 `todo!()` skeleton is
+  closed.** `ring.rs` had been a literal `todo!()` since Phase 0 (docs/03 §5, "anonymous authorship").
+  Real, standard linkable ring signature (Liu-Wei-Wong LSAG, the same shape used pre-CLSAG by Monero)
+  over Ristretto255 — zero new Cargo dependencies (curve25519-dalek/sha2 were already unconditional
+  deps; the per-signature randomness reuses the SAME `getrandom` 0.2 `client-full`-only source
+  `symmetric.rs`'s AEAD nonce already draws from). Key image (linkability tag)
+  `I = x_pi · H_p(ctx)` — deliberately keyed by a caller-supplied CONTEXT (meant to be
+  `group_id‖epoch`, per docs/03's own framing), not the signer's own pubkey as Monero's permanent key
+  image does, so the SAME signer gets the SAME tag only within one epoch's context and an unrelated
+  one the next epoch — exactly the "spam-linkable within an epoch, unlinkable across epochs" property
+  docs/03 §5 asks for. `sign` is `client-full`-gated (needs the secret scalar); `verify` is
+  unconditional (needs no secret, reveals nothing about which member signed) — same "verification is
+  edge-safe" precedent as `zk.rs`/`blind_sig.rs`/`alias_sig.rs`.
+  **Crate-core scope only, matching this codebase's own established precedent** (kem.rs, oprf.rs,
+  backup.rs, group.rs all landed crate-only first): `GroupDO`/`apps/web` wiring — deciding what "the
+  ring" is for a real MLS group (converting each member's MLS Ed25519 credential into a Ristretto
+  keypair, vs. a separate parallel keypair per member) — is deliberately NOT decided here, left open
+  for whenever this gets connected to a live group rather than guessed at.
+  **Verified two ways:** `cargo test --release --features client-full,issuer-full` — 72/72
+  (crate-wide, up from 59; 13 new: round-trip for every signer position in a 5-member ring, a
+  non-member's signature correctly rejected, tampered message/ring rejected, same-signer-same-epoch
+  linkability, same-signer-different-epoch unlinkability, different-signers-different-key-images,
+  fresh-randomness-per-call (same key image, different `c0`), out-of-range-index/undersized-ring
+  rejected, malformed-length inputs rejected without panicking, and an independent algebraic
+  cross-check — not just calling this module's own `verify` — that the signer's solved `s` value
+  reconstructs an `alpha`-consistent `(L,R)` pair under both bases, confirming the ring-closing math
+  is exact, not coincidentally accepted). `edge-verify-only` still builds clean for
+  `wasm32-unknown-unknown` and `cargo tree` confirms `ml-kem`/`x25519-dalek`/`kem`/`openmls`/`rayon`
+  remain absent from that profile (only the pre-existing unconditional curve25519-dalek/sha2 are
+  used). AND a separate live Node probe against the actual COMPILED WASM — BOTH `pkg/client`
+  (client-full) and `pkg/msg` (edge-verify-only) — confirming `pkg/msg` exports `ring_verify` but
+  genuinely has NO `ring_sign`/`ring_generate_keypair` at all (not just "unused"), that the SAME real
+  signature verifies identically through both compiled profiles, that a tampered message/signature
+  byte/wrong-epoch-context is rejected by the edge build specifically, and that the linkability/
+  unlinkability properties hold through two independent real signing calls (not just asserted from
+  the Rust-side unit tests).
+  **Honest scope, stated plainly:** no fuzzing/side-channel hardening (same deferral as the rest of
+  this crate, see below); no `GroupDO`/UI wiring (stated above); this crate treats `ctx` as an opaque
+  byte string, so which layer computes/rotates the actual `group_id‖epoch` encoding is future work.
+- **Done (2026-07, "Key Transparency consistency proofs" pass) — R18 progress, `workers/messaging`
+  side: closes the specific residual gap the earlier "Key Transparency (K8)" pass's own header
+  comment named** ("no RFC 6962 'consistency proof'... a server that controls the only copy of the
+  log could in principle still fork it for one victim without those additional pieces"). New module
+  `workers/messaging/src/merkleConsistency.ts` (pure TS/bigint, no new dependency): `mth`/
+  `consistencyProof`/`verifyConsistency`, RFC 6962 §2.1.1/§2.1.2's actual recursive definitions.
+  **A real design pitfall found by reading `@zk-kit/lean-imt`'s own `insert()` source before writing
+  anything, not assumed:** a live tree's node matrix MUTATES in place (a "carried up unchanged" lone
+  node gets overwritten once a later insertion gives it a real sibling), so this module always
+  recomputes `MTH(...)` from the raw ordered leaf-hash list for whichever exact prefix size is asked
+  for, rather than reusing `KeyTransparencyDO`'s cached `LeanIMT` node matrix, which would silently
+  return TODAY's subtree value instead of history's.
+  **A real soundness question found by this module's OWN brute-force adversarial testing (not
+  assumed correct from the algorithm's description), investigated rather than papered over:** an
+  exhaustive sweep first flagged `verifyConsistency(m, n_wrong, rootM, root_of_the_REAL_n, proof)` as
+  accepting — traced to the fact that RFC 6962 consistency proofs authenticate that root_m's CONTENT
+  is a genuine prefix of root_n's content, and deliberately do NOT independently authenticate the
+  numeric size label attached to root_n (real Certificate Transparency binds `(tree_size, root_hash)`
+  via a separate Signed-Tree-Head signature, outside the Merkle math entirely) — not a bug. Confirmed
+  by the test that actually matters for K8's threat model: two trees sharing an identical prefix then
+  diverging (a real fork) — a proof from one fork correctly fails to verify against the other fork's
+  root at the same (m,n), which is the actual equivocation-detection property this feature exists
+  for. Documented as an explicit, load-bearing scope note in the module's own header comment rather
+  than silently "fixed" into a non-standard variant.
+  New unauthenticated `GET /transparency/consistency?first=m&second=n` (matches `/root`/`/latest/
+  :key`/`/proof/:seq`'s existing openness — this is the public audit log), rate-limited per
+  `(first,second)` pair via the pre-existing `RateGateDO` `/check` primitive (`CONSISTENCY_RATE_
+  LIMIT_PER_EPOCH = 20`, same "cheap check before expensive work" reasoning as `/membership/
+  proof/:commitment`'s existing rate gate — this recomputes `MTH` over up to `second` leaves per
+  call, materially more expensive than `/proof/:seq`'s O(log n) cached path).
+  **Verified live, real running `wrangler dev`, not simulated:** appended 25 real entries to a fresh
+  `KeyTransparencyDO`, then for seven `(first,second)` pairs (including non-power-of-two boundaries
+  like (5,13), (13,25)) independently reconstructed the leaf list via the pre-existing public
+  `/proof/:seq` route (not by reading DO internals) and confirmed the live endpoint's `firstRoot`/
+  `secondRoot`/`proof` matched an independent recomputation byte-for-byte, and that
+  `merkleConsistency.verifyConsistency` accepts the live proof while rejecting a tampered proof
+  entry and swapped roots for every pair tested. Confirmed 400 on `first=0`, `first>=second`,
+  `second` beyond the log's current size, and non-numeric input; confirmed the 429 rate limit fires
+  on repeated requests for one `(first,second)` pair while a different pair's first request is
+  unaffected (per-key isolation, same discipline as this file's other rate-gated routes).
+  **Durability checked separately, same discipline as this DO's earlier passes:** killed the live
+  `wrangler dev` process outright and started a completely fresh one against the same on-disk
+  state — `/transparency/root` and `/transparency/consistency?first=13&second=25` both returned
+  byte-identical results with zero new writes, confirming the log's persistence, not just a warm
+  process's memory. `tsc --noEmit` and `schema-lint` both clean (no schema changes — this reads the
+  existing `kt_entries` table, no new columns/tables).
+  **Honest scope:** still no independent monitors/gossip, no client-side (`apps/web`) verification
+  wiring, no RFC 6962-style Signed Tree Head (the piece that WOULD authenticate the numeric size
+  label — see the soundness-question note above) — this pass closes the consistency-proof MATH and
+  its live wiring specifically, matching K8's own "Mitigated, not Closed" framing.
+- **Done (2026-07, "Signed Tree Head" pass) — R18 progress: closes the exact residual gap the
+  previous pass's own header comment named** ("no RFC 6962-style Signed Tree Head — the piece that
+  WOULD authenticate the numeric size label"). New module `workers/messaging/src/sth.ts`: signs
+  `(size, root, timestamp)` with Ed25519 via `node:crypto` (this Worker already opts into
+  `nodejs_compat`, same precedent `KeyTransparencyDO.ts`'s own `createHash` usage established) —
+  deliberately NOT vortic-core/WASM, since this is a pure server-side signing operation with no
+  client-side counterpart to keep in the same language, unlike `alias_sig.rs` (which needs the SAME
+  sign/verify pair runnable from a browser). Ed25519 via `node:crypto` needs no digest-algorithm
+  argument (`sign(null, message, key)`) — the hash is built into the signature scheme itself.
+  **Stated plainly, matching this module's own header comment: signing alone does not make the log
+  incapable of equivocating** — a dishonest operator could still sign two DIFFERENT roots for the
+  SAME size and hand one to each of two observers. What it provides is DETECTABILITY: a captured STH
+  becomes a durable, non-repudiable, independently-checkable statement, so two such STHs compared
+  later (by gossip/monitoring — still not built, see below) constitute cryptographic proof of
+  misbehavior. This is the same role an STH plays in real Certificate Transparency.
+  New keypair: real Ed25519 (`node:crypto` `generateKeyPairSync`, one-time offline generation, same
+  "generate once, private half to `.dev.vars`, public half committed" precedent as the RSABSSA
+  issuer keypair) — private PKCS8 PEM in `env.KT_STH_SIGNING_KEY_PEM` (`.dev.vars`, gitignored;
+  `wrangler secret put` in prod), public SPKI PEM committed in new `src/kt-sth-key.ts` (keyed by
+  `kid`, same rotation-ready lookup-table shape as `issuer-keys.ts`). New unauthenticated
+  `GET /transparency/sth` (matches this log's existing openness — a public, verifiable commitment is
+  the whole point). No rate limit added: this call has the same cost as `/root` (cached-tree read,
+  one Ed25519 sign), which itself carries none.
+  **A real, non-cryptographic bug found and fixed during this pass, not swept under the rug:**
+  `.dev.vars` stores the PKCS8 PEM as a single line with `\n` escapes rather than a literal
+  multi-line quoted value — NOT because the literal-multiline form (which `workers/enrollment`'s
+  pre-existing `ISSUER_SIGNING_KEY_PEM` already uses) is actually broken, but because this pass's own
+  live testing was confused for a while by a genuinely unrelated problem: a STALE `wrangler dev`
+  process from an earlier testing session had NOT been killed by `pkill -f "wrangler dev"` on this
+  Windows/Git-Bash setup and kept answering on the same port with stale bundled code, making every
+  new env var (not just this one — a plain unrelated test var showed the same symptom) appear to
+  silently not exist. Diagnosed by testing on a brand-new, never-used port, which resolved
+  immediately — recorded here so a future session doesn't waste time re-diagnosing the same
+  red herring, and the `\n`-escaped format was kept afterward anyway since it was already confirmed
+  working end-to-end and sidesteps any future doubt about literal-newline `.dev.vars` parsing.
+  **Verified two ways:** a standalone round-trip test confirmed the REAL `.dev.vars` private key and
+  the REAL committed `kt-sth-key.ts` public key are a genuine matching pair (not two independently
+  generated keys that happen to both exist), plus tamper rejection on every field (size, root,
+  timestamp, signature byte), wrong-public-key rejection, malformed-input handling without throwing,
+  and confirmed Ed25519 signing is deterministic (same inputs sign identically twice — a real,
+  checkable property, not assumed). **Live, real running `wrangler dev`:** `GET /transparency/sth`
+  returns a real signature whose `(size, root)` matches `/root` exactly; independently verified
+  against the committed public key; every tampered field rejected; two successive fetches with no
+  intervening appends report the identical `(size, root)` but a genuinely fresh signature each time
+  (not a cached response). **Durability checked separately, same discipline as this DO's other
+  passes:** killed the live process and started a completely fresh one against the same on-disk
+  state — the reported root/size were byte-identical to before the restart, and a freshly-signed STH
+  against that persisted state still verified correctly.
+  **Honest scope:** no gossip/gossip-gap detection, no independent monitors comparing STHs from
+  different vantage points, no `apps/web` client-side verification wiring, no MaxMergeDelay/freshness
+  policy beyond the raw `timestamp` field itself — this pass is the signing/verification primitive
+  and its live wiring only, matching this doc's "Mitigated, not Closed" framing for R18's remaining
+  pieces.
+- **Done (2026-07, "Argon2id hardened PoW" pass) — R16 progress: `pow.rs` gets the SECOND `Hpow`
+  option docs/03 §8.3 names** (`SHA-256 baseline | Argon2id hardened: memory-hard, botnet/GPU-
+  resistant`) — only the SHA-256 mode existed before this pass. Same stamp grammar
+  (`ver:alg:bits:epoch:resource:salt:counter`), same validity predicate
+  (`leading_zero_bits(Hpow(stamp)) >= bits`); only `alg` becomes `"argon2id"` and `Hpow` becomes an
+  Argon2id hash. New `mint_argon2id`/`pow_mint_argon2id` (client-full) — **added as a SEPARATE
+  function, not a parameter on the existing `mint`/`pow_mint`**, specifically to avoid touching a
+  REAL live caller found by checking first, not assumed absent: `apps/web/src/workers/
+  powMiner.worker.ts` already calls `pow_mint` with its existing 4-argument signature. `verify`
+  (unconditional) now dispatches on the stamp's own declared `alg`, accepting either — a backward-
+  compatible generalization, not a breaking change (an existing `"sha256"` stamp verifies
+  identically to before).
+  **A real parameter-choice judgment call, stated plainly:** `backup.rs`'s existing Argon2id usage
+  (m=256 MiB) is docs/03 §11's spec for stretching an already-high-entropy secret ONCE — completely
+  wrong for a function that must run up to ~2^bits times per mint. This pass picks much lighter
+  params (m=4 MiB, t=1, p=1) — still genuinely memory-hard relative to SHA-256's zero memory cost,
+  but fast enough to mint in real time — and MEASURES the actual cost rather than assuming a number:
+  a single Argon2id call at these params took **~2.66ms natively** (release profile); a full
+  `mint_argon2id` search at a 9-bit target took **~1.33s** natively (found at counter 583, close to
+  the 2^9=512 expected average) — both printed and recorded here, not guessed. Exact bit targets
+  for real register/write/resolve-class difficulty under THIS param set are NOT decided in this
+  pass (that's DO-wiring judgment, out of scope here) — but the real cost-per-attempt number now
+  exists to base that decision on, where none did before.
+  **`argon2` moved from a `client-full`-only optional dependency to an UNCONDITIONAL one**
+  (`Cargo.toml`) so `verify` can compute an Argon2id digest at the edge too — same "verification is
+  edge-safe" reasoning `ed25519-dalek`/`blind-rsa-signatures` already established for their own
+  moves. `backup.rs`'s own `client-full`-gated module and behavior are completely unaffected; only
+  the Cargo-level dependency gate moved. `bip39`/`aes-gcm` (backup.rs's other two deps) stay
+  `client-full`-only, confirmed via `cargo tree`.
+  **Verified two ways:** `cargo test --release --features client-full,issuer-full` — 77/77
+  (crate-wide, up from 72; 5 new: argon2id mint/verify round-trip, wrong-resource/insufficient-bits
+  rejection, a cross-alg test proving `verify` genuinely re-hashes under the stamp's OWN declared
+  alg rather than always checking one hash regardless of label, and the two timing measurements
+  above). `edge-verify-only` still builds clean for `wasm32-unknown-unknown`; `cargo tree` confirms
+  `argon2` is now (correctly, intentionally) PRESENT in that profile while `ml-kem`/`x25519-dalek`/
+  `kem`/`openmls`/`rayon`/`bip39`/`aes-gcm` remain absent — the plane-separation invariant holds
+  with the new unconditional dependency too. AND a separate live Node probe against the actual
+  COMPILED WASM, both `pkg/client` and `pkg/msg`: confirmed `pkg/msg` exports `pow_verify` but
+  genuinely has NEITHER `pow_mint` NOR `pow_mint_argon2id` at all (mint stays client-only in both
+  modes); a real WASM-mined 8-bit argon2id stamp (111ms, found at counter 66) verified identically
+  through BOTH compiled profiles; the pre-existing SHA-256 path was re-run through the real WASM
+  unchanged (3ms at 16 bits) to confirm it's genuinely unaffected, not just unchanged in the diff;
+  relabeling a real argon2id stamp's `alg` field to `"sha256"` correctly fails edge verification
+  (proving the digest is genuinely re-derived per the declared alg, not cached/reused); malformed/
+  unrecognized-alg input rejected without throwing.
+  **Honest scope, stated plainly, matching this module's own pre-existing precedent for the
+  SHA-256 mode:** this crate-level `argon2id` mode is NOT wired into `AliasDO.ts`'s production
+  verifier (`workers/messaging/src/pow.ts`, checked directly — still hardcodes
+  `alg !== "sha256"` as a rejection), nor into any adaptive-difficulty or per-action bit-target
+  policy. That is separate, later DO-side wiring work, consistent with how every other Phase 1
+  primitive in this crate (kem, oprf, backup, group, ring) landed crate-core first.
+- **Still to implement (crate-core):** none remaining from this doc's original Phase 1 primitive
+  list — VOPRF DLEQ (Phase 2 Airlock pass), MLS (real MLS group encryption pass), Argon2id/BIP39
+  backup, bLSAG ring sigs, and now Argon2id-hardened PoW are all landed. Remaining Phase 1 work is
+  UI/DO wiring (named per primitive above) and the hardening item below, not a missing primitive.
 - WASM boundary fuzzing + NIST ML-KEM KATs; constant-time & `zeroize` audit — deferred (explicitly out of
   scope for this pass; current tests are correctness-only, not fuzz/side-channel hardened).
 - **Exit:** interop tests green (two clients ratchet PQ messages, form an MLS group, rotate epochs); backup
@@ -483,6 +777,193 @@ bands, not calendar promises.
   **Live-verified:** 25 sequential requests against one real commitment → first 20 return 200, the next 5
   return 429 with a clear error message; a second, different real commitment's first request returns 200
   unaffected by the first commitment's counter (confirms per-key isolation, not a global limit).
+- **Done (2026-07, "capability-issuance rate limit" pass) — closes the still-TODO gap the previous
+  pass's own comment flagged.** `POST /auth/session` had NO rate gate at all: the nullifier-spend
+  check (the only replay guard) ran AFTER the ~0.8 s Groth16 pairing verify (R1), so replaying the
+  same `(proof, nullifier)` pair forced a full expensive re-verification on every resend before ever
+  reaching the cheap check that would reject it — a real amplification path, not just a missing nice-
+  to-have. Reused the exact same `RateGateDO` `/check` primitive the proof-rate-limit pass built,
+  `key = "session:" + nullifier`, `limit = 5` per epoch, checked right after the (already-existing)
+  cheap `merkleRoot` staleness check and before the pairing verify — same "cheap check before
+  expensive work" ordering this function already used once. **Live-verified** (fresh local
+  `wrangler dev`, stale `.wrangler` D1/DO state cleared first per this doc's own convention): 5
+  attempts with a fixed nullifier all reached the real pairing check (`zk_verify_groth16_bytes ->
+  false`, 401); the 6th and 7th were rejected with 429 *before* that log line ever printed — proof the
+  short-circuit actually fires pre-verification, not just post-hoc; a different nullifier's first
+  attempt still reached the pairing check unaffected (401, not 429) — confirms per-key isolation, same
+  discipline as the `/proof` rate-limit test. `tsc --noEmit` clean, `schema-lint` clean (no schema
+  changes).
+- **Done (2026-07, "adaptive resolve difficulty" pass) — R15/R16 progress: `/alias/resolve` no
+  longer charges a flat 20-bit PoW price regardless of how hot a target is.** Real gap closed: a
+  scraper could hammer ONE known/guessed alias arbitrarily many times per epoch at the same flat
+  cost — R15's own mitigation column ("adaptive/per-target difficulty") was still unimplemented.
+  `AliasDO.ts` gained `adaptiveResolveBits(lookupKey)`: reuses the exact `RateGateDO` `/check`
+  counter primitive the `/proof` and capability-issuance rate limits already established (its own
+  header comment explicitly anticipated more callers), but instead of hard-blocking at a limit, the
+  running per-epoch attempt count for that ONE `lookup_key` raises the required bits —
+  `20 + floor((count-1)/5)`, capped at 28 — so the counter is bumped and the new bar computed BEFORE
+  spending any work verifying the stamp (an under-difficulty probe still pushes the bar up, not a
+  free look at the old price). Fails toward the MAX difficulty (not the base) if `RateGateDO` is
+  unreachable — falling back to the cheapest price on that failure would make "make RateGateDO
+  unreachable" a perverse incentive, caught during design, not after.
+  **Live-verified** (fresh local `wrangler dev`, real mined stamps via the compiled `pkg/client`
+  WASM's `pow_mint`, no shortcuts): attempts 1-5 against one real registered alias, each with a
+  fresh real 20-bit stamp, all succeed; attempt 6 with a 20-bit stamp is rejected (403, message
+  correctly states "required 21 bits"); the SAME attempt retried with a real 21-bit stamp succeeds;
+  a different, never-touched `lookup_key`'s first attempt still only needs 20 bits (per-key
+  isolation, not a global counter) — confirmed by a 404 (alias genuinely doesn't exist) rather than
+  a 403 (PoW bar was never the blocker for it). `tsc --noEmit` clean, `schema-lint` clean (no schema
+  changes — the counter reuses `RateGateDO`'s existing table).
+  **Honest scope:** deliberately resolve-only, per R15's specific enumeration/scraping framing —
+  `/register` and `/introduce` keep their flat bit costs. R16's other named mitigations (memory-hard
+  Argon2id PoW option, off-thread client miner) are untouched by this pass.
+- **Done (2026-07, "incremental tree cache" pass) — closes the R23-follow-up COST NOTE
+  (`MerkleTreeDO`'s own header comment flagged this as "the first place to look if latency becomes a
+  problem").** `/root`, `/insert`, and `/proof/:commitment` used to rebuild the ENTIRE LeanIMT from
+  scratch (n Poseidon2 hashes) on every single call. Fixed using `@zk-kit/lean-imt`'s OWN
+  `tree.export()`/`LeanIMT.import()` (serialize/deserialize without recomputing any hash) and its
+  incremental `tree.insert(leaf)` (O(log n)) — reused verbatim, not reimplemented, matching this
+  file's own "use the reference implementation, don't rewrite it" precedent from the original R21
+  pass. A new `tree_cache` DO-internal SQLite row (`{size, exported}`) is the source of truth for a
+  warm cache; `loadTreeForSize(n)` imports it when the recorded size matches the current commitment
+  count, else falls back to the original full rebuild (a size mismatch — should be unreachable in
+  normal single-threaded DO operation — is logged, not silently papered over). `/insert` loads the
+  PRE-insert cached state BEFORE writing the new commitment row (loading after would double-count the
+  just-written row when the cache-miss fallback re-reads the table), calls `.insert()`, then persists
+  the updated state — detects a genuinely-new vs. idempotent-retry insert via `SqlStorageCursor
+  .rowsWritten` on the `INSERT OR IGNORE`, so a retried request touches neither the tree nor the
+  cache. `handleProof` also switched from a hand-rolled linear scan for the leaf index to the
+  library's own `tree.indexOf()`.
+  **Live-verified, real end-to-end, not simulated:** four REAL commitments redeemed through the full
+  RSABSSA chain (`workers/enrollment`'s real `/token/issue` against the real committed issuer
+  keypair, no shortcuts) and inserted one at a time — after EVERY insert, the Worker's reported
+  `merkleRoot`/`size` were compared against an INDEPENDENTLY built reference tree (same
+  `@zk-kit/lean-imt`+`poseidon-lite` packages, a completely separate in-script tree, not reusing
+  `MerkleTreeDO`'s code) and matched byte-for-byte all 4 times — the same "parity-verified"
+  discipline the original R21 pass established. `GET /proof/:commitment` checked for BOTH the last
+  (non-first — the regression case that actually exercises sibling paths) and first member, index/
+  siblings/root all matching the reference tree exactly. **Durability, not just correctness, checked
+  separately:** killed the live `wrangler dev` process outright and started a completely fresh one
+  against the SAME on-disk state (no rebuild-from-D1, no reseeding) — a brand-new DO instance,
+  READ-ONLY (zero new inserts), correctly served all 4 commitments' proofs with the exact same root
+  as before the restart, proving `tree_cache` genuinely persisted to durable storage rather than
+  just staying warm in a live process's memory. Real observed timings, not claimed as a rigorous
+  before/after benchmark: post-restart cached proof calls ran **4.7-9.6ms** (first call 62.9ms,
+  cold-start overhead). `tsc --noEmit` clean, `schema-lint` clean (`tree_cache` is DO-internal
+  SQLite, same non-D1-migrated situation this file's own header comment already documents for
+  `commitments`/`nullifiers`).
+  **Honest gap:** no adversarial test deliberately corrupted the cache to exercise the size-mismatch
+  fallback path live (only reasoned through and code-reviewed) — the fallback logic is a straight
+  reuse of the pre-existing rebuild code path, low-risk, but not itself live-fired in this pass. No
+  formal before/after latency benchmark at the "thousands of members" scale the original cost note
+  named as the threshold to worry about — this pass proves correctness and a real durability
+  property, not a quantified performance claim at scale.
+- **Done (2026-07, "Key Transparency (K8)" pass) — R18 progress: `alias_pub` bindings are now a
+  publicly-auditable, append-only log, not just a mutable live table.** Real gap closed: before this,
+  nothing stopped a compromised/malicious `AliasDO` from silently telling different askers different
+  keys for the same nickname (equivocation) — no witness of what was ever published, and no way for
+  an outside observer to catch a lie. New `KeyTransparencyDO` (`workers/messaging`, new DO class +
+  wrangler.toml migration `v4`): every `AliasDO` register/revoke event is appended as a leaf in a
+  REAL Merkle tree over SHA-256 (`@zk-kit/lean-imt` — the SAME official library `MerkleTreeDO`
+  already uses for the Semaphore tree, reused again, not reimplemented), using the exact incremental-
+  cache technique the "incremental tree cache" pass above just established (`tree.export()`/
+  `LeanIMT.import()`/`tree.insert()`, a `kt_tree_cache` row) — this pass is a direct beneficiary of
+  that one, not a coincidence of timing. Leaf preimage is domain-separated and position-bound
+  (`vortic-kt-v1:{event}:{lookup_key}:{alias_pub}:{seq}`) so even a content-identical event (e.g. two
+  revokes back to back) never collides on the same leaf. `AliasDO.ts`'s `handleRegister`/
+  `handleRevoke` AWAIT the append (a deliberate difference from `MerkleTreeDO`'s fire-and-forget D1
+  mirror: here the log genuinely must stay in lock-step with the live table or the whole point of
+  auditability breaks) but don't hard-fail the parent operation on a log outage — logged loudly
+  instead, since a real alias register/revoke doesn't depend on the log for ITS OWN correctness.
+  Three new public, unauthenticated GET routes (`/transparency/root`, `/transparency/latest/:key`,
+  `/transparency/proof/:seq`) — deliberately open, matching `/membership/proof/:commitment`'s own
+  reasoning: hiding a transparency log behind a capability defeats the point of a log anyone can
+  independently audit. `/append` itself has no public route — only `AliasDO` can write, via the
+  internal DO binding.
+  **A real toolchain gap hit and fixed, not glossed over:** `LeanIMT`'s hash function must be
+  SYNCHRONOUS, but Workers' only native SHA-256 (`crypto.subtle.digest`) is async-only — solved with
+  `node:crypto`'s synchronous `createHash` (this Worker already opts into `nodejs_compat` in
+  `wrangler.toml`, so it's available at runtime), which needed `@types/node` added as a **dev-only**
+  dependency (zero runtime/bundle footprint) plus `"node"` added to `tsconfig.json`'s `types` array
+  for it to typecheck — Cloudflare's own documented pattern for this exact combination, not an ad hoc
+  workaround.
+  **Live-verified, real end-to-end, fresh `wrangler dev`:** registered a real alias (real PoW, real
+  Ed25519 `alias_pub`) — `/transparency/latest` correctly showed a `register` event at seq 1, and its
+  inclusion proof matched an INDEPENDENTLY built reference tree (separate script, separate
+  `createHash` calls, not reusing `KeyTransparencyDO`'s code) byte-for-byte. Revoked it (real
+  signature) — `/latest` correctly flipped to a `revoke` event at seq 2 with an empty `aliasPub`.
+  **The append-only property itself was checked, not just asserted:** fetched entry #1's proof AGAIN
+  after the tree had grown to size 2 — the returned root, index, and siblings had genuinely changed
+  (correctly reflecting the bigger tree) yet still independently verified against the reference tree,
+  proving old entries stay provably included as the log grows, not just present. Re-registered the
+  SAME nickname under a DIFFERENT identity after the revoke — succeeded (proving revoke really freed
+  it in `AliasDO`'s live table) and produced a THIRD log entry, correctly becoming the new `/latest`
+  for that lookup_key. An untouched nickname correctly 404s. **Durability checked separately, same
+  discipline as the tree-cache pass above:** killed the live `wrangler dev` process and started a
+  completely fresh one against the same on-disk state — `/transparency/root` and `/transparency/
+  proof/1` returned byte-identical results with zero new writes, confirming `kt_tree_cache` truly
+  persisted rather than living only in a warm process's memory. `tsc --noEmit` clean, `schema-lint`
+  clean (added `KEY_TRANSPARENCY_DO` to `PLANE_FORBIDDEN_BINDINGS.enrollment` proactively, matching
+  every other Messaging-only DO already listed there).
+  **A real test-script bug caught and fixed before being reported as a finding, not silently
+  worked around:** an early re-registration attempt after revoke returned 409 and looked like a real
+  bug (alias not actually freed) — traced to the TEST SCRIPT reusing the same deterministic PoW salt
+  for both registration attempts of the same nickname, so `pow_mint` reproduced the byte-identical
+  stamp and tripped the (correct, pre-existing) stamp-replay guard before ever reaching the alias-
+  registration check. Fixed by varying the salt between calls; not a `KeyTransparencyDO`/`AliasDO`
+  bug. Recorded so it isn't mistaken for a resolved product bug later.
+  **Honest scope, stated plainly (this is "Mitigated," not "Closed" — see R18's own risk-register
+  row):** no RFC 6962 cross-time consistency proofs (a structural proof that an OLDER root is a
+  genuine prefix of a NEWER one, independent of any single leaf's inclusion proof — the piece that
+  would let an auditor catch a log that forked for one victim without needing to already trust this
+  operator's current root), no independent monitors/gossip between separate observers, and no
+  `apps/web` client-side verification wiring (fetch a proof, check it locally, compare against a
+  cached tree head) — this pass is the append-only log and inclusion-proof machinery only, a real
+  precondition for those, not a substitute.
+- **Done (2026-07, "server-side bucketing" pass) — R7 progress: closes a gap this doc had implicitly
+  assumed was already handled.** docs/03 §6 (Sealed Sender++) point 4 says plainly: "constant-size
+  envelopes via length padding to power-of-two buckets; timestamps bucketed server-side." Checked
+  before writing anything, not assumed: `grep` across `QueueDO.ts`/`GroupDO.ts`/`ConvLogDO.ts` showed
+  EVERY one of them stored and returned a raw `Date.now()` — no server-side timestamp bucketing
+  existed anywhere in this codebase, despite R22's "Sealed Sender++" closure covering points 2/3
+  (pairwise transport, padded/delayed/decoupled receipts) but never actually landing point 4. Worse:
+  `QueueDO`'s existing `size_bucket` field was CLIENT-DECLARED and never validated against the real
+  ciphertext length — a lying or buggy client could claim any bucket, silently defeating the padding.
+  New shared `bucketing.ts`: `bucketTimestamp` (floor to a 1-minute boundary, tunable) and
+  `validateSizeBucket` (real check: ciphertext length must fit `(2^(b-1), 2^b]` for declared bucket
+  `b`, not just "some number the client typed").
+  **A real design decision made and documented, not the obvious default:** bucketing happens AT
+  WRITE TIME (before the row is ever persisted), not only when a response is formatted. docs/02's
+  PRIMARY adversary A2 is the host itself — "reads all D1/R2/DO state" — so bucketing only at
+  response time would protect against nothing that adversary actually does; it would only raise cost
+  for a weaker, secondary adversary (a passive network observer). Real TTL/eviction timing (`QueueDO`)
+  still uses the UNBUCKETED real clock internally — only the `enqueued_at` value that gets stored and
+  exposed is coarsened, so scheduling correctness is unaffected.
+  Applied to `QueueDO.ts` (real `validateSizeBucket` check added to `/push`, replacing the previous
+  trust-the-client behavior), `GroupDO.ts` (gained a `size_bucket` column via the same guarded-`ALTER
+  TABLE` migration pattern `AliasDO.ts`'s `alias_pub` column established, plus a wire-format change —
+  `blobs` becomes `{blob, sizeBucket}[]` per entry, since a group batch can genuinely mix different
+  real message sizes, unlike `QueueDO`'s one-ciphertext-per-call shape; verified beforehand that no
+  client code calls this route yet, so this is a clean addition, not a breaking change to a live
+  caller), and `ConvLogDO.ts` (timestamp bucketing ONLY — the original D1 schema for `conv_log` never
+  had a `size_bucket` column, so this pass doesn't invent a padding requirement CRDT op-log entries
+  were never designed to carry).
+  **Live-verified, real `wrangler dev`, all three DOs:** `QueueDO` — a correctly-bucketed 32-byte
+  push (bucket 5) succeeds; the SAME ciphertext declared as bucket 8 (way oversized) rejects with
+  400; declared as bucket 4 (too small to actually fit 32 bytes) also rejects with 400 — both
+  directions of the lie are caught, not just one; a pulled message's `enqueuedAt` is confirmed to be
+  an exact multiple of 60000ms AND the correct floor of the real push instant (not just "some"
+  multiple of 60000). `GroupDO` — a batch with one honest and one lying entry rejects the WHOLE
+  batch (no partial-write inconsistency); a correct batch succeeds and `/sync` reflects both the
+  stored `sizeBucket` and a correctly-bucketed `enqueuedAt`. `ConvLogDO` — append + sync confirms
+  `enqueuedAt` is bucketed and, deliberately, carries no `sizeBucket` field at all. `tsc --noEmit`
+  clean, `schema-lint` clean (no D1 migrations touched — these are DO-internal SQLite columns, same
+  non-D1-migrated situation this codebase already documents elsewhere for `commitments`/`nullifiers`).
+  **Honest scope:** `QueueDO`'s `expires_at`/TTL-eviction clock is deliberately real-time, unbucketed
+  (state precisely above) — flagged so a future reader doesn't "fix" it into using the coarsened
+  value and silently break eviction timing. Optional cover traffic (K6, R7's other named mitigation)
+  is untouched by this pass. The 1-minute bucket granularity is a judgment call, not a value derived
+  from a specific traffic-analysis threshold — reasonable default, not a proven-optimal one.
 - **Done (2026-07, "R25: real OHTTP" pass) — closes R25: the OHTTP Relay was never implemented, only
   stub comments (`index.ts`, `wrangler.toml`) claiming it existed "in production."** README calls this
   "load-bearing, not cosmetic" — without it Cloudflare sees the real client IP on every anonymity-zone
@@ -1947,6 +2428,49 @@ bands, not calendar promises.
   one-time action but worth knowing before assuming it's always fast. The inbox's "handled" set is
   local-device-only, same honest scope as the rest of `lib/chatList.ts` — declining/accepting on one
   device doesn't sync that decision to another of the user's own linked devices.
+- **Done (2026-07, "signed alias revoke" pass) — R18 progress: `alias_pub` signed ownership +
+  revoke are now real, closing the "a nickname can never be freed, not even by its own owner" gap.**
+  `alias_pub` moves from bundled-inside-`record` to also being a plaintext `AliasDO` column
+  (populated at register time) — no new privacy leak (a bare Ed25519 key has no structural link to
+  a nickname/identity, same property the bundled copy already had). New `vortic-core` module
+  `alias_sig.rs` (unconditionally compiled, unlike `ratchet.rs` which is `client-full`-only): `sign`
+  (client-only, reuses the SAME long-term identity key `ratchet.rs` derives for PQXDH prekey
+  signing — not a second keypair) + `verify` (edge-safe, no secret). `ed25519-dalek` moved from a
+  `client-full`-optional dep to always-compiled, same precedent as `blind-rsa-signatures`/
+  `ark-groth16` ("verification is edge-safe, link it unconditionally, gate only the secret-key
+  calls"). New `AliasDO.ts` route `POST /revoke {lookup_key, sig}`: verifies the signature against
+  the row's stored `alias_pub` over a canonical `revoke_message(lookup_key)`, then deletes the row —
+  no separate nonce needed (a captured signature only ever authorizes revoking the SAME
+  (lookup_key, alias_pub) pairing it was made under; see `alias.rs`'s doc comment for the full
+  argument). Wired through both the direct `/alias/*` route (already capability-gated) and the
+  OHTTP-wrapped path, matching register/resolve/introduce.
+  **A real bug found by this pass's own negative test, not assumed in advance:** plain
+  `ed25519_dalek::Verifier::verify` (cofactored) accepted an all-zero 32-byte "public key" paired
+  with an all-zero 64-byte "signature" as valid for ANY message — the well-known Ed25519 identity-
+  point/zero-signature malleability. Real exposure here specifically: `alias_pub` is CLIENT-SUPPLIED
+  at registration (the server never derives it), so an attacker could register a row with a
+  deliberately degenerate key. Fixed by switching to `verify_strict` (ed25519-dalek's own documented
+  mitigation for exactly this class of signature malleability) — reused, not hand-rolled, per this
+  crate's standing rule. A legitimately derived `identity_verifying_key(seed)` can never BE the
+  degenerate point (RFC 8032 clamping keeps the signing scalar non-zero), so this only ever rejects
+  deliberately-malformed input.
+  **Live-verified, real WASM, real `wrangler dev` (no browser needed — this is a Worker-API-only
+  change, not UI):** a Node probe using the actual compiled `pkg/client` WASM (not a mock) drove 5
+  cases against a fresh local instance — real-owner revoke succeeds (204) and the row is genuinely
+  gone (replay → 404); a WRONG identity's signature is rejected (401); revoking a nonexistent alias
+  → 404; a malformed (wrong-length) signature → 400; and, the one most worth checking explicitly,
+  the REJECTED wrong-key revoke did NOT delete the row — confirmed by resolving it afterward and
+  getting the original record back byte-for-byte. `cargo test` 45/45 (crate-wide, up from 40 — 8 new
+  in `alias_sig.rs`/`alias.rs`), `edge-verify-only` still builds clean for `wasm32-unknown-unknown`
+  and `cargo tree` confirms `ml-kem`/`x25519-dalek`/`kem` remain absent from that profile (only
+  `ed25519-dalek` newly joined it, as intended). `tsc --noEmit` and `schema-lint` both clean.
+  **Honest scope:** update-in-place is NOT implemented (revoke + re-register under a fresh PoW
+  stamp covers the same outcome, deliberately kept smaller — see `alias.rs`'s doc comment); reserved/
+  verified namespaces and Key Transparency (K8) over alias→key remain open, per R18's own row.
+  Pre-existing `AliasDO` instances (created before this pass) get the new `alias_pub` column via a
+  guarded `ALTER TABLE` on next wake-up, but any row registered before this pass has an empty
+  `alias_pub` and simply can't be revoked until its owner re-registers — not a live concern yet
+  (pre-beta, no real registered aliases exist outside local dev testing).
 
 ## Phase 5 — Hardening & audit (M)
 - External crypto + appsec audit; trusted-setup ceremony (if Groth16); binary/circuit transparency (K7);
@@ -1976,18 +2500,27 @@ Severity × likelihood; **R1 is the one the brief explicitly asked about.**
 | R4 | **Trusted setup (Groth16)** compromise / ceremony risk | High | Low | Multi-party ceremony w/ public transcript, **or** switch to transparent-setup PLONK/Halo2 (decide in Phase 2 spike) | 2,5 |
 | R5 | **Single-host concentration** — Cloudflare is host *and* primary adversary; also a censorship/availability SPOF | High | Med | Confidentiality/anonymity are cryptographic (host-independent); track relay/P2P diversification for availability (post-v1) | 5,6 |
 | R6 | **WASM size/perf** on mobile (ML-KEM+MLS+Groth16 prover) | Med | Med | Lazy-load prover; code-split; wasm-opt; native Capacitor crypto for hot paths | 1,4 |
-| R7 | **MLS DS metadata** — delivery service still sees ordering/size/epoch | Med | High | Blind ordering only; pad sizes; bucket timestamps; pairwise-queue isolation; documented in N1 | 3 |
+| **R7** | **MLS DS metadata** — delivery service still sees ordering/size/epoch | Med | High | Blind ordering only; pad sizes; bucket timestamps; pairwise-queue isolation; documented in N1 | 3 |
+| — | *(R7 progress, 2026-07, "server-side bucketing" pass — Mitigated, not fully Closed):* real size-bucket validation + server-side timestamp bucketing now exist for `QueueDO`/`GroupDO`/`ConvLogDO` — see the Phase 3 entry below. **Not done:** optional cover traffic (K6). | | | | |
+| — | *(R7 progress, 2026-07, "real MLS group encryption" pass):* the actual MLS crypto core now exists (`MlsGroupSession`, Phase 1 entry above) — `GroupDO`'s blind-ordering design confirmed to need zero changes to carry real Commit/Application messages. **Not done:** `apps/web` wiring (no group is created/joined by a real user yet), PQ ciphersuite for groups (real, disclosed gap — see the Phase 1 entry), Welcome delivery plumbing over `QueueDO`. | | | | |
 | R8 | **Sealed Sender residual leak** (receipts/traffic analysis) | Med | Med | Sealed++ (padded/delayed/decoupled receipts), queue isolation, optional chaff (K6) | 3 |
 | R9 | **PQC library immaturity** (no CMVP-validated WASM ML-KEM yet) | Med | Med | Hybrid (classical still protects if PQ lib flawed); pin audited versions; track AWS-LC/OpenSSL 3.5 maturity | 1,5 |
 | R10 | **DO 10 GB shard / hot-shard limits** | Low | Med | Per-conversation sharding; TTL-evict delivered ciphertext to R2; backpressure | 3 |
 | R11 | **Enrollment Sybil** via multiple OAuth accounts | Med | Med | PPID quota per `sub`; invite-only closed network; per-epoch nullifier rate limits | 2 |
-| R12 | **Key-loss / recovery** without linkage is hard UX | Med | High | Recovery phrase + optional blind cloud backup; clear "no phrase = no recovery" contract | 1,4 |
+| **R12** | **Key-loss / recovery** without linkage is hard UX | Med | High | Recovery phrase + optional blind cloud backup; clear "no phrase = no recovery" contract | 1,4 |
+| — | *(R12 progress, 2026-07, "Argon2id/BIP39 backup" pass — Mitigated, not fully Closed):* the crypto pipeline is real and live-WASM-verified — see the Phase 1 entry above. **Not done:** `apps/web` UI (generate/enter phrase, wire to real local state), optional blind cloud backup to R2, live browser/mobile Argon2id-at-256MiB memory verification. | | | | |
 | R13 | **Legal compulsion** of Cloudflare | High | Low | "Can't produce what we can't compute": design ensures no email↔handle data exists to hand over; warrant-canary | all |
 | R14 | **CDN/circuit swap** (malicious WASM) | Med | Low | Reproducible builds, binary transparency, client-side circuit-hash pinning (K7) | 5 |
-| R15 | **Alias directory enumeration/scraping** — public aliases reintroduce a discoverable namespace | Med | Med | PoW-per-resolve + encrypted records (dump is inert) + capability gate; adaptive/per-target difficulty; opt-in & default-off | 3 |
-| R16 | **PoW asymmetry** — botnet/GPU/ASIC mint stamps far cheaper than honest mobiles; or bits set too high hurt UX | Med | Med | Memory-hard Argon2id option; adaptive per-target bits; capability gate bounds actors to real accounts; tune bands; off-thread miner | 3,5 |
+| **R15** | **Alias directory enumeration/scraping** — public aliases reintroduce a discoverable namespace | Med | Med | PoW-per-resolve + encrypted records (dump is inert) + capability gate; adaptive/per-target difficulty; opt-in & default-off | 3 |
+| **R16** | **PoW asymmetry** — botnet/GPU/ASIC mint stamps far cheaper than honest mobiles; or bits set too high hurt UX | Med | Med | Memory-hard Argon2id option; adaptive per-target bits; capability gate bounds actors to real accounts; tune bands; off-thread miner | 3,5 |
+| — | *(R15/R16 progress, 2026-07, "adaptive resolve difficulty" pass — Mitigated, not fully Closed):* per-target adaptive PoW bits for `/alias/resolve` are real and live-verified — see the Phase 3 entry below. **Not done:** the Argon2id memory-hard PoW option, off-thread/worker-thread client miner, adaptive difficulty on `/register`/`/introduce` (scoped to resolve only, per R15's specific enumeration-scraping angle). | | | | |
+| — | *(R16 progress, 2026-07, "Argon2id hardened PoW" pass — Mitigated, not fully Closed):* the memory-hard Argon2id `Hpow` option the row above named is now real and live-verified (crate-core, both native and real compiled WASM, both build profiles) — see the Phase 1 entry above for the full write-up, including real measured costs (~2.66ms/hash at m=4MiB,t=1,p=1) rather than assumed ones. **Not done:** off-thread/worker-thread client miner for this mode specifically, wiring into `AliasDO.ts`'s production verifier or any adaptive-difficulty policy (checked directly: `workers/messaging/src/pow.ts` still only accepts `alg==="sha256"`), and choosing real per-action bit targets under the new param set. | | | | |
 | R17 | **Host offline dictionary attack** on `AliasDO` dump (nicknames are low-entropy) | Med | Med | Documented residual (aliases are public by intent); high-entropy nickname advice; **identity-linkage stays cryptographically safe** — record holds no email/PPID/handle | 3 |
-| R18 | **Nickname squatting / impersonation** | Low | Med | Registration PoW + capability; `alias_pub` signed ownership; reserved/verified namespaces; report+revoke; Key Transparency (K8) over alias→key | 3,5 |
+| **R18** | **Nickname squatting / impersonation** | Low | Med | Registration PoW + capability; `alias_pub` signed ownership; reserved/verified namespaces; report+revoke; Key Transparency (K8) over alias→key | 3,5 |
+| — | *(R18 progress, 2026-07, "signed alias revoke" pass — Mitigated, not fully Closed):* `alias_pub` signed ownership + revoke are now real — see the entry below. **Not done:** reserved/verified namespaces, update-in-place (revoke + re-register covers the same outcome for now). | | | | |
+| — | *(R18 progress, 2026-07, "Key Transparency (K8)" pass — Mitigated, not fully Closed):* an append-only, publicly-auditable log of every register/revoke event now exists — see the Phase 3 entry below. **Not done:** RFC 6962-style cross-time consistency proofs, independent monitors/gossip, client-side verification wiring, reserved/verified namespaces. | | | | |
+| — | *(R18 progress, 2026-07, "Key Transparency consistency proofs" pass — Mitigated, not fully Closed):* the cross-time consistency-proof gap the row above named is now closed — real `GET /transparency/consistency?first=m&second=n`, live-verified against a real running log including a genuine fork/equivocation test (see the Phase 1/3 entries below for the full write-up, including a real soundness question this pass's own adversarial testing raised and resolved: the math authenticates root CONTENT consistency, not the numeric size label — that binding is a separate, still-not-built Signed-Tree-Head mechanism). **Not done:** independent monitors/gossip, client-side (`apps/web`) verification wiring, the STH signature itself, reserved/verified namespaces. | | | | |
+| — | *(R18 progress, 2026-07, "Signed Tree Head" pass — Mitigated, not fully Closed):* the STH signature gap the row above named is now closed — real Ed25519-signed `(size, root, timestamp)` via `GET /transparency/sth`, live-verified against a real running log (see the Phase 3 entry below for the full write-up, including the honest "signing alone doesn't prevent equivocation, it makes it DETECTABLE" framing this pass states plainly). **Not done:** independent monitors/gossip (the piece that actually USES a captured STH for detection), client-side (`apps/web`) verification wiring, reserved/verified namespaces. | | | | |
 | R19 | **Self-doxxing** — a human-chosen public alias is a persistent identifier the *user* exposes | Low | High | Default invisible; explicit opt-in warning; recommend pairing with an ephemeral persona (K2); never auto-suggest real-name aliases | 3,4 |
 | **R20** | **Session capability was in `localStorage`** — JS-readable, so any XSS or malicious extension with DOM access could trivially steal a live bearer credential authorising `/queue` etc. | High | Closed | **Mitigated 2026-07** (Plane Bridge pass): moved to in-memory React state only, never persisted; reload loses the session by design. Open follow-up: a real "remember this device" UX (if ever added) needs a non-extractable key (WebCrypto non-exportable `CryptoKey` / platform keystore), not Web Storage | 2 |
 | **R21** | **`/auth/session` accepted a fixed, shared valid ZK proof vector, not one generated live from the client's own Semaphore witness** — the mock circuit's public inputs never changed, so every client presented the *same* proof. | High | Closed | **Resolved 2026-07 (server side — see docs/06's "Real Semaphore v4" and "R21-continued" entries below).** `/auth/session` now verifies a REAL Semaphore v4 proof (official circuit, real LeanIMT+Poseidon root in `MerkleTreeDO`) against public inputs built from the CALLER's own `(merkleRoot, nullifier, message, scope)`, with `merkleRoot` additionally checked against the tree's actual current root. `VK_HEX` is now the OFFICIAL PSE multi-party trusted-setup ceremony key ("Semaphore V4 Ceremony 1", 300-400+ contributors, finalized 2024-09-05) — not a local single-party test setup. Live-verified against the official artifacts: a genuinely different proof/root/nullifier per request, replay/stale-root/tampered-proof all correctly rejected, both natively (arkworks) and inside the live Workers WASM runtime. **Not independently re-verified:** the full multi-party ceremony transcript (per-contribution hash chain / beacon replay) — only the published end result's file integrity and structural/cryptographic correctness against our circuit. | 2 |

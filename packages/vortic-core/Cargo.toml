@@ -18,7 +18,14 @@ client-full = [
     "dep:chacha20poly1305",
     "dep:base64",
     "dep:getrandom",
-    "dep:ed25519-dalek",
+    "dep:bip39",
+    "dep:aes-gcm",
+    "dep:openmls",
+    "dep:openmls_traits",
+    "dep:openmls_basic_credential",
+    "dep:openmls_rust_crypto",
+    "dep:js-sys",
+    "dep:serde_json",
 ]
 # Edge builds (Cloudflare Workers) must be able to compile WITHOUT linking any decryption or
 # proving code — this is the crate-level enforcement of docs/03 crypto invariant #4 ("the edge
@@ -60,6 +67,29 @@ ark-groth16 = { version = "0.6.0", default-features = false }
 # reasoning as ark-bn254/ark-groth16 above. `default-features = false` drops its `serde` feature
 # (unneeded; we hand-roll the wasm-bindgen byte contract like every other module here).
 blind-rsa-signatures = { version = "0.17.2", default-features = false }
+# Always-compiled in BOTH profiles (R18, 2026-07): Ed25519 sign+verify for alias-ownership actions
+# (alias_sig.rs). `Verifier::verify` needs no secret and must run on the edge — AliasDO checks a
+# revoke signature against the plaintext `alias_pub` column without ever holding the owner's signing
+# key — same "verification is edge-safe" reasoning as ark-bn254/blind-rsa-signatures above, and the
+# same crate ratchet.rs already used for PQXDH prekey-bundle signing (client-full only, unaffected —
+# only this Cargo-level dependency gate moved, ratchet.rs's own module stays client-full-gated at
+# lib.rs). `Signer::sign` (the secret-key half) is only ever CALLED from client-full-gated code
+# (alias_sig::sign, ratchet.rs) — linking the crate unconditionally doesn't expose it at the edge,
+# same distinction blind-rsa-signatures already draws between "linked" and "callable".
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc", "zeroize"] }
+# Always-compiled in BOTH profiles (R16, 2026-07): Argon2id-hardened PoW (`pow.rs`'s `argon2id` stamp
+# algorithm alongside the existing SHA-256 Hashcash one) — memory-hard, botnet/GPU-resistant, per
+# docs/03 §8.3's own named `Hpow` alternative. Moved out of the `client-full`-only set `backup.rs`
+# originally added it under: `pow::verify` must remain edge-safe (same "verification is edge-safe"
+# reasoning as ed25519-dalek/blind-rsa-signatures above) and now needs to compute an Argon2id digest
+# too, not just SHA-256 — `backup.rs`'s own usage (key derivation, `client-full`-gated at the MODULE
+# level in lib.rs) is completely unaffected by this dependency-gate move, since it never touched
+# `edge-verify-only`'s dependency set either way; only the Cargo-level `dep:` gate moved. `default-
+# features = false` + `alloc`: same rationale as `backup.rs`'s existing usage (raw KDF via
+# `hash_password_into`, no RNG needed — PoW's own salt is also a fixed, domain-separated constant,
+# for the same class of reason: the varying `counter`/`salt` fields already live INSIDE the hashed
+# stamp string, so Argon2id's own salt parameter doesn't need to vary per call here either).
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 # blind-rsa-signatures pulls `rand 0.10` -> `getrandom 0.4` transitively (a DIFFERENT major version
 # than the `getrandom 0.2` below, which symmetric.rs's nonce uses — Cargo resolves both as distinct
 # crate instances; aliasing avoids a `[dependencies.getrandom]` key collision in this file). The
@@ -89,12 +119,43 @@ chacha20poly1305 = { version = "0.10", optional = true, default-features = false
 base64 = { version = "0.22", optional = true }
 getrandom = { version = "0.2", optional = true, features = ["js"] }
 
-# client-full only (R24): long-term device identity signing (docs/03 §1 "Long-term device: Ed25519 +
-# X25519 + ML-KEM") — authenticates PQXDH prekey bundles so the ratchet handshake isn't bare
-# unauthenticated DH. `Signer::sign` is deterministic per RFC 8032 (nonce derived from
-# SHA-512(seed) internally), so — same as every other client-full dep here — no RNG/getrandom
-# backend is needed for signing itself.
-ed25519-dalek = { version = "2", optional = true, default-features = false, features = ["alloc", "zeroize"] }
+# client-full only (R12): local-first E2EE backups (backup.rs), docs/03 §11. `bip39` for the
+# recovery-phrase <-> seed conversion (default features: `std` + `unicode-normalization`, needed to
+# validate/normalize a user-typed phrase per the BIP39 spec — English wordlist is built in, no
+# extra language feature needed). `argon2` moved to an unconditional dependency above (2026-07,
+# "Argon2id hardened PoW" pass) — see that entry's comment; `backup.rs`'s own usage is unaffected.
+# `aes-gcm`, same `alloc`-only shape as `chacha20poly1305` above (default features add a
+# `getrandom` wiring this crate doesn't need — the nonce is filled via the SAME
+# `getrandom::getrandom` call symmetric.rs already uses).
+bip39 = { version = "2", optional = true }
+aes-gcm = { version = "0.10", default-features = false, features = ["alloc", "aes"], optional = true }
+
+# client-full only: real MLS (RFC 9420) group encryption (group.rs). Chosen over the AWS `mls-rs`
+# alternative after investigating both — user decision, recorded here for the next reader: neither
+# has a confirmed third-party security audit, but openmls's `openmls-wasm` package + CI wasm32
+# build target (builds, though not test-run, on that target by the maintainers) is a stronger
+# WASM-maturity signal than mls-rs's own explicit "Experimental" label on its only WASM-viable
+# crypto backend. `openmls_rust_crypto` (not `libcrux-provider`, the other in-tree option) — verified
+# by actually building both `--target wasm32-unknown-unknown` before deciding: `libcrux-provider`
+# pulls `rayon` (real-thread data-parallelism, meaningless/risky on a target with no OS threads by
+# default) into the graph; `openmls_rust_crypto` does not, and is built on the SAME `RustCrypto`/
+# `curve25519-dalek` family this crate already depends on elsewhere (a familiar, not novel, trust
+# surface at the primitive level — the audit gap is in openmls's OWN protocol-state-machine code,
+# not in the elliptic-curve math it calls out to). `features = ["js"]` is REQUIRED for
+# wasm32-unknown-unknown (openmls has a hard `compile_error!` without it — needs browser
+# `crypto.getRandomValues`/`Date.now()` via `getrandom`'s js backend and `fluvio-wasm-timer`) —
+# openmls's own README calls enabling `js` in a *library* "strongly discouraged" because it forces
+# that backend even for non-web wasm targets (wasi etc.); this crate never targets those, so the
+# caveat doesn't apply here. Verified via `cargo build --release --target wasm32-unknown-unknown`
+# (not just `cargo check`) and `cargo tree --features edge-verify-only`: `openmls`/`rayon` are
+# absent from the edge-verify-only dependency graph — same plane-separation check every other
+# client-full-only dependency in this file already gets.
+openmls = { version = "0.8.1", default-features = false, features = ["js", "openmls_rust_crypto"], optional = true }
+js-sys = { version = "0.3.103", optional = true }
+serde_json = { version = "1.0.151", optional = true }
+openmls_traits = { version = "0.5.0", optional = true }
+openmls_basic_credential = { version = "0.5.0", optional = true }
+openmls_rust_crypto = { version = "0.5.1", optional = true }
 
 [dev-dependencies]
 ark-relations = { version = "0.6.0", default-features = false }

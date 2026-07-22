@@ -35,6 +35,7 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
 import { bufToBase64 } from "../base64";
+import { bucketTimestamp, validateSizeBucket } from "../bucketing";
 
 // The `[key: string]: SqlStorageValue` index signatures below are required by
 // `SqlStorage.exec<T extends Record<string, SqlStorageValue>>` — every row shape passed as the
@@ -137,9 +138,16 @@ export class QueueDO extends DurableObject<Env> {
     if (ciphertext.byteLength === 0) {
       return new Response("empty ciphertext", { status: 400 });
     }
+    // Real check that was previously missing (bucketing.ts's header comment): a lying/broken
+    // client could otherwise declare a bucket far bigger than its real ciphertext, silently
+    // defeating the padding this field exists to provide.
+    if (!validateSizeBucket(ciphertext.byteLength, sizeBucket)) {
+      return new Response(`ciphertext length ${ciphertext.byteLength} does not match declared size_bucket ${sizeBucket}`, { status: 400 });
+    }
 
     const now = Date.now();
-    const expiresAt = now + ttlMs;
+    const expiresAt = now + ttlMs; // real TTL clock — NOT bucketed, eviction timing must stay accurate
+    const bucketedEnqueuedAt = bucketTimestamp(now); // what's actually stored/exposed — see bucketing.ts
 
     const row = this.ctx.storage.sql
       .exec<SeqRow>(
@@ -148,7 +156,7 @@ export class QueueDO extends DurableObject<Env> {
          RETURNING seq`,
         ciphertext,
         sizeBucket,
-        now,
+        bucketedEnqueuedAt,
         expiresAt,
       )
       .one();
@@ -159,7 +167,7 @@ export class QueueDO extends DurableObject<Env> {
       seq: row.seq,
       ciphertext: bufToBase64(ciphertext),
       sizeBucket,
-      enqueuedAt: now,
+      enqueuedAt: bucketedEnqueuedAt,
     });
 
     return Response.json({ seq: row.seq }, { status: 201 });

@@ -15,3 +15,13 @@ SESSION_SIGNING_KEY="replace-with-a-long-random-hex-string"
 # next `GET /ohttp/keys` fetch, so a rotation briefly breaks in-flight encapsulations (acceptable —
 # this endpoint has no session state to preserve across a rotation).
 OHTTP_GATEWAY_SEED="replace-with-a-random-32-byte-hex-string"
+
+# Ed25519 PKCS8 PEM — KeyTransparencyDO's Signed Tree Head signing key (see src/sth.ts). Generate a
+# real one with: node -e "const c=require('node:crypto');const{publicKey,privateKey}=c.generateKeyPairSync('ed25519');console.log(privateKey.export({type:'pkcs8',format:'pem'}).toString().split(String.fromCharCode(10)).join('\\n'));console.log(publicKey.export({type:'spki',format:'pem'}))"
+# The PRIVATE half goes here; the PUBLIC half goes in the committed src/kt-sth-key.ts (safe to
+# commit — same reasoning as issuer-keys.ts's CURRENT_ISSUER_PK_PEM). Rotating this key means
+# updating BOTH this value and kt-sth-key.ts's KT_STH_KEYS table under a new `kid`. Uses `\n`
+# escapes on ONE line rather than a literal multi-line quoted value — `node:crypto`'s
+# `createPrivateKey` accepts either, and keeping it single-line sidesteps any local dotenv-parser
+# ambiguity around literal newlines inside a quoted `.dev.vars` value.
+KT_STH_SIGNING_KEY_PEM="-----BEGIN PRIVATE KEY-----\nreplace-with-a-real-generated-ed25519-pkcs8-key\n-----END PRIVATE KEY-----"

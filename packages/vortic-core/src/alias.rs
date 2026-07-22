@@ -43,13 +43,40 @@ pub fn derive_record_key(nickname: &str) -> [u8; 32] {
     out
 }
 
-// No `AliasOwnershipKey`/Ed25519 alias-key type here (the Phase-0 skeleton's TODO): this pass
-// reuses `ratchet::identity_verifying_key`/`identity_sign_bundle`/`identity_verify_bundle` instead
-// of inventing a parallel Ed25519 keypair type — same deterministic-from-seed pattern, already
-// wasm-bindgen-exported and tested, and `AliasDO.ts` itself doesn't verify any signature yet (no
-// signed update/revoke — see its own header comment), so `alias_pub` only needs to be BUNDLED into
-// the record for now, not cryptographically exercised server-side. A dedicated ownership-key type
-// is worth revisiting only once signed update/revoke lands.
+// No dedicated `AliasOwnershipKey` type here (the Phase-0 skeleton's TODO): `alias_pub` IS
+// `ratchet::identity_verifying_key(seed)`'s output — the same long-term identity key that signs
+// PQXDH prekey bundles, not a second parallel keypair. Sign/verify for ownership actions live in
+// `alias_sig.rs` (kept separate from this module so `verify` stays reachable from `edge-verify-only`
+// builds — `ratchet.rs` itself is `client-full`-only per lib.rs, since it also holds ratchet
+// decrypt state that must never link into the edge binary).
+//
+// R18 (2026-07, "signed alias revoke" pass): `AliasDO.ts` now stores `alias_pub` as a plaintext
+// column (populated at register time) and verifies a signature over `revoke_message` below before
+// deleting a row — closing the "no signed update/revoke" gap this comment used to flag. Update
+// (replacing a record's contents in place) is deliberately NOT implemented in this pass — revoke +
+// re-register (a fresh PoW stamp) covers the same outcome and keeps the change smaller; add it
+// later by reusing this exact signature mechanism with a different domain-separated message.
+
+/// Canonical message signed to authorize revoking a registered alias (R18). Domain-separated and
+/// bound to the exact `lookup_key` being revoked — not reusable against a different alias. No
+/// separate nonce/timestamp is needed: `AliasDO` verifies against whatever `alias_pub` is CURRENTLY
+/// stored for that `lookup_key`, so a captured signature only ever authorizes revoking the same
+/// (lookup_key, alias_pub) pairing it was made under — replaying it after a successful revoke just
+/// 404s (row gone), and replaying it after a DIFFERENT owner re-registers the same nickname fails
+/// the pubkey check outright (the new row's `alias_pub` differs).
+pub fn revoke_message(lookup_key: &[u8; 32]) -> Vec<u8> {
+    let mut msg = b"vortic-alias-revoke-v1".to_vec();
+    msg.extend_from_slice(lookup_key);
+    msg
+}
+
+#[wasm_bindgen]
+pub fn alias_revoke_message(lookup_key: &[u8]) -> Vec<u8> {
+    let Ok(key) = <[u8; 32]>::try_from(lookup_key) else {
+        return Vec::new();
+    };
+    revoke_message(&key)
+}
 
 #[wasm_bindgen]
 pub fn alias_lookup_key(nickname: &str) -> Vec<u8> {
@@ -86,6 +113,15 @@ mod tests {
         // if they did, `lookup_key` would double as an oracle for `derive_record_key`, defeating
         // the whole "the DO holds lookup_key -> ciphertext but cannot read the ciphertext" design.
         assert_ne!(rec_a, lookup_key("nightowl_42"));
+    }
+
+    #[test]
+    fn revoke_message_is_deterministic_and_lookup_key_sensitive() {
+        let key_a = lookup_key("nightowl_42");
+        let key_b = lookup_key("nightowl_43");
+        assert_eq!(revoke_message(&key_a), revoke_message(&key_a));
+        assert_ne!(revoke_message(&key_a), revoke_message(&key_b));
+        assert!(revoke_message(&key_a).starts_with(b"vortic-alias-revoke-v1"));
     }
 
     #[test]

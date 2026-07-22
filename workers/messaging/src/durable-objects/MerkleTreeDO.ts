@@ -22,16 +22,24 @@
 // computes; a fixed-depth or differently-hashed tree would never agree with the real circuit.
 // Superseded the earlier SHA-256-over-the-list placeholder (see git history) — that could never have
 // matched a real proof's public `merkleRoot` regardless of how correct the ZK verifier itself was.
-// Rebuilds the tree from the full commitment list on every query — simple and correct at this scale;
-// incrementally persisting tree state is a future optimization, not required for correctness.
-// COST NOTE (R23 follow-up, 2026-07 — flagged, not fixed): `/root`, `/insert`, and the new `/proof/:commitment`
-// (below) all pay this same O(n) Poseidon2-hashes-from-scratch cost per call, n = total commitment count.
-// Fine at the hundreds-of-members scale this pass was built/tested against; at thousands+ members this
-// rebuild-per-request pattern (now hit by proof requests too, not just insert/root) is the first place
-// to look if MerkleTreeDO latency becomes a problem — the fix would be incremental/cached tree state,
-// deliberately not built here since it wasn't yet a measured bottleneck. `/proof/:commitment` is
-// additionally per-commitment rate-limited at the `index.ts` route level (via `RateGateDO`) precisely
-// because it's unauthenticated AND pays this cost — see that route's comment.
+//
+// CACHING (2026-07, "incremental tree cache" pass — closes the COST NOTE below): `/root`, `/insert`,
+// and `/proof/:commitment` used to rebuild the ENTIRE tree from scratch (n Poseidon2 hashes) on
+// EVERY call, flagged in the R23-follow-up pass as "the first place to look if latency becomes a
+// problem." Fixed by persisting the tree's own serialized state (`tree.export()`/`LeanIMT.import()`
+// — both official `@zk-kit/lean-imt` methods, reused verbatim, not reimplemented) in a new
+// `tree_cache` row: `/root`/`/proof` now `import` the cached state (no hashing at all) when its
+// recorded `size` matches the current commitment count; `/insert` loads the PRE-insert cached state,
+// calls the library's own incremental `tree.insert(leaf)` (O(log n), not O(n)), then persists the
+// new state. A size mismatch (or no cache yet) falls back to the original full rebuild — this is a
+// perf optimization, not a new source of truth, so the fallback path must produce byte-identical
+// roots to the cached path; see the "incremental tree cache" pass's live-verification note in
+// docs/06 for the parity check that confirms this.
+// COST NOTE (R23 follow-up, 2026-07 — now resolved, see above): `/root`, `/insert`, and the
+// `/proof/:commitment` (below) used to pay an O(n) Poseidon2-hashes-from-scratch cost per call, n =
+// total commitment count. `/proof/:commitment` remains additionally per-commitment rate-limited at
+// the `index.ts` route level (via `RateGateDO`) since it's unauthenticated — that mitigation is
+// unrelated to this caching fix and stays in place regardless of how cheap a single call now is.
 // SCOPE (Phase 2 pass): commitments/nullifier tables are unchanged. The nullifier sets are real and
 // enforce one-spend semantics. Single global instance for now (addressed by "global"), like AliasDO.
 //
@@ -77,6 +85,11 @@ interface TokenNullRow {
   token_null: string;
   [key: string]: SqlStorageValue;
 }
+interface TreeCacheRow {
+  size: number;
+  exported: string;
+  [key: string]: SqlStorageValue;
+}
 
 export class MerkleTreeDO extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
@@ -95,7 +108,43 @@ export class MerkleTreeDO extends DurableObject<Env> {
         token_null TEXT PRIMARY KEY,
         spent_at   INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS tree_cache (
+        id       INTEGER PRIMARY KEY CHECK (id = 1),
+        size     INTEGER NOT NULL,
+        exported TEXT NOT NULL
+      );
     `);
+  }
+
+  private readonly hashFn = (a: bigint, b: bigint): bigint => poseidon2([a, b]);
+
+  // Loads the tree in the state it should be in when there are exactly `expectedSize` leaves —
+  // from the cache (no hashing at all) if the cache agrees with that size, else a full rebuild from
+  // the commitments table (same O(n) path this DO always used before the cache existed). A mismatch
+  // when a cache DOES exist is a real drift signal (should be unreachable in normal operation, since
+  // DO execution is single-threaded and every mutating path below keeps the cache in lock-step) —
+  // logged, not silently papered over, and the safe rebuild still produces a correct result either way.
+  private loadTreeForSize(expectedSize: number): LeanIMT<bigint> {
+    const cached = this.ctx.storage.sql.exec<TreeCacheRow>("SELECT size, exported FROM tree_cache WHERE id = 1").toArray()[0];
+    if (cached && cached.size === expectedSize) {
+      return LeanIMT.import<bigint>(this.hashFn, cached.exported, (v) => BigInt(v));
+    }
+    if (cached) {
+      console.warn(
+        `[MerkleTreeDO] tree cache size mismatch (cached ${cached.size}, expected ${expectedSize}) — rebuilding from the commitments table`,
+      );
+    }
+    const rows = this.ctx.storage.sql.exec<CommitmentRow>("SELECT commitment FROM commitments ORDER BY seq").toArray();
+    const leaves = rows.map((r) => hexToField(r.commitment));
+    return new LeanIMT<bigint>(this.hashFn, leaves);
+  }
+
+  private persistTreeCache(tree: LeanIMT<bigint>): void {
+    this.ctx.storage.sql.exec(
+      "INSERT INTO tree_cache (id, size, exported) VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET size = excluded.size, exported = excluded.exported",
+      tree.size,
+      tree.export(),
+    );
   }
 
   override async fetch(request: Request): Promise<Response> {
@@ -112,15 +161,12 @@ export class MerkleTreeDO extends DurableObject<Env> {
   }
 
   // Real Lean IMT root over Poseidon2, matching Semaphore v4's actual circuit — see this file's
-  // header comment. Rebuilt from the full commitment list each call (simple, correct; incremental
-  // persistence is a future optimization).
+  // header comment. Reads the cached tree state when available (no hashing at all); falls back to
+  // a full rebuild only on a cold/mismatched cache.
   private computeRoot(): string {
-    const rows = this.ctx.storage.sql
-      .exec<CommitmentRow>("SELECT commitment FROM commitments ORDER BY seq")
-      .toArray();
-    if (rows.length === 0) return EMPTY_TREE_ROOT;
-    const leaves = rows.map((r) => hexToField(r.commitment));
-    const tree = new LeanIMT((a: bigint, b: bigint) => poseidon2([a, b]), leaves);
+    const { n } = this.ctx.storage.sql.exec<CountRow>("SELECT COUNT(*) AS n FROM commitments").one();
+    if (n === 0) return EMPTY_TREE_ROOT;
+    const tree = this.loadTreeForSize(n);
     return fieldToHex(tree.root as bigint);
   }
 
@@ -131,22 +177,22 @@ export class MerkleTreeDO extends DurableObject<Env> {
   // sibling path here is expected protocol behavior, not an anonymity leak. No capability gating: this
   // is called BEFORE a session capability exists (the client needs this proof to even attempt
   // /auth/session in the first place), matching the existing openness of /root and /insert.
-  // Rebuilds the tree from the full commitment list, same as `computeRoot()` — see that method's
-  // comment on the cost tradeoff; this endpoint doesn't change the cost CLASS (already O(n) Poseidon2
-  // hashes per call before this endpoint existed), just adds one more caller that pays it.
+  // Loads the (usually cached) tree, same as `computeRoot()` — see that method's and this file's
+  // header comment on the caching. `LeanIMT.indexOf` is the library's own leaf lookup (not a second
+  // hand-rolled linear scan), so this no longer needs a separate SQL row scan to find the index.
   private handleProof(commitment: string): Response {
     if (!HEX64_RE.test(commitment)) {
       return new Response("commitment must be a 64-char lowercase hex (32-byte) value", { status: 400 });
     }
-    const rows = this.ctx.storage.sql
-      .exec<CommitmentRow>("SELECT commitment FROM commitments ORDER BY seq")
-      .toArray();
-    const leafIndex = rows.findIndex((r) => r.commitment === commitment);
+    const { n } = this.ctx.storage.sql.exec<CountRow>("SELECT COUNT(*) AS n FROM commitments").one();
+    if (n === 0) {
+      return new Response("commitment not found in the membership tree", { status: 404 });
+    }
+    const tree = this.loadTreeForSize(n);
+    const leafIndex = tree.indexOf(hexToField(commitment));
     if (leafIndex === -1) {
       return new Response("commitment not found in the membership tree", { status: 404 });
     }
-    const leaves = rows.map((r) => hexToField(r.commitment));
-    const tree = new LeanIMT((a: bigint, b: bigint) => poseidon2([a, b]), leaves);
     const proof = tree.generateProof(leafIndex);
     return Response.json({
       index: proof.index,
@@ -204,20 +250,42 @@ export class MerkleTreeDO extends DurableObject<Env> {
     // request doesn't grow the tree or change the root. (The tokenNull check above already prevents a
     // single token from being redeemed twice; this guards the separate case of the same commitment
     // bytes colliding, which INSERT OR IGNORE handles safely either way.)
+    //
+    // Load the PRE-insert tree state BEFORE writing the new row — loading it after would risk the
+    // cache-miss rebuild path reading the row we just wrote and double-counting it once we then call
+    // `.insert()` on top. DO execution is single-threaded per instance, so there's no race between
+    // this read and the write below (same property every other DO in this codebase already relies on).
+    const beforeCount = this.ctx.storage.sql.exec<CountRow>("SELECT COUNT(*) AS n FROM commitments").one().n;
+    const preTree = beforeCount === 0 ? new LeanIMT<bigint>(this.hashFn, []) : this.loadTreeForSize(beforeCount);
+
     const commitCreatedAt = Date.now();
-    this.ctx.storage.sql.exec(
+    const insertResult = this.ctx.storage.sql.exec(
       "INSERT OR IGNORE INTO commitments (commitment, created_at) VALUES (?, ?)",
       commitment,
       commitCreatedAt,
     );
+    const wasNewCommitment = insertResult.rowsWritten > 0;
     this.ctx.waitUntil(
       this.env.DB_MSG.prepare("INSERT OR IGNORE INTO commitments (commitment, created_at) VALUES (?, ?)")
         .bind(commitment, commitCreatedAt)
         .run()
         .catch((err) => console.error("D1 mirror error (commitments):", err))
     );
-    const { n } = this.ctx.storage.sql.exec<CountRow>("SELECT COUNT(*) AS n FROM commitments").one();
-    return Response.json({ merkleRoot: this.computeRoot(), size: n });
+
+    let root: string;
+    let n: number;
+    if (wasNewCommitment) {
+      preTree.insert(hexToField(commitment)); // O(log n) incremental update, not a rebuild
+      this.persistTreeCache(preTree);
+      root = fieldToHex(preTree.root as bigint);
+      n = beforeCount + 1;
+    } else {
+      // Idempotent retry: the leaf set is unchanged, so the pre-insert tree IS the current tree —
+      // no cache write needed, nothing actually changed.
+      n = beforeCount;
+      root = beforeCount === 0 ? EMPTY_TREE_ROOT : fieldToHex(preTree.root as bigint);
+    }
+    return Response.json({ merkleRoot: root, size: n });
   }
 
   private async handleSpend(request: Request): Promise<Response> {

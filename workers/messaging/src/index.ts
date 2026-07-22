@@ -18,6 +18,7 @@ export { DeviceLinkDO } from "./durable-objects/DeviceLinkDO";
 export { DeviceLeaseDO } from "./durable-objects/DeviceLeaseDO";
 export { AliasDO } from "./durable-objects/AliasDO";
 export { RateGateDO } from "./durable-objects/RateGateDO";
+export { KeyTransparencyDO } from "./durable-objects/KeyTransparencyDO";
 
 const router = Router();
 
@@ -40,12 +41,32 @@ function merkleStub(env: Env) {
   return env.MERKLE_TREE_DO.get(env.MERKLE_TREE_DO.idFromName("global"));
 }
 
+/** The single global KeyTransparencyDO instance (K8), same "global" convention as AliasDO/MerkleTreeDO. */
+function keyTransparencyStub(env: Env) {
+  return env.KEY_TRANSPARENCY_DO.get(env.KEY_TRANSPARENCY_DO.idFromName("global"));
+}
+
 // /membership/proof/:commitment (below) is necessarily unauthenticated — it's called BEFORE a session
 // capability can exist, and MerkleTreeDO rebuilds the whole tree per call (see its header comment's cost
 // note), so an unrate-limited caller could force repeated O(n) rebuilds against one commitment. RateGateDO
 // is sharded by epoch bucket (docs/04 DO catalog) — one fresh counter set per epoch, so this needs no
 // explicit reset/cleanup logic.
 const PROOF_RATE_LIMIT_PER_EPOCH = 20;
+
+// /transparency/consistency (below) recomputes MTH(...) from scratch over `second` leaves per call —
+// materially more expensive than /transparency/proof/:seq's O(log n) cached-tree path — so it gets
+// the same per-target rate-gate treatment as /membership/proof/:commitment above.
+const CONSISTENCY_RATE_LIMIT_PER_EPOCH = 20;
+
+// Capability-issuance rate limit (the "still-TODO" case RateGateDO's own header comment
+// anticipated — see the "/proof rate limit" pass this reuses). Real gap it closes: today
+// `coreAuthSession` below only checks the nullifier-spend table AFTER running the ~0.8s Groth16
+// pairing verify (R1), so replaying the exact same (proof, nullifier) pair forces the Worker to
+// redo the full expensive pairing check every single time before ever reaching the cheap
+// spend-check that would reject it. Keyed per-claimed-nullifier (mirrors `proof:${commitment}`'s
+// per-target keying) so one replayed/hammered attempt can't burn unlimited CPU, while distinct
+// honest attempts (distinct nullifiers) are unaffected by each other's counters.
+const SESSION_RATE_LIMIT_PER_EPOCH = 5;
 
 function rateGateStub(env: Env) {
   const epoch = Math.floor(Date.now() / 1000 / 3600);
@@ -224,6 +245,22 @@ async function coreAuthSession(env: Env, rawBody: unknown): Promise<CoreResult> 
     return { status: 409, body: { error: "merkleRoot does not match the current membership tree root" } };
   }
 
+  // Second cheap check, still before the expensive pairing work: cap attempts per claimed
+  // nullifier so a replayed/hammered (proof, nullifier) pair can't force unlimited re-verification.
+  const rateRes = await rateGateStub(env).fetch(
+    new Request("https://do/check", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key: `session:${nullifier}`, limit: SESSION_RATE_LIMIT_PER_EPOCH }),
+    }),
+  );
+  if (!rateRes.ok) return { status: 502, body: { error: `Rate check failed (${rateRes.status})` } };
+  const { allowed, count, limit } = (await rateRes.json()) as { allowed: boolean; count: number; limit: number };
+  if (!allowed) {
+    console.log(`[Session] auth/session rate limit hit for nullifier ${nullifier.slice(0, 16)}… (${count}/${limit} this epoch)`);
+    return { status: 429, body: { error: "Too many session attempts for this proof this epoch — try again next epoch" } };
+  }
+
   let publicInputsBytes: Uint8Array;
   try {
     publicInputsBytes = buildPublicInputsBytes(merkleRoot, nullifier, message, scope);
@@ -271,6 +308,78 @@ router.get("/membership/proof/:commitment", async (request: IRequest, env: Env) 
   const origin = request.headers.get("Origin");
   const result = await coreMembershipProof(env, request.params.commitment);
   return jsonResp(result.body, origin, result.status);
+});
+
+// K8: public, unauthenticated read routes for the append-only Key Transparency log — same openness
+// reasoning as /membership/proof/:commitment (this is a PUBLIC AUDIT log by design; hiding it behind
+// a capability would defeat the point of a transparency log anyone can independently check).
+// Writes (`/append`) are internal-only, called by AliasDO on register/revoke, never routed here.
+router.get("/transparency/root", async (request: IRequest, env: Env) => {
+  const origin = request.headers.get("Origin");
+  const res = await keyTransparencyStub(env).fetch(new Request("https://do/root"));
+  return jsonResp(await res.json(), origin, res.status);
+});
+router.get("/transparency/latest/:lookupKey", async (request: IRequest, env: Env) => {
+  const origin = request.headers.get("Origin");
+  const res = await keyTransparencyStub(env).fetch(new Request(`https://do/latest/${request.params.lookupKey}`));
+  const text = await res.text();
+  let parsed: unknown = {};
+  try {
+    parsed = text ? JSON.parse(text) : {};
+  } catch {
+    parsed = { error: text };
+  }
+  return jsonResp(parsed, origin, res.status);
+});
+router.get("/transparency/proof/:seq", async (request: IRequest, env: Env) => {
+  const origin = request.headers.get("Origin");
+  const res = await keyTransparencyStub(env).fetch(new Request(`https://do/proof/${request.params.seq}`));
+  const text = await res.text();
+  let parsed: unknown = {};
+  try {
+    parsed = text ? JSON.parse(text) : {};
+  } catch {
+    parsed = { error: text };
+  }
+  return jsonResp(parsed, origin, res.status);
+});
+router.get("/transparency/sth", async (request: IRequest, env: Env) => {
+  const origin = request.headers.get("Origin");
+  const res = await keyTransparencyStub(env).fetch(new Request("https://do/sth"));
+  return jsonResp(await res.json(), origin, res.status);
+});
+router.get("/transparency/consistency", async (request: IRequest, env: Env) => {
+  const origin = request.headers.get("Origin");
+  const url = new URL(request.url);
+  const first = url.searchParams.get("first") ?? "";
+  const second = url.searchParams.get("second") ?? "";
+  if (!/^\d+$/.test(first) || !/^\d+$/.test(second)) {
+    return errorResp("first and second query params must be positive integers", origin, 400);
+  }
+
+  const rateRes = await rateGateStub(env).fetch(
+    new Request("https://do/check", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key: `consistency:${first}:${second}`, limit: CONSISTENCY_RATE_LIMIT_PER_EPOCH }),
+    }),
+  );
+  if (!rateRes.ok) return errorResp(`Rate check failed (${rateRes.status})`, origin, 502);
+  const { allowed, count, limit } = (await rateRes.json()) as { allowed: boolean; count: number; limit: number };
+  if (!allowed) {
+    console.log(`[Transparency] consistency rate limit hit for (${first},${second}) (${count}/${limit} this epoch)`);
+    return errorResp("Too many consistency-proof requests for this (first,second) pair this epoch — try again next epoch", origin, 429);
+  }
+
+  const res = await keyTransparencyStub(env).fetch(new Request(`https://do/consistency?first=${first}&second=${second}`));
+  const text = await res.text();
+  let parsed: unknown = {};
+  try {
+    parsed = text ? JSON.parse(text) : {};
+  } catch {
+    parsed = { error: text };
+  }
+  return jsonResp(parsed, origin, res.status);
 });
 
 router.post("/auth/session", async (request: IRequest, env: Env) => {
@@ -453,8 +562,9 @@ async function coreDeviceLinkRequest(env: Env, linkId: string, sub: "put" | "tak
   return { status: res.status, body: parsed };
 }
 
-// AliasDO (alias contact establishment pass, 2026-07) — `POST /alias/register`,
-// `GET /alias/resolve/:lookupKey`, `POST /alias/introduce`. Wrapped through OHTTP for the same
+// AliasDO (alias contact establishment pass, 2026-07; `/revoke` added R18, same day style) —
+// `POST /alias/register`, `GET /alias/resolve/:lookupKey`, `POST /alias/introduce`,
+// `POST /alias/revoke`. Wrapped through OHTTP for the same
 // reason `/prekey/*`/`/device-link/*` are: a register/resolve/introduce call reveals "this real IP
 // is claiming/looking up/contacting @nickname" — exactly the metadata docs/03 §8's privacy model
 // (nickname discoverable, identity linkage never) exists to protect, so leaving these unwrapped
@@ -550,6 +660,9 @@ async function dispatchBhttpRequest(env: Env, req: BhttpRequest): Promise<CoreRe
   }
   if (req.method === "POST" && req.path === "/alias/introduce") {
     return coreAliasRequest(env, "introduce", "POST", req);
+  }
+  if (req.method === "POST" && req.path === "/alias/revoke") {
+    return coreAliasRequest(env, "revoke", "POST", req);
   }
   return { status: 404, body: { error: "Not found (via OHTTP gateway)" } };
 }

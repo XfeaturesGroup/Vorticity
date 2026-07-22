@@ -6,8 +6,11 @@
 //! WASM via `wasm-bindgen`.
 
 pub mod alias;
+pub mod alias_sig;
+#[cfg(feature = "client-full")]
 pub mod backup;
 pub mod blind_sig;
+#[cfg(feature = "client-full")]
 pub mod group;
 #[cfg(feature = "client-full")]
 pub mod kem;

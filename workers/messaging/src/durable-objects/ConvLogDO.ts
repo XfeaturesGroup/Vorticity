@@ -27,6 +27,7 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
 import { base64ToBuf, bufToBase64 } from "../base64";
+import { bucketTimestamp } from "../bucketing";
 
 // The `[key: string]: SqlStorageValue` index signature is required by
 // `SqlStorage.exec<T extends Record<string, SqlStorageValue>>`.
@@ -116,7 +117,13 @@ export class ConvLogDO extends DurableObject<Env> {
       return new Response("every entry in body.blobs must be a non-empty base64 string", { status: 400 });
     }
 
-    const now = Date.now();
+    // Bucketed at write time, not just when returned — see bucketing.ts's header comment for why
+    // (the primary named adversary in docs/02 can read raw DO storage directly, so coarsening only
+    // at response time would protect against nothing that adversary actually does). No size_bucket
+    // here (unlike QueueDO/GroupDO): the original D1 schema for `conv_log` never had one — CRDT
+    // op-log entries are a different shape/threat model than message ciphertexts, so this pass
+    // doesn't invent a padding requirement the design never called for.
+    const bucketedEnqueuedAt = bucketTimestamp(Date.now());
     const seqs: number[] = [];
     const inserted: LogEntryRow[] = [];
     // Sequential inserts preserve the caller's array order as the assigned seq order — required
@@ -126,7 +133,7 @@ export class ConvLogDO extends DurableObject<Env> {
         .exec<LogEntryRow>(
           "INSERT INTO entries (blob, enqueued_at) VALUES (?, ?) RETURNING seq, blob, enqueued_at",
           blob,
-          now,
+          bucketedEnqueuedAt,
         )
         .one();
       seqs.push(row.seq);

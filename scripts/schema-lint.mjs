@@ -36,7 +36,18 @@ const WORKERS_DIR = join(REPO_ROOT, "workers");
 const FORBIDDEN_COLUMNS = ["email", "sub", "user_id", "phone", "handle", "ip", "nickname"];
 
 const PLANE_FORBIDDEN_BINDINGS = {
-  enrollment: ["DB_MSG", "MEDIA", "MERKLE_TREE_DO", "QUEUE_DO", "GROUP_DO", "CONV_LOG_DO", "PRESENCE_DO", "ALIAS_DO", "RATE_GATE_DO"],
+  enrollment: [
+    "DB_MSG",
+    "MEDIA",
+    "MERKLE_TREE_DO",
+    "QUEUE_DO",
+    "GROUP_DO",
+    "CONV_LOG_DO",
+    "PRESENCE_DO",
+    "ALIAS_DO",
+    "RATE_GATE_DO",
+    "KEY_TRANSPARENCY_DO",
+  ],
   messaging: ["DB_ENROLL", "OAUTH_CLIENT_SECRET", "PPID_HMAC_SECRET", "ISSUER_SIGNING_KEY_PEM"],
 };
 

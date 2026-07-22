@@ -12,10 +12,17 @@
 //
 // Note vs. the original docs/04 schema sketch: that draft carried `alias_pub`/`pow_bits` as
 // separate plaintext columns (needed for verifying signed update/revoke requests without
-// decrypting `record` first). This pass only implements /register and /resolve — no update/revoke
-// yet — so `alias_pub` stays bundled inside the encrypted `record` for now, which is *stronger*
-// privacy than the original sketch. Reintroduce a plaintext `alias_pub` column only if/when
-// signed-update support needs it.
+// decrypting `record` first).
+//
+// R18 (2026-07, "signed alias revoke" pass): `alias_pub` is now a plaintext column, populated at
+// register time — the client sends it alongside the already-opaque `record` blob. No new privacy
+// leak: `alias_pub` is a bare Ed25519 public key with no structural link to a nickname, an email,
+// or a `DB_ENROLL` identity — the same property `record`'s bundled copy already had, just no longer
+// requiring the nickname (hence `record`'s decryption key) to read it. This is what lets `/revoke`
+// verify a signature (vortic-core's `alias_sig::verify`, via `alias-wasm.ts`) WITHOUT ever
+// decrypting `record` — this DO still never learns the nickname. Update (replacing a record's
+// contents) is NOT implemented here — see `alias.rs`'s module doc for why that's a deliberate,
+// smaller scope for this pass.
 //
 // PROOF-OF-WORK (docs/03 §8.3): stamp = "ver:alg:bits:epoch:resource:salt:counter". A stamp is
 // valid iff SHA-256(stamp) has >= the endpoint's required leading zero bits, `resource` matches
@@ -31,12 +38,29 @@ import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
 import { base64ToBuf, bufToBase64 } from "../base64";
 import { verifyPowStamp, stampExpiryFromEpoch } from "../pow";
+import { verifyAliasOwnership, aliasRevokeMessage } from "../alias-wasm";
+import { hexToBytes } from "../session";
 
 const LOOKUP_KEY_RE = /^[0-9a-f]{64}$/; // SHA-256 digest, lowercase hex
+const ALIAS_PUB_RE = /^[0-9a-f]{64}$/; // raw 32-byte Ed25519 public key, lowercase hex
 const REGISTER_MIN_BITS = 24;
-const RESOLVE_MIN_BITS = 20;
+
+// R15/R16 (2026-07, "adaptive resolve difficulty" pass): resolve used to require a FLAT 20 bits no
+// matter how many times a given lookup_key had already been resolved this epoch — the risk
+// register's own R15 mitigation column ("adaptive/per-target difficulty") was still unimplemented.
+// Real gap this closes: a flat cost lets a scraper hammer ONE known/guessed alias arbitrarily many
+// times per epoch for the same per-attempt price. Reuses the exact `RateGateDO` "increment and
+// check a counter" primitive the `/proof` and `/auth/session` rate limits already established
+// (RateGateDO.ts's own header comment explicitly anticipated more callers of `/check`, not just
+// those two) — but instead of hard-blocking at a limit, the running per-epoch attempt count for
+// THIS lookup_key raises the required PoW bits, so cost scales smoothly with how hot a target is
+// rather than falling off a cliff at some N+1th request.
+const RESOLVE_BASE_BITS = 20;
+const RESOLVE_ADAPTIVE_STEP = 5; // every this-many resolve attempts against one lookup_key this epoch...
+const RESOLVE_ADAPTIVE_BITS_PER_STEP = 1; // ...adds this many required bits...
+const RESOLVE_MAX_BITS = 28; // ...capped here (docs/03 §8.3's 18-26 bit range, +2 headroom for this cap)
 // Flow 6 (docs/04): "write to intro queue" PoW, resource = the target intro_queue_id, not a
-// lookup_key. Mid docs/03 §8.3's stated 20-24 bit write range, distinct from RESOLVE_MIN_BITS
+// lookup_key. Mid docs/03 §8.3's stated 20-24 bit write range, distinct from RESOLVE_BASE_BITS
 // only as a difficulty choice — the two never collide on which stamp satisfies which endpoint
 // since every stamp is resource-bound (a resolve-shaped stamp targets a lookup_key hex string, an
 // introduce-shaped stamp targets an intro_queue_id — the two id-spaces don't overlap in practice).
@@ -47,9 +71,49 @@ const INTRODUCE_MIN_BITS = 22;
 const INTRODUCE_TTL_MS = 3 * 24 * 60 * 60 * 1000;
 const MAX_INTRO_QUEUE_ID_LEN = 256; // defensive cap, matches other opaque-id length checks in this codebase
 
+// Epoch-bucketed RateGateDO stub, matching index.ts's own `rateGateStub` exactly (same formula —
+// not required to be byte-identical across files since key prefixes never collide, but keeping the
+// epoch definition consistent means "resets every epoch" means the same thing everywhere).
+function rateGateStub(env: Env): DurableObjectStub {
+  const epoch = Math.floor(Date.now() / 1000 / 3600);
+  return env.RATE_GATE_DO.get(env.RATE_GATE_DO.idFromName(`epoch:${epoch}`));
+}
+
+/** K8: the single global KeyTransparencyDO instance, same "global" convention as this DO itself. */
+function keyTransparencyStub(env: Env): DurableObjectStub {
+  return env.KEY_TRANSPARENCY_DO.get(env.KEY_TRANSPARENCY_DO.idFromName("global"));
+}
+
+// K8: append one event to the public transparency log. AWAITED, not fire-and-forget (unlike
+// MerkleTreeDO's D1 mirror `.catch(...)` pattern this deliberately does NOT copy): D1 there is a
+// redundant COPY of state that's already authoritative in the DO itself, so a mirror failure only
+// costs durability-in-depth. Here, if the log silently fell behind AliasDO's live table, the two
+// would DISAGREE — exactly the equivocation gap K8 exists to make detectable, so it isn't optional.
+// Still doesn't hard-fail the parent register/revoke on a log outage (logged loudly instead): a
+// transparency-log subsystem being briefly down shouldn't block real alias operations, which don't
+// depend on it for their OWN correctness. See this file's header comment for the honest scope note.
+async function appendToTransparencyLog(env: Env, lookupKey: string, aliasPub: string, event: "register" | "revoke"): Promise<void> {
+  try {
+    const res = await keyTransparencyStub(env).fetch(
+      new Request("https://do/append", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ lookup_key: lookupKey, alias_pub: aliasPub, event }),
+      }),
+    );
+    if (!res.ok) console.error(`[AliasDO] Key Transparency log append failed (${event}): HTTP ${res.status}`);
+  } catch (err) {
+    console.error(`[AliasDO] Key Transparency log append failed (${event}):`, err);
+  }
+}
+
 // Required by `SqlStorage.exec<T extends Record<string, SqlStorageValue>>`.
 interface AliasRow {
   record: ArrayBuffer;
+  [key: string]: SqlStorageValue;
+}
+interface AliasPubRow {
+  alias_pub: string;
   [key: string]: SqlStorageValue;
 }
 interface StampRow {
@@ -72,6 +136,7 @@ export class AliasDO extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS aliases (
         lookup_key TEXT PRIMARY KEY,
         record     BLOB NOT NULL,
+        alias_pub  TEXT NOT NULL DEFAULT '',
         created_at INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS pow_stamps (
@@ -80,6 +145,17 @@ export class AliasDO extends DurableObject<Env> {
       );
       CREATE INDEX IF NOT EXISTS idx_pow_stamps_expires_at ON pow_stamps(expires_at);
     `);
+    // R18 migration for DOs created before `alias_pub` existed: `CREATE TABLE IF NOT EXISTS` above
+    // is a no-op against an already-existing table, so a pre-R18 instance needs the column added in
+    // place. SQLite has no `ADD COLUMN IF NOT EXISTS`, so this is guarded by a try/catch — succeeds
+    // once (adds the column, empty-string default for pre-existing rows, meaning those rows simply
+    // can't be revoked until re-registered), then fails harmlessly with "duplicate column name" on
+    // every subsequent DO wake-up.
+    try {
+      this.ctx.storage.sql.exec(`ALTER TABLE aliases ADD COLUMN alias_pub TEXT NOT NULL DEFAULT ''`);
+    } catch {
+      // column already exists — expected on every wake-up after the first
+    }
   }
 
   override async fetch(request: Request): Promise<Response> {
@@ -87,6 +163,10 @@ export class AliasDO extends DurableObject<Env> {
 
     if (request.method === "POST" && url.pathname === "/register") {
       return this.handleRegister(request);
+    }
+
+    if (request.method === "POST" && url.pathname === "/revoke") {
+      return this.handleRevoke(request);
     }
 
     const resolveMatch = url.pathname.match(/^\/resolve\/([^/]+)$/);
@@ -117,6 +197,7 @@ export class AliasDO extends DurableObject<Env> {
     const lookupKey = (body as { lookup_key?: unknown }).lookup_key;
     const recordB64 = (body as { record?: unknown }).record;
     const powStamp = (body as { pow_stamp?: unknown }).pow_stamp;
+    const aliasPub = (body as { alias_pub?: unknown }).alias_pub;
 
     if (typeof lookupKey !== "string" || !LOOKUP_KEY_RE.test(lookupKey)) {
       return new Response("lookup_key must be a 64-char lowercase hex SHA-256 digest", { status: 400 });
@@ -126,6 +207,11 @@ export class AliasDO extends DurableObject<Env> {
     }
     if (typeof powStamp !== "string") {
       return new Response("pow_stamp must be a string", { status: 400 });
+    }
+    // R18: plaintext ownership key, stored alongside the (still-opaque-to-this-DO) record — see the
+    // header comment above for why this doesn't weaken the nickname-isolation property.
+    if (typeof aliasPub !== "string" || !ALIAS_PUB_RE.test(aliasPub)) {
+      return new Response("alias_pub must be a 64-char lowercase hex (32-byte) Ed25519 public key", { status: 400 });
     }
 
     let record: ArrayBuffer;
@@ -157,14 +243,94 @@ export class AliasDO extends DurableObject<Env> {
     }
 
     const stampExpiresAt = stampExpiryFromEpoch(pow.epoch);
-    this.ctx.storage.sql.exec("INSERT INTO aliases (lookup_key, record, created_at) VALUES (?, ?, ?)", lookupKey, record, Date.now());
+    this.ctx.storage.sql.exec(
+      "INSERT INTO aliases (lookup_key, record, alias_pub, created_at) VALUES (?, ?, ?, ?)",
+      lookupKey,
+      record,
+      aliasPub,
+      Date.now(),
+    );
     this.ctx.storage.sql.exec("INSERT INTO pow_stamps (stamp, expires_at) VALUES (?, ?)", powStamp, stampExpiresAt);
     await this.scheduleStampSweepNoLaterThan(stampExpiresAt);
 
+    await appendToTransparencyLog(this.env, lookupKey, aliasPub, "register");
     return new Response(null, { status: 201 });
   }
 
+  // ── revoke (R18: signed ownership) ─────────────────────────────────────────────────────────
+  // Frees a nickname so it can be registered again (by anyone, including a different owner) —
+  // closes the "no signed update/revoke" gap R18 flagged: before this, a registered alias could
+  // NEVER be freed, not even by its own legitimate owner. No PoW required here (unlike register):
+  // the signature itself is the scarce proof — it can only be produced by whoever holds the
+  // identity secret key `alias_pub` commits to, which is exactly as hard to forge as PoW is cheap
+  // to buy, and cheaper for the legitimate owner than re-mining a stamp.
+
+  private async handleRevoke(request: Request): Promise<Response> {
+    let body: unknown;
+    try {
+      body = await request.json();
+    } catch {
+      return new Response("invalid JSON body", { status: 400 });
+    }
+
+    const lookupKey = (body as { lookup_key?: unknown }).lookup_key;
+    const sigB64 = (body as { sig?: unknown }).sig;
+
+    if (typeof lookupKey !== "string" || !LOOKUP_KEY_RE.test(lookupKey)) {
+      return new Response("lookup_key must be a 64-char lowercase hex SHA-256 digest", { status: 400 });
+    }
+    if (typeof sigB64 !== "string" || sigB64.length === 0) {
+      return new Response("sig must be a non-empty base64 string", { status: 400 });
+    }
+
+    let sig: Uint8Array;
+    try {
+      sig = new Uint8Array(base64ToBuf(sigB64));
+      if (sig.byteLength !== 64) throw new Error("wrong length");
+    } catch {
+      return new Response("sig must be a valid base64-encoded 64-byte Ed25519 signature", { status: 400 });
+    }
+
+    const rows = this.ctx.storage.sql.exec<AliasPubRow>("SELECT alias_pub FROM aliases WHERE lookup_key = ?", lookupKey).toArray();
+    const row = rows[0];
+    if (!row || row.alias_pub.length === 0) {
+      return new Response("alias not found", { status: 404 });
+    }
+
+    const message = aliasRevokeMessage(hexToBytes(lookupKey));
+    const valid = verifyAliasOwnership(hexToBytes(row.alias_pub), message, sig);
+    console.log(`[Alias] revoke signature valid -> ${valid} (lookup_key ${lookupKey.slice(0, 16)}…)`);
+    if (!valid) {
+      return new Response("signature verification failed", { status: 401 });
+    }
+
+    this.ctx.storage.sql.exec("DELETE FROM aliases WHERE lookup_key = ?", lookupKey);
+    await appendToTransparencyLog(this.env, lookupKey, row.alias_pub, "revoke");
+    return new Response(null, { status: 204 });
+  }
+
   // ── resolve ─────────────────────────────────────────────────────────────────────────────────
+
+  // R15/R16: `limit` here is deliberately a sentinel that RateGateDO will never actually enforce
+  // (this call exists to read back a running COUNT, not to hard-block) — the block-or-allow
+  // decision stays entirely in `verifyPowStamp`'s bit-difficulty check below, matching this
+  // endpoint's existing "spend real work even on a miss" philosophy rather than introducing a
+  // second, differently-shaped rejection path.
+  private async adaptiveResolveBits(lookupKey: string): Promise<number> {
+    const res = await rateGateStub(this.env).fetch(
+      new Request("https://do/check", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key: `resolve:${lookupKey}`, limit: Number.MAX_SAFE_INTEGER }),
+      }),
+    );
+    // RateGateDO unreachable: fail toward the MAX difficulty, not the base — falling back to the
+    // cheapest price would make "make RateGateDO unreachable" a perverse incentive for an attacker.
+    if (!res.ok) return RESOLVE_MAX_BITS;
+    const { count } = (await res.json()) as { count: number };
+    const extraSteps = Math.floor((count - 1) / RESOLVE_ADAPTIVE_STEP);
+    return Math.min(RESOLVE_BASE_BITS + extraSteps * RESOLVE_ADAPTIVE_BITS_PER_STEP, RESOLVE_MAX_BITS);
+  }
 
   private async handleResolve(request: Request, lookupKey: string): Promise<Response> {
     if (!LOOKUP_KEY_RE.test(lookupKey)) {
@@ -175,9 +341,14 @@ export class AliasDO extends DurableObject<Env> {
       return new Response("missing X-PoW-Stamp header", { status: 400 });
     }
 
-    const pow = await verifyPowStamp(powStamp, lookupKey, RESOLVE_MIN_BITS);
+    // R15/R16: bump the per-lookup_key attempt counter FIRST (unconditionally — an under-difficulty
+    // probe should still push the bar up, not get a free look at the old price) and derive this
+    // attempt's required bits from the resulting count, before spending any real work verifying it.
+    const requiredBits = await this.adaptiveResolveBits(lookupKey);
+
+    const pow = await verifyPowStamp(powStamp, lookupKey, requiredBits);
     if (!pow.ok) {
-      return new Response(`PoW rejected: ${pow.reason}`, { status: 403 });
+      return new Response(`PoW rejected: ${pow.reason} (required ${requiredBits} bits this epoch for this alias)`, { status: 403 });
     }
 
     const spent = this.ctx.storage.sql.exec<StampRow>("SELECT stamp FROM pow_stamps WHERE stamp = ?", powStamp).toArray();

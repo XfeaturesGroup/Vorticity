@@ -21,14 +21,28 @@
 // WEBSOCKET HIBERNATION: same caveat as documented in QueueDO.ts — hibernation means the DO holds
 // no in-memory state and accrues no duration cost while sockets sit idle; a `/push` is still a
 // real (if brief) invocation that wakes the DO to write + fan out, then it can sleep again.
+//
+// REAL MLS CRYPTO CORE LANDED (2026-07, `packages/vortic-core/src/group.rs`, `MlsGroupSession`) —
+// this file needed ZERO changes for it, which is the whole point of the blind-DS design confirmed
+// working as intended: Commit and Application messages from `MlsGroupSession::addMember`/
+// `encryptMessage` are both just opaque bytes to `/push`, exactly like this file already assumed.
+// One real exception, NOT handled by this DO and not meant to be: a Welcome message (RFC 9420 —
+// delivered to the new member ONLY, never broadcast) must NOT be pushed here; it travels over a
+// private 1:1 channel (`QueueDO`, the same infrastructure alias contact-establishment already uses)
+// to the specific new member, out of band from this group's log entirely. Still open, not done in
+// the crypto-core pass: the `apps/web` wiring that would actually call `MlsGroupSession` and route
+// a Welcome to the right `QueueDO` — this file's own openness to opaque bytes was verified, not the
+// end-to-end client feature.
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
 import { base64ToBuf, bufToBase64 } from "../base64";
+import { bucketTimestamp, validateSizeBucket } from "../bucketing";
 
 // Required by `SqlStorage.exec<T extends Record<string, SqlStorageValue>>`.
 interface GroupEntryRow {
   seq: number;
   blob: ArrayBuffer;
+  size_bucket: number;
   sender_queue_id: string | null;
   enqueued_at: number;
   [key: string]: SqlStorageValue;
@@ -38,6 +52,7 @@ interface WireEntry {
   type: "message";
   seq: number;
   blob: string; // base64
+  sizeBucket: number;
   senderQueueId: string | null;
   enqueuedAt: number;
 }
@@ -49,6 +64,7 @@ function rowToWire(row: GroupEntryRow): WireEntry {
     type: "message",
     seq: row.seq,
     blob: bufToBase64(row.blob),
+    sizeBucket: row.size_bucket,
     senderQueueId: row.sender_queue_id,
     enqueuedAt: row.enqueued_at,
   };
@@ -65,10 +81,18 @@ export class GroupDO extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS entries (
         seq             INTEGER PRIMARY KEY AUTOINCREMENT,
         blob            BLOB NOT NULL,
+        size_bucket     INTEGER NOT NULL DEFAULT 0,
         sender_queue_id TEXT,
         enqueued_at     INTEGER NOT NULL
       );
     `);
+    // Migration for entries created before size_bucket existed — same guarded-ALTER pattern
+    // AliasDO.ts's alias_pub column already established (see that file for why this shape).
+    try {
+      this.ctx.storage.sql.exec(`ALTER TABLE entries ADD COLUMN size_bucket INTEGER NOT NULL DEFAULT 0`);
+    } catch {
+      // column already exists — expected on every wake-up after the first
+    }
   }
 
   override async fetch(request: Request): Promise<Response> {
@@ -99,11 +123,16 @@ export class GroupDO extends DurableObject<Env> {
       return new Response("invalid JSON body", { status: 400 });
     }
 
-    const blobsB64 = (body as { blobs?: unknown }).blobs;
-    if (!Array.isArray(blobsB64) || blobsB64.length === 0) {
+    // Wire format: `blobs: {blob: base64, sizeBucket: number}[]` — each entry carries its OWN
+    // declared padding bucket (a group can carry messages of genuinely different real sizes, so
+    // one batch-level bucket wouldn't make sense, unlike QueueDO's one-ciphertext-per-call shape).
+    // No client currently calls this route (checked before changing the shape — apps/web has no
+    // GroupDO wiring yet), so this is a clean addition, not a breaking change to a live caller.
+    const blobsIn = (body as { blobs?: unknown }).blobs;
+    if (!Array.isArray(blobsIn) || blobsIn.length === 0) {
       return new Response("body.blobs must be a non-empty array", { status: 400 });
     }
-    if (blobsB64.length > MAX_BATCH_SIZE) {
+    if (blobsIn.length > MAX_BATCH_SIZE) {
       return new Response(`body.blobs exceeds max batch size of ${MAX_BATCH_SIZE}`, { status: 400 });
     }
 
@@ -113,27 +142,34 @@ export class GroupDO extends DurableObject<Env> {
     }
     const senderTag: string | null = (senderQueueId as string | undefined) ?? null;
 
-    let blobs: ArrayBuffer[];
+    let entries: { blob: ArrayBuffer; sizeBucket: number }[];
     try {
-      blobs = blobsB64.map((b) => {
-        if (typeof b !== "string") throw new Error("not a string");
+      entries = blobsIn.map((entry) => {
+        const b = (entry as { blob?: unknown }).blob;
+        const sb = (entry as { sizeBucket?: unknown }).sizeBucket;
+        if (typeof b !== "string") throw new Error("blob must be a string");
         const buf = base64ToBuf(b);
         if (buf.byteLength === 0) throw new Error("empty blob");
-        return buf;
+        if (typeof sb !== "number" || !validateSizeBucket(buf.byteLength, sb)) {
+          throw new Error(`sizeBucket ${String(sb)} does not match real length ${buf.byteLength}`);
+        }
+        return { blob: buf, sizeBucket: sb };
       });
-    } catch {
-      return new Response("every entry in body.blobs must be a non-empty base64 string", { status: 400 });
+    } catch (err) {
+      return new Response(`invalid body.blobs entry: ${(err as Error).message}`, { status: 400 });
     }
 
     const now = Date.now();
+    const bucketedEnqueuedAt = bucketTimestamp(now); // see bucketing.ts — coarsened before it's ever stored
     const seqs: number[] = [];
-    for (const blob of blobs) {
+    for (const { blob, sizeBucket } of entries) {
       const row = this.ctx.storage.sql
         .exec<{ seq: number; [key: string]: SqlStorageValue }>(
-          "INSERT INTO entries (blob, sender_queue_id, enqueued_at) VALUES (?, ?, ?) RETURNING seq",
+          "INSERT INTO entries (blob, size_bucket, sender_queue_id, enqueued_at) VALUES (?, ?, ?, ?) RETURNING seq",
           blob,
+          sizeBucket,
           senderTag,
-          now,
+          bucketedEnqueuedAt,
         )
         .one();
       seqs.push(row.seq);
@@ -141,8 +177,9 @@ export class GroupDO extends DurableObject<Env> {
         type: "message",
         seq: row.seq,
         blob: bufToBase64(blob),
+        sizeBucket,
         senderQueueId: senderTag,
-        enqueuedAt: now,
+        enqueuedAt: bucketedEnqueuedAt,
       });
     }
 

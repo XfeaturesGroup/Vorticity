@@ -74,6 +74,11 @@ class_name = "AliasDO"
 name = "RATE_GATE_DO"
 class_name = "RateGateDO"
 
+# K8 (2026-07): append-only Key Transparency log for alias->key bindings — see KeyTransparencyDO.ts.
+[[durable_objects.bindings]]
+name = "KEY_TRANSPARENCY_DO"
+class_name = "KeyTransparencyDO"
+
 # SQLite-backed DOs (GA on Workers Free+, see docs/04 "Cloudflare limits"). new_sqlite_classes
 # is required the first time each class ships; do not edit this block for existing classes later
 # (Durable Object migrations are append-only history, like D1 migrations).
@@ -99,3 +104,8 @@ new_sqlite_classes = ["PrekeyDO"]
 [[migrations]]
 tag = "v3"
 new_sqlite_classes = ["DeviceLinkDO", "DeviceLeaseDO"]
+
+# KeyTransparencyDO (K8 pass, 2026-07) — same append-only reasoning as v2/v3 above.
+[[migrations]]
+tag = "v4"
+new_sqlite_classes = ["KeyTransparencyDO"]
