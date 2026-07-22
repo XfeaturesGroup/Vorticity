@@ -7,6 +7,8 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
+    "typecheck:scripts": "tsc --noEmit -p scripts/tsconfig.json",
+    "monitor:kt": "tsx scripts/kt-monitor.mts",
     "test": "vitest"
   },
   "dependencies": {
@@ -19,6 +21,7 @@
     "@cloudflare/vitest-pool-workers": "^0.12.4",
     "@cloudflare/workers-types": "^5.20260710.1",
     "@types/node": "^26.1.1",
+    "tsx": "^4.19.2",
     "typescript": "^5.7.2",
     "vitest": "~3.2.0",
     "wrangler": "^4.62.0"

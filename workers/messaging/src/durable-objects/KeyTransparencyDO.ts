@@ -26,6 +26,7 @@ import { DurableObject } from "cloudflare:workers";
 import { createHash } from "node:crypto";
 import { LeanIMT } from "@zk-kit/lean-imt";
 import { mth, consistencyProof } from "../merkleConsistency";
+import { ktCombine as combine, fieldToHex } from "../ktHash";
 import { signSth } from "../sth";
 import type { Env } from "../env";
 
@@ -35,19 +36,11 @@ const ALIAS_PUB_RE = /^[0-9a-f]{64}$/;
 function sha256Hex(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
-// LeanIMT's hash function must be synchronous (unlike `crypto.subtle.digest`) — `node:crypto`'s
-// `createHash` is, and this Worker already opts into `nodejs_compat` (wrangler.toml). Combines two
-// field elements (here: arbitrary 256-bit values, not BN254-field-constrained — no ZK circuit ever
-// reads this tree) by hashing their big-endian byte concatenation.
-function combine(a: bigint, b: bigint): bigint {
-  const aHex = a.toString(16).padStart(64, "0");
-  const bHex = b.toString(16).padStart(64, "0");
-  const bytes = Buffer.from(aHex + bHex, "hex");
-  return BigInt("0x" + sha256Hex(bytes));
-}
-function fieldToHex(n: bigint): string {
-  return n.toString(16).padStart(64, "0");
-}
+// `combine`/`fieldToHex` now live in ktHash.ts — extracted (2026-07, "KT gossip/monitor" pass) so
+// `scripts/kt-monitor.mts`, an independent process outside this Worker, combines sibling hashes the
+// IDENTICAL way this DO does. Two divergent implementations of "the log's own hash function" would
+// make every consistency proof the monitor checks spuriously fail (or, worse, spuriously pass on a
+// coincidence) — see ktHash.ts's header comment.
 
 interface EntryRow {
   seq: number;

@@ -1,0 +1,11 @@
+{
+  "extends": "../../../tsconfig.base.json",
+  "compilerOptions": {
+    "types": ["node"],
+    "lib": ["ES2022"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "noEmit": true
+  },
+  "include": ["kt-monitor.mts", "../src/sth.ts", "../src/merkleConsistency.ts", "../src/ktHash.ts", "../src/kt-sth-key.ts"]
+}

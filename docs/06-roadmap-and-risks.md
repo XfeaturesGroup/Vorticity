@@ -377,6 +377,55 @@ bands, not calendar promises.
   policy beyond the raw `timestamp` field itself — this pass is the signing/verification primitive
   and its live wiring only, matching this doc's "Mitigated, not Closed" framing for R18's remaining
   pieces.
+- **Done (2026-07, "KT gossip/monitor" pass) — R18 progress: closes the exact residual gap sth.ts's
+  own header comment named** ("two such STHs compared later — by gossip/monitoring, still not built
+  — constitute cryptographic proof of misbehavior"). New `workers/messaging/scripts/kt-monitor.mts`:
+  an independent watchdog script that fetches `GET /transparency/sth`, verifies its Ed25519
+  signature, and compares it against a LOCALLY PERSISTED prior STH the script itself remembers —
+  never against anything the server currently claims about its own past. Three outcomes per run:
+  same size + same root -> OK; size grew -> fetch `GET /transparency/consistency?first=prev&second=
+  new`, cross-check the proof's own `firstRoot` against what THIS script already verified last time
+  (not the server's restatement of it), then run the real RFC 6962 `verifyConsistency`; anything else
+  (log shrank, same size but a different root, `firstRoot`/`secondRoot` mismatch, or a failing
+  consistency proof) is an ALARM with both conflicting STHs (or the failing proof) dumped as evidence
+  and a distinct exit code (0 = OK, 1 = ALARM, 2 = the check itself couldn't complete) so unattended
+  cron alerting can tell "the log is lying" apart from "this script broke."
+  **A real design choice made and stated, not defaulted into:** this reuses the project's own already-
+  tested `verifySth`/`verifyConsistency`/`ktCombine` rather than a from-scratch reimplementation. The
+  tempting "more independent" move — hand-rolling RFC 6962 §2.1.2's iterative verifier a second time —
+  was rejected: a monitor with a subtly-wrong DIVERGENT verifier is worse than one sharing the tested
+  implementation, either false-alarming constantly (gets ignored, defeats the point) or silently
+  accepting forks it should catch. The property that actually provides equivocation detection is
+  independent, tamper-evident MEMORY of prior state plus WHO/WHERE runs the check — not divergent
+  arithmetic — so `ktCombine`/`fieldToHex` were extracted out of `KeyTransparencyDO.ts` into a new
+  shared `src/ktHash.ts` (single source of truth for both the live DO and this script) rather than
+  copied.
+  **Live-verified with six real scenarios against a real `wrangler dev` KeyTransparencyDO, not
+  simulated:** (1) first run with no state file establishes a baseline (exit 0); (2) a second run with
+  no intervening change reports OK-unchanged (exit 0); (3) a state file hand-crafted with the SAME
+  size as the live log but a DIFFERENT root correctly ALARMs as same-size equivocation (exit 1); (4) a
+  state file claiming a LARGER size than the live log correctly ALARMs as an append-only violation
+  (exit 1); (5) a state file with a plausible-looking but WRONG historical root correctly ALARMs when
+  the live consistency endpoint's own `firstRoot` doesn't match it (exit 1) — the realistic shape a
+  genuine rewritten-history attack would take; (6) **real, non-synthetic log growth**: mined an actual
+  24-bit Hashcash stamp (real SHA-256 grinding, ~9.6M tries) and registered a real alias through the
+  live `POST /alias/register` (the actual production append path, `AliasDO.handleRegister` ->
+  `appendToTransparencyLog`), growing the log from a verified size=25 to size=26 — the monitor,
+  re-run against its real prior baseline, fetched a REAL consistency proof from the live server,
+  verified it with the real RFC 6962 algorithm, and reported OK-GREW (exit 0), confirming the
+  positive path works against genuine append-only growth, not just its own negative controls. The
+  JSONL audit trail (`--history-file`) correctly recorded all six verdicts (`BASELINE`,
+  `OK-UNCHANGED`, three `ALARM`s, `OK-GREW`) as independent forensic evidence.
+  **Honest scope, stated plainly:** this is the mechanism, not the deployment. Run from the same
+  machine/account that operates `workers/messaging` (as every test above necessarily was), it proves
+  the CODE works, not the THREAT MODEL it exists for — a single-operator monitor colludes trivially
+  with a single-operator log. The property this whole feature is meant to buy requires a THIRD PARTY
+  (or at minimum a separately-controlled account/schedule) actually running it on a cron against the
+  public prod endpoint with a state file the primary operator cannot edit — not deployed or automated
+  as part of this pass (no scheduled task, no publication of the script for outside operators to
+  discover and run). No `apps/web` client-side verification wiring (unchanged from the STH pass's own
+  gap) — a monitor is a server-operator/community tool, not a per-user browser check, so this is a
+  deliberate scope boundary, not an oversight.
 - **Done (2026-07, "Argon2id hardened PoW" pass) — R16 progress: `pow.rs` gets the SECOND `Hpow`
   option docs/03 §8.3 names** (`SHA-256 baseline | Argon2id hardened: memory-hard, botnet/GPU-
   resistant`) — only the SHA-256 mode existed before this pass. Same stamp grammar
@@ -2585,6 +2634,7 @@ Severity × likelihood; **R1 is the one the brief explicitly asked about.**
 | — | *(R18 progress, 2026-07, "Key Transparency (K8)" pass — Mitigated, not fully Closed):* an append-only, publicly-auditable log of every register/revoke event now exists — see the Phase 3 entry below. **Not done:** RFC 6962-style cross-time consistency proofs, independent monitors/gossip, client-side verification wiring, reserved/verified namespaces. | | | | |
 | — | *(R18 progress, 2026-07, "Key Transparency consistency proofs" pass — Mitigated, not fully Closed):* the cross-time consistency-proof gap the row above named is now closed — real `GET /transparency/consistency?first=m&second=n`, live-verified against a real running log including a genuine fork/equivocation test (see the Phase 1/3 entries below for the full write-up, including a real soundness question this pass's own adversarial testing raised and resolved: the math authenticates root CONTENT consistency, not the numeric size label — that binding is a separate, still-not-built Signed-Tree-Head mechanism). **Not done:** independent monitors/gossip, client-side (`apps/web`) verification wiring, the STH signature itself, reserved/verified namespaces. | | | | |
 | — | *(R18 progress, 2026-07, "Signed Tree Head" pass — Mitigated, not fully Closed):* the STH signature gap the row above named is now closed — real Ed25519-signed `(size, root, timestamp)` via `GET /transparency/sth`, live-verified against a real running log (see the Phase 3 entry below for the full write-up, including the honest "signing alone doesn't prevent equivocation, it makes it DETECTABLE" framing this pass states plainly). **Not done:** independent monitors/gossip (the piece that actually USES a captured STH for detection), client-side (`apps/web`) verification wiring, reserved/verified namespaces. | | | | |
+| — | *(R18 progress, 2026-07, "KT gossip/monitor" pass — Mitigated, not fully Closed):* the "independent monitors/gossip" gap the row above named is now closed AS A MECHANISM — `workers/messaging/scripts/kt-monitor.mts` persists its own STH history independently of the server and alarms on equivocation/shrink/rewritten-history, live-verified with 3 real alarm scenarios plus a real growth scenario driven by an actual mined PoW + alias registration (see the Phase 3 entry below). **Not done, and this is the load-bearing gap:** actual THIRD-PARTY deployment — running this from a separately-controlled account/machine/schedule against the public prod endpoint is what makes equivocation detection real rather than theoretical; a single operator running their own monitor against their own log proves the code, not the trust property. Also still not done: client-side (`apps/web`) verification wiring, reserved/verified namespaces. | | | | |
 | R19 | **Self-doxxing** — a human-chosen public alias is a persistent identifier the *user* exposes | Low | High | Default invisible; explicit opt-in warning; recommend pairing with an ephemeral persona (K2); never auto-suggest real-name aliases | 3,4 |
 | **R20** | **Session capability was in `localStorage`** — JS-readable, so any XSS or malicious extension with DOM access could trivially steal a live bearer credential authorising `/queue` etc. | High | Closed | **Mitigated 2026-07** (Plane Bridge pass): moved to in-memory React state only, never persisted; reload loses the session by design. Open follow-up: a real "remember this device" UX (if ever added) needs a non-extractable key (WebCrypto non-exportable `CryptoKey` / platform keystore), not Web Storage | 2 |
 | **R21** | **`/auth/session` accepted a fixed, shared valid ZK proof vector, not one generated live from the client's own Semaphore witness** — the mock circuit's public inputs never changed, so every client presented the *same* proof. | High | Closed | **Resolved 2026-07 (server side — see docs/06's "Real Semaphore v4" and "R21-continued" entries below).** `/auth/session` now verifies a REAL Semaphore v4 proof (official circuit, real LeanIMT+Poseidon root in `MerkleTreeDO`) against public inputs built from the CALLER's own `(merkleRoot, nullifier, message, scope)`, with `merkleRoot` additionally checked against the tree's actual current root. `VK_HEX` is now the OFFICIAL PSE multi-party trusted-setup ceremony key ("Semaphore V4 Ceremony 1", 300-400+ contributors, finalized 2024-09-05) — not a local single-party test setup. Live-verified against the official artifacts: a genuinely different proof/root/nullifier per request, replay/stale-root/tampered-proof all correctly rejected, both natively (arkworks) and inside the live Workers WASM runtime. **Not independently re-verified:** the full multi-party ceremony transcript (per-contribution hash chain / beacon replay) — only the published end result's file integrity and structural/cryptographic correctness against our circuit. | 2 |
