@@ -477,6 +477,53 @@ bands, not calendar promises.
   `alg !== "sha256"` as a rejection), nor into any adaptive-difficulty or per-action bit-target
   policy. That is separate, later DO-side wiring work, consistent with how every other Phase 1
   primitive in this crate (kem, oprf, backup, group, ring) landed crate-core first.
+- **Done (2026-07, "wire Argon2id PoW into AliasDO" pass) — closes the DO-wiring gap the pass above
+  named by exact file path.** `workers/messaging/src/pow.ts`'s `verifyPowStamp` — the function that
+  actually gates every live register/resolve/introduce request — now dispatches on the stamp's own
+  declared `alg` instead of hardcoding `"sha256"`. SHA-256 stays plain `crypto.subtle.digest` (a
+  single fast hash, no reason to add WASM overhead); `argon2id` is delegated to a REAL Argon2id
+  computation via a new `pow-wasm.ts` loader (same `pkg/msg` edge-profile WASM bundle `zk-wasm.ts`/
+  `blindsig-wasm.ts` already load, `initSync` idempotent across all three) calling `pow.rs`'s
+  unconditional `pow_verify` — memory-hard hashing genuinely isn't reasonable to hand-roll in pure
+  JS, unlike the SHA-256 mode.
+  **The exact "choose real per-action bit targets" gap R16's row explicitly named is closed with a
+  DERIVED number, not a picked one:** rather than hand-tuning a separate Argon2id bit target per
+  action, `argonEquivalentBits(sha256Bits) = sha256Bits - ARGON2ID_BIT_DISCOUNT` derives it from the
+  EXISTING SHA-256 target every call site already had. `ARGON2ID_BIT_DISCOUNT = 11` comes from two
+  REAL measurements taken this pass, not assumed: a live 24-bit SHA-256 register-class mint on this
+  machine took 9,583,205 tries in 11.468s (~1.197µs/attempt); `pow.rs`'s own timing test measured a
+  single native Argon2id(m=4MiB,t=1,p=1) call at ~2.6824ms/attempt. Ratio ≈2240x → log2(2240)≈11 bits
+  lower for equal expected wall-clock cost. Consequence: **every existing call site
+  (`REGISTER_MIN_BITS=24`, resolve's adaptive base/max, `INTRODUCE_MIN_BITS=22`) needed ZERO code
+  changes** — they still pass one number, which now transparently means "the SHA-256-equivalent
+  difficulty for this action," and a client choosing to mint under `argon2id` automatically gets the
+  cost-equivalent target derived from it.
+  **Honest gap in the measurement itself, stated plainly:** the 2.6824ms figure is a NATIVE release
+  build number (from `pow.rs`'s own test), not re-measured inside the actual WASM binary this Worker
+  runs — plausibly somewhat slower again, the same class of native-vs-WASM timing gap `backup.rs`'s
+  own Argon2id docs already disclose for their derivation. The derived discount is a reasonable
+  estimate from real numbers, not a rounded-off guess, but not a WASM-in-Worker remeasurement either.
+  **Live-verified against a real `wrangler dev` AliasDO with genuinely mined stamps (not synthetic
+  bit-count assertions), two rounds:** (register route) a REAL argon2id stamp mined via the compiled
+  `pkg/client` WASM (`pow_mint_argon2id`) at the derived 13-bit target (=24-11) accepted (201); the
+  pre-existing real 24-bit SHA-256 path re-run unchanged to confirm zero regression (201); an
+  argon2id stamp deliberately mined at a WEAKER 4-bit target correctly rejected (403, "insufficient
+  PoW"); an argon2id stamp minted for the WRONG resource (a different `lookup_key`) correctly
+  rejected (403); a wholly unrecognized `alg` (`"md5"`) correctly rejected with a clear reason; a
+  genuine argon2id stamp replayed against a second, different resource correctly rejected on the
+  resource-mismatch check (same replay-set machinery, unaffected by the alg change). (resolve route,
+  regression check since this route wasn't directly touched) both a real 20-bit SHA-256 stamp and a
+  real 9-bit argon2id stamp (=20-11) for the SAME never-registered lookup key both correctly pass PoW
+  and reach the real "alias not found" 404 — proving PoW acceptance, not the unrelated existence
+  check, for both algorithms. Mining was done fully upfront before firing any requests — this
+  project's own prior-session lesson about `wrangler dev` local connections dropping (ECONNRESET)
+  across a long synchronous CPU-bound mining pause held here too on the first attempt, fixed the same
+  documented way.
+  **Not done:** off-thread/worker-thread client miner for Argon2id specifically (unaffected by this
+  pass — `apps/web`'s `powMiner.worker.ts` still only calls the SHA-256 `pow_mint`), in-Worker/WASM
+  remeasurement of the Argon2id timing used to derive the discount, and any UI affordance for a user
+  to actually CHOOSE the hardened mode (this pass makes the server accept it; nothing client-side
+  offers it yet).
 - **Still to implement (crate-core):** none remaining from this doc's original Phase 1 primitive
   list — VOPRF DLEQ (Phase 2 Airlock pass), MLS (real MLS group encryption pass), Argon2id/BIP39
   backup, bLSAG ring sigs, and now Argon2id-hardened PoW are all landed. Remaining Phase 1 work is
@@ -2628,6 +2675,7 @@ Severity × likelihood; **R1 is the one the brief explicitly asked about.**
 | **R16** | **PoW asymmetry** — botnet/GPU/ASIC mint stamps far cheaper than honest mobiles; or bits set too high hurt UX | Med | Med | Memory-hard Argon2id option; adaptive per-target bits; capability gate bounds actors to real accounts; tune bands; off-thread miner | 3,5 |
 | — | *(R15/R16 progress, 2026-07, "adaptive resolve difficulty" pass — Mitigated, not fully Closed):* per-target adaptive PoW bits for `/alias/resolve` are real and live-verified — see the Phase 3 entry below. **Not done:** the Argon2id memory-hard PoW option, off-thread/worker-thread client miner, adaptive difficulty on `/register`/`/introduce` (scoped to resolve only, per R15's specific enumeration-scraping angle). | | | | |
 | — | *(R16 progress, 2026-07, "Argon2id hardened PoW" pass — Mitigated, not fully Closed):* the memory-hard Argon2id `Hpow` option the row above named is now real and live-verified (crate-core, both native and real compiled WASM, both build profiles) — see the Phase 1 entry above for the full write-up, including real measured costs (~2.66ms/hash at m=4MiB,t=1,p=1) rather than assumed ones. **Not done:** off-thread/worker-thread client miner for this mode specifically, wiring into `AliasDO.ts`'s production verifier or any adaptive-difficulty policy (checked directly: `workers/messaging/src/pow.ts` still only accepts `alg==="sha256"`), and choosing real per-action bit targets under the new param set. | | | | |
+| — | *(R16 progress, 2026-07, "wire Argon2id PoW into AliasDO" pass — Mitigated, not fully Closed):* the DO-wiring gap the row above named is now closed — `pow.ts` dispatches on the stamp's own `alg`, argon2id verified via real WASM, and every existing call site's bit target now automatically has a derived (not guessed) Argon2id-equivalent via `argonEquivalentBits`, live-verified with real mined stamps on both register and resolve (see the Phase 1 entry below). **Not done:** off-thread client miner (unaffected — unchanged from the row above), UI to let a user choose the hardened mode, in-Worker/WASM remeasurement of the timing the bit-discount is derived from (currently a native figure). | | | | |
 | R17 | **Host offline dictionary attack** on `AliasDO` dump (nicknames are low-entropy) | Med | Med | Documented residual (aliases are public by intent); high-entropy nickname advice; **identity-linkage stays cryptographically safe** — record holds no email/PPID/handle | 3 |
 | **R18** | **Nickname squatting / impersonation** | Low | Med | Registration PoW + capability; `alias_pub` signed ownership; reserved/verified namespaces; report+revoke; Key Transparency (K8) over alias→key | 3,5 |
 | — | *(R18 progress, 2026-07, "signed alias revoke" pass — Mitigated, not fully Closed):* `alias_pub` signed ownership + revoke are now real — see the entry below. **Not done:** reserved/verified namespaces, update-in-place (revoke + re-register covers the same outcome for now). | | | | |
