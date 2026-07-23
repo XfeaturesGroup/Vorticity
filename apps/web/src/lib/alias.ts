@@ -80,6 +80,12 @@ async function unsealWithRecKey(rawKey: Uint8Array, sealed: Uint8Array): Promise
 // contact-request blob isn't distinguishable from an ordinary queue message by ciphertext length. ---
 const SIZE_BUCKETS = [256, 512, 1024, 2048, 4096, 8192, 16384];
 
+function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
 function padHex(byteLen: number): string {
   const raw = new Uint8Array(byteLen);
   crypto.getRandomValues(raw);
@@ -171,7 +177,17 @@ export async function registerAlias(nickname: string, cap: string): Promise<OwnA
   const res = await ohttpFetch("/alias/register", {
     method: "POST",
     headers: { Authorization: `Bearer ${cap}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ lookup_key: lookupKey, record: bytesToB64(sealedRecord), pow_stamp: stamp }),
+    body: JSON.stringify({
+      lookup_key: lookupKey,
+      record: bytesToB64(sealedRecord),
+      pow_stamp: stamp,
+      // R18 (AliasDO.ts): a plaintext top-level ownership key, required since the "signed alias
+      // revoke" pass — this client was never updated to send it, so every registration attempt has
+      // been failing with a 400 since that backend change landed. `record`'s own bundled base64
+      // copy (above) is what stays opaque to the DO; this is the SAME key, just hex-encoded and
+      // sent alongside, per AliasDO.ts's handleRegister.
+      alias_pub: bytesToHex(aliasPub),
+    }),
   });
   if (!res.ok) throw new Error(`alias register failed: HTTP ${res.status} ${await res.text().catch(() => "")}`);
 
