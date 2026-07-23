@@ -19,22 +19,30 @@ export function ContextMenu({ x, y, items, onClose }: { x: number; y: number; it
   const ref = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
+    // REAL BUG found live: this used to close on `mousedown`, but the SAME right-click gesture that
+    // opens this menu (mousedown -> contextmenu) could fire a document-level "mousedown outside the
+    // menu" in the same frame it opened — the menu wasn't mounted yet at the moment of that
+    // mousedown, so `ref.current` didn't contain it, and this closed the menu instantly, before it
+    // was ever visible ("right-click does nothing"). `click` fires strictly after `mouseup`, cleanly
+    // separated from the contextmenu-opening gesture — a right-click itself does not synthesize a
+    // `click` event in any mainstream browser, so this menu can never see-and-close its own opening
+    // gesture, only a GENUINE subsequent left-click elsewhere.
     const handleClick = (e: MouseEvent) => {
       if (ref.current && !ref.current.contains(e.target as Node)) onClose();
     };
     const handleKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
     };
-    document.addEventListener("mousedown", handleClick);
+    document.addEventListener("click", handleClick);
     document.addEventListener("keydown", handleKey);
     return () => {
-      document.removeEventListener("mousedown", handleClick);
+      document.removeEventListener("click", handleClick);
       document.removeEventListener("keydown", handleKey);
     };
   }, [onClose]);
 
-  const left = Math.min(x, window.innerWidth - MENU_WIDTH - 8);
-  const top = Math.min(y, window.innerHeight - items.length * ROW_HEIGHT - 16);
+  const left = Math.min(Math.max(x, 8), window.innerWidth - MENU_WIDTH - 8);
+  const top = Math.min(Math.max(y, 8), window.innerHeight - items.length * ROW_HEIGHT - 16);
 
   return (
     <div
