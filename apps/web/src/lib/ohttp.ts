@@ -40,7 +40,7 @@ async function fetchKeyConfig(): Promise<Uint8Array> {
 }
 
 export interface OhttpFetchInit {
-  method: "GET" | "POST";
+  method: "GET" | "POST" | "PUT";
   headers?: Record<string, string>;
   /** A JSON string (the usual case) or already-encoded bytes (e.g. a padded Sealed Sender++
    * envelope — see useQueueTransport.ts's `pushEnvelope`, which is not JSON at all). */

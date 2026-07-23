@@ -617,8 +617,27 @@ fn dh_ratchet_step(state: &mut RatchetState, new_dhr_pub: [u8; 32], seeds: &Entr
     state.dh_ratchet_turns += 1;
 }
 
-fn ratchet_encrypt(state: &mut RatchetState, plaintext: &[u8], seeds: &Entropy) -> Vec<u8> {
-    let mut cks = state.cks.expect("no sending chain yet — Bob must decrypt Alice's first message before he can send");
+/// REAL BUG found live (2026-07-23, via an actual two-party browser test, not a unit test): this used
+/// to `.expect()` the responder's sending chain, which panics (an `unreachable` wasm trap, surfacing
+/// in a browser as a confusing "recursive use of an object detected" — wasm-bindgen's `&mut self`
+/// borrow flag is left stuck set once a panic unwinds mid-call, poisoning the `RatchetSession` for
+/// every later call too, not just this one). The underlying constraint IS real Double Ratchet
+/// protocol behavior, not a crypto bug: the responder ("Bob") has no sending chain key until he's
+/// decrypted the initiator's first message (which carries her new DH public key and triggers his
+/// first DH-ratchet turn) — there is no key material to derive one from before that. But a real,
+/// everyday user action (the person who created an invite typing a message before the other side has
+/// joined) hit exactly this path, crashing the whole encryption module instead of getting a clean,
+/// recoverable "can't send yet" result. Returns `Err` now; the `#[wasm_bindgen]` wrapper
+/// (`encrypt_message`) already had a `Result` return type, so no signature-shape change reaches JS.
+fn ratchet_encrypt(state: &mut RatchetState, plaintext: &[u8], seeds: &Entropy) -> Result<Vec<u8>, String> {
+    let Some(mut cks) = state.cks else {
+        return Err(
+            "cannot send yet — must receive at least one message from the other side first (the \
+             responder has no sending chain until then; this is a real Double Ratchet protocol \
+             constraint, not a transient failure)"
+                .to_string(),
+        );
+    };
     let n = state.ns;
     state.ns += 1;
 
@@ -662,7 +681,7 @@ fn ratchet_encrypt(state: &mut RatchetState, plaintext: &[u8], seeds: &Entropy) 
 
     let mut wire = header_bytes;
     wire.extend_from_slice(&ciphertext);
-    wire
+    Ok(wire)
 }
 
 fn ratchet_decrypt(state: &mut RatchetState, wire: &[u8], seeds: &Entropy) -> Result<Vec<u8>, String> {
@@ -897,7 +916,7 @@ impl RatchetSession {
     #[wasm_bindgen(js_name = encryptMessage)]
     pub fn encrypt_message(&mut self, plaintext: &str, entropy: &[u8]) -> Result<Vec<u8>, JsError> {
         let seeds = Entropy::from_bytes(entropy).map_err(|e| JsError::new(&e))?;
-        Ok(ratchet_encrypt(&mut self.state, plaintext.as_bytes(), &seeds))
+        ratchet_encrypt(&mut self.state, plaintext.as_bytes(), &seeds).map_err(|e| JsError::new(&e))
     }
 
     /// Decrypt one wire message. Same 96-byte entropy contract as `encryptMessage` (consumed only if
@@ -950,7 +969,7 @@ mod tests {
     }
 
     fn encrypt(state: &mut RatchetState, plaintext: &str, tag: u8) -> Vec<u8> {
-        ratchet_encrypt(state, plaintext.as_bytes(), &entropy(tag))
+        ratchet_encrypt(state, plaintext.as_bytes(), &entropy(tag)).expect("test call sites always send after a sending chain exists")
     }
 
     fn decrypt(state: &mut RatchetState, wire: &[u8], tag: u8) -> Result<String, String> {
@@ -999,6 +1018,29 @@ mod tests {
 
         let wire3 = encrypt(&mut alice, "second message", 14);
         assert_eq!(decrypt(&mut bob, &wire3, 15).unwrap(), "second message");
+    }
+
+    /// Real bug found live (2026-07-23, two-party browser test — see this function's neighbor
+    /// `ratchet_encrypt`'s own doc comment for the full story): the responder trying to send before
+    /// ever receiving a message used to PANIC (`unreachable` wasm trap, "poisoning" the whole
+    /// `RatchetSession` object for every later call — confirmed by an isolated Node repro before this
+    /// fix). A completely ordinary user action (the person who creates an invite typing a message
+    /// while waiting for the other side to join) hit this every single time. Must now be a clean,
+    /// recoverable `Err`, not a crash.
+    #[test]
+    fn responder_sending_before_receiving_anything_is_a_clean_error_not_a_panic() {
+        let (mut alice, mut bob) = setup();
+        let result = ratchet_encrypt(&mut bob, b"bob trying to speak first", &entropy(5));
+        assert!(result.is_err(), "Bob has no sending chain yet — must be Err, not a crash or a bogus Ok");
+
+        // The SAME session must still work normally afterward — a rejected send must not leave the
+        // state corrupted for a later, legitimate exchange (this is exactly the "poisoned object"
+        // failure mode the panic version had; a clean Err must not have that effect at all).
+        // Nothing to reset here since `bob` was never mutated on the error path.
+        let wire = encrypt(&mut alice, "alice speaks first, as the protocol requires", 6);
+        assert_eq!(decrypt(&mut bob, &wire, 7).unwrap(), "alice speaks first, as the protocol requires");
+        let reply = encrypt(&mut bob, "now bob can reply", 8);
+        assert_eq!(decrypt(&mut alice, &reply, 9).unwrap(), "now bob can reply");
     }
 
     #[test]

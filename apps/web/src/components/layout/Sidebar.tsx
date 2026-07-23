@@ -47,16 +47,19 @@ export function Sidebar() {
   };
 
   return (
-    <div className="w-64 bg-black flex flex-col h-full shrink-0 overflow-y-auto vx-scrollbar border-r border-white/5">
-      <div className="p-6 flex items-center gap-3 shrink-0 mb-2">
-        <Shield className="w-7 h-7 text-fluid-peach" />
-        <span className="font-serif text-lg tracking-tight text-white">Vorticity</span>
+    // Icon-only rail below `md` (a real phone viewport has no room for a 256px labeled sidebar next
+    // to a full-width chat pane), full labeled sidebar at `md`+ — same breakpoint Chats.tsx's own
+    // split-view collapse uses, so the two responsive treatments read as one consistent layout.
+    <div className="w-16 md:w-64 bg-black flex flex-col h-full shrink-0 overflow-y-auto vx-scrollbar border-r border-white/5">
+      <div className="p-4 md:p-6 flex items-center justify-center md:justify-start gap-3 shrink-0 mb-2">
+        <Shield className="w-7 h-7 text-fluid-peach shrink-0" />
+        <span className="hidden md:inline font-serif text-lg tracking-tight text-white">Vorticity</span>
       </div>
 
-      <div className="flex-1 px-4 py-2 space-y-6">
+      <div className="flex-1 px-2 md:px-4 py-2 space-y-6">
         {navGroups.map((group) => (
           <div key={group.label} className="flex flex-col gap-1">
-            <span className="text-[10px] font-bold text-white/40 uppercase tracking-widest px-3 mb-2 font-sans">
+            <span className="hidden md:block text-[10px] font-bold text-white/40 uppercase tracking-widest px-3 mb-2 font-sans">
               {group.label}
             </span>
             {group.items.map((item) => (
@@ -64,24 +67,25 @@ export function Sidebar() {
                 key={item.path}
                 to={item.path}
                 end={item.exact ?? false}
+                title={item.label}
                 className={({ isActive }) =>
                   cn(
-                    "flex items-center gap-3 px-3 py-2 rounded-xl transition-all duration-200",
+                    "flex items-center justify-center md:justify-start gap-3 px-3 py-2 rounded-xl transition-all duration-200",
                     isActive ? "bg-white/10 text-white shadow-edge-lit" : "text-white/60 hover:text-white hover:bg-white/5",
                   )
                 }
               >
-                <item.icon className="w-4 h-4" />
-                <span className="font-medium text-sm font-sans">{item.label}</span>
+                <item.icon className="w-4 h-4 shrink-0" />
+                <span className="hidden md:inline font-medium text-sm font-sans">{item.label}</span>
               </NavLink>
             ))}
           </div>
         ))}
       </div>
 
-      <div className="p-4 mt-auto">
-        <div className="vx-glass-dimmable rounded-2xl p-4 shadow-glass border border-white/5 flex flex-col gap-4">
-          <div className="flex items-center gap-3 overflow-hidden">
+      <div className="p-2 md:p-4 mt-auto">
+        <div className="vx-glass-dimmable rounded-2xl p-2 md:p-4 shadow-glass border border-white/5 flex flex-col gap-4">
+          <div className="hidden md:flex items-center gap-3 overflow-hidden">
             <div className="w-10 h-10 rounded-full bg-fluid-peach/20 flex items-center justify-center shrink-0">
               <Shield className="w-5 h-5 text-fluid-peach" />
             </div>
@@ -92,10 +96,11 @@ export function Sidebar() {
           </div>
           <button
             onClick={handleEndSession}
+            title="End Session"
             className="flex items-center justify-center gap-2 w-full py-2 rounded-xl bg-white/5 hover:bg-red-500/20 hover:text-red-400 text-white/70 transition-colors text-sm font-medium"
           >
-            <LogOut className="w-4 h-4" />
-            End Session
+            <LogOut className="w-4 h-4 shrink-0" />
+            <span className="hidden md:inline">End Session</span>
           </button>
         </div>
       </div>

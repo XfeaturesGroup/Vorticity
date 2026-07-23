@@ -85,6 +85,23 @@ const BACKUP_DELETE_RATE_LIMIT_PER_EPOCH = 5;
 // BEFORE the R2 write, not just documented, so an oversized/malicious body can't buy free storage.
 const BACKUP_MAX_BYTES = 8 * 1024 * 1024;
 
+// Phase C media/attachments pass (2026-07): opaque-ID-keyed encrypted blobs in the already-bound
+// `MEDIA` R2 bucket (docs/04), same "opaque ID doubles as a capability" reasoning as `backupR2Key`
+// above, and the SAME deliberate choice as backup to proxy through the Worker rather than issue a
+// presigned-direct-to-R2 URL — docs/03 §10's original sketch earmarked presigned/chunked upload for
+// media specifically (unlike backup) because it assumed arbitrary-size file transfer, but this pass
+// caps attachments at a bounded size (images/short clips/voice notes, not video/arbitrary files), at
+// which point the SAME reasoning `backupR2Key` documents applies just as well: proxying keeps the
+// capability + rate-limit gate as the single enforcement point, and — materially, for THIS app —
+// going through the Worker means attachment upload/download can be OHTTP-wrapped like every other
+// conversation route (R25), whereas a presigned direct-to-R2 PUT would bypass the Relay entirely and
+// hand the real client IP straight to R2 at upload/download time, undermining the exact metadata
+// protection this pass exists to preserve. True chunked/multipart streaming for large media (docs/03
+// §10's original scope) remains future work if/when video or arbitrary-size files are ever supported.
+const MEDIA_PUT_RATE_LIMIT_PER_EPOCH = 10;
+const MEDIA_GET_RATE_LIMIT_PER_EPOCH = 30;
+const MEDIA_MAX_BYTES = 20 * 1024 * 1024;
+
 function rateGateStub(env: Env) {
   const epoch = Math.floor(Date.now() / 1000 / 3600);
   return env.RATE_GATE_DO.get(env.RATE_GATE_DO.idFromName(`epoch:${epoch}`));
@@ -331,14 +348,30 @@ function backupR2Key(backupId: string): string {
   return `backup/${backupId}`;
 }
 
+/** `generation` is a PUBLIC counter (see vortic-core's backup.rs "GENERATION KEYS" doc) — stored as
+ * R2 custom metadata, not secret, just "how many times has this backup been rotated." */
+function generationFromMetadata(customMetadata: Record<string, string> | undefined): number {
+  const raw = customMetadata?.generation;
+  const n = raw !== undefined ? Number(raw) : 0;
+  return Number.isInteger(n) && n >= 0 ? n : 0;
+}
+
+// R12 key-rotation pass (2026-07-23): the generation counter must advance by exactly 1 per write —
+// enforced via a REAL atomic compare-and-swap (R2's `onlyIf.etagMatches`), not read-then-write,
+// so a malicious/compromised host cannot roll the counter back and replay a stale generation to a
+// client that will re-derive that generation's key from nothing but the phrase (see backup.rs).
 async function coreBackupPut(env: Env, backupId: string | undefined, rawBody: unknown): Promise<CoreResult> {
   if (!backupId || !HEX64_RE.test(backupId)) {
     return { status: 400, body: { error: "backupId must be a 64-char lowercase hex (32-byte) value" } };
   }
-  const body = rawBody as { blob?: unknown };
+  const body = rawBody as { blob?: unknown; generation?: unknown };
   if (typeof body.blob !== "string") {
     return { status: 400, body: { error: "Missing blob (base64)" } };
   }
+  if (typeof body.generation !== "number" || !Number.isInteger(body.generation) || body.generation < 0) {
+    return { status: 400, body: { error: "generation must be a non-negative integer" } };
+  }
+  const generation = body.generation;
   let bytes: ArrayBuffer;
   try {
     bytes = base64ToBuf(body.blob);
@@ -366,9 +399,41 @@ async function coreBackupPut(env: Env, backupId: string | undefined, rawBody: un
     return { status: 429, body: { error: "Too many backup writes for this ID this epoch — try again next epoch" } };
   }
 
-  await env.BACKUP.put(backupR2Key(backupId), bytes);
-  console.log(`[Backup] PUT ${backupId.slice(0, 16)}… (${bytes.byteLength}B)`);
-  return { status: 200, body: { ok: true, size: bytes.byteLength, updatedAt: Date.now() } };
+  const key = backupR2Key(backupId);
+  const existing = await env.BACKUP.head(key);
+
+  if (existing) {
+    const currentGeneration = generationFromMetadata(existing.customMetadata);
+    if (generation !== currentGeneration + 1) {
+      return {
+        status: 409,
+        body: { error: `generation must advance by exactly 1 (current ${currentGeneration}, got ${generation})` },
+      };
+    }
+    // Real CAS: `onlyIf.etagMatches` makes R2 itself reject the write (returns null, doesn't throw)
+    // if the object changed since the `head()` above — closes the read-then-write race a naive
+    // "check then put" would have, which matters here because a lost race would silently let a
+    // stale generation number get accepted.
+    const result = await env.BACKUP.put(key, bytes, {
+      customMetadata: { generation: String(generation) },
+      onlyIf: { etagMatches: existing.etag },
+    });
+    if (result === null) {
+      return { status: 409, body: { error: "generation conflict — another write raced this one, refetch and retry" } };
+    }
+  } else {
+    if (generation !== 0) {
+      return { status: 409, body: { error: `first backup write must be generation 0, got ${generation}` } };
+    }
+    // First-ever write for this ID: no prior object/etag to CAS against, so this specific edge case
+    // (bootstrap, not the repeated rotation path a real attacker would target) accepts a narrow
+    // read-then-write race rather than an unverified "object must not exist" R2 conditional —
+    // documented honestly, not silently assumed safe.
+    await env.BACKUP.put(key, bytes, { customMetadata: { generation: "0" } });
+  }
+
+  console.log(`[Backup] PUT ${backupId.slice(0, 16)}… (${bytes.byteLength}B, generation ${generation})`);
+  return { status: 200, body: { ok: true, size: bytes.byteLength, updatedAt: Date.now(), generation } };
 }
 
 async function coreBackupGet(env: Env, backupId: string | undefined): Promise<CoreResult> {
@@ -395,7 +460,12 @@ async function coreBackupGet(env: Env, backupId: string | undefined): Promise<Co
   const buf = await object.arrayBuffer();
   return {
     status: 200,
-    body: { blob: bufToBase64(buf), size: buf.byteLength, updatedAt: object.uploaded.getTime() },
+    body: {
+      blob: bufToBase64(buf),
+      size: buf.byteLength,
+      updatedAt: object.uploaded.getTime(),
+      generation: generationFromMetadata(object.customMetadata),
+    },
   };
 }
 
@@ -424,6 +494,79 @@ async function coreBackupDelete(env: Env, backupId: string | undefined): Promise
   await env.BACKUP.delete(backupR2Key(backupId));
   console.log(`[Backup] DELETE ${backupId.slice(0, 16)}…`);
   return { status: 200, body: { ok: true } };
+}
+
+function mediaR2Key(mediaId: string): string {
+  return `media/${mediaId}`;
+}
+
+// No generation/CAS dance here unlike backup — a mediaId is a freshly generated random 256-bit value
+// per attachment, never reused or rotated, so it's write-once by convention. A bare overwrite on a
+// repeat PUT (retry after a dropped response, say) is harmless: same id implies same client, and
+// R2 objects are content-addressed by this key alone.
+async function coreMediaPut(env: Env, mediaId: string | undefined, rawBody: unknown): Promise<CoreResult> {
+  if (!mediaId || !HEX64_RE.test(mediaId)) {
+    return { status: 400, body: { error: "mediaId must be a 64-char lowercase hex (32-byte) value" } };
+  }
+  const body = rawBody as { blob?: unknown };
+  if (typeof body.blob !== "string") {
+    return { status: 400, body: { error: "Missing blob (base64)" } };
+  }
+  let bytes: ArrayBuffer;
+  try {
+    bytes = base64ToBuf(body.blob);
+  } catch {
+    return { status: 400, body: { error: "blob is not valid base64" } };
+  }
+  if (bytes.byteLength === 0) {
+    return { status: 400, body: { error: "blob must not be empty" } };
+  }
+  if (bytes.byteLength > MEDIA_MAX_BYTES) {
+    return { status: 413, body: { error: `blob exceeds the ${MEDIA_MAX_BYTES}-byte media size cap` } };
+  }
+
+  const rateRes = await rateGateStub(env).fetch(
+    new Request("https://do/check", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key: `media:put:${mediaId}`, limit: MEDIA_PUT_RATE_LIMIT_PER_EPOCH }),
+    }),
+  );
+  if (!rateRes.ok) return { status: 502, body: { error: `Rate check failed (${rateRes.status})` } };
+  const { allowed, count, limit } = (await rateRes.json()) as { allowed: boolean; count: number; limit: number };
+  if (!allowed) {
+    console.log(`[Media] PUT rate limit hit for ${mediaId.slice(0, 16)}… (${count}/${limit} this epoch)`);
+    return { status: 429, body: { error: "Too many media writes for this ID this epoch — try again next epoch" } };
+  }
+
+  await env.MEDIA.put(mediaR2Key(mediaId), bytes);
+  console.log(`[Media] PUT ${mediaId.slice(0, 16)}… (${bytes.byteLength}B)`);
+  return { status: 200, body: { ok: true, size: bytes.byteLength } };
+}
+
+async function coreMediaGet(env: Env, mediaId: string | undefined): Promise<CoreResult> {
+  if (!mediaId || !HEX64_RE.test(mediaId)) {
+    return { status: 400, body: { error: "mediaId must be a 64-char lowercase hex (32-byte) value" } };
+  }
+
+  const rateRes = await rateGateStub(env).fetch(
+    new Request("https://do/check", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key: `media:get:${mediaId}`, limit: MEDIA_GET_RATE_LIMIT_PER_EPOCH }),
+    }),
+  );
+  if (!rateRes.ok) return { status: 502, body: { error: `Rate check failed (${rateRes.status})` } };
+  const { allowed, count, limit } = (await rateRes.json()) as { allowed: boolean; count: number; limit: number };
+  if (!allowed) {
+    console.log(`[Media] GET rate limit hit for ${mediaId.slice(0, 16)}… (${count}/${limit} this epoch)`);
+    return { status: 429, body: { error: "Too many media reads for this ID this epoch — try again next epoch" } };
+  }
+
+  const object = await env.MEDIA.get(mediaR2Key(mediaId));
+  if (!object) return { status: 404, body: { error: "no media stored for this ID" } };
+  const buf = await object.arrayBuffer();
+  return { status: 200, body: { blob: bufToBase64(buf), size: buf.byteLength } };
 }
 
 router.post("/membership/insert", async (request: IRequest, env: Env) => {
@@ -555,6 +698,29 @@ router.delete("/backup/:backupId", async (request: IRequest, env: Env) => {
   const denied = await requireCapability(request, env);
   if (denied) return denied;
   const result = await coreBackupDelete(env, request.params.backupId);
+  return jsonResp(result.body, origin, result.status);
+});
+
+// Phase C media direct routes — capability-gated like backup above (see `coreMediaPut`/`Get`'s
+// header comment for why this reuses backup's proxy-through-Worker shape rather than a presigned URL).
+router.put("/media/:mediaId", async (request: IRequest, env: Env) => {
+  const origin = request.headers.get("Origin");
+  const denied = await requireCapability(request, env);
+  if (denied) return denied;
+  let body: unknown;
+  try {
+    body = await request.json();
+  } catch {
+    return errorResp("Invalid JSON body", origin, 400);
+  }
+  const result = await coreMediaPut(env, request.params.mediaId, body);
+  return jsonResp(result.body, origin, result.status);
+});
+router.get("/media/:mediaId", async (request: IRequest, env: Env) => {
+  const origin = request.headers.get("Origin");
+  const denied = await requireCapability(request, env);
+  if (denied) return denied;
+  const result = await coreMediaGet(env, request.params.mediaId);
   return jsonResp(result.body, origin, result.status);
 });
 
@@ -852,6 +1018,24 @@ async function dispatchBhttpRequest(env: Env, req: BhttpRequest): Promise<CoreRe
     }
     if (req.method === "GET") return coreBackupGet(env, backupId);
     return coreBackupDelete(env, backupId);
+  }
+  // Phase C media OHTTP-wrapped path — same capability re-check shape as the backup block above,
+  // same rationale (an attachment upload/download's real IP is sensitive metadata too).
+  const mediaMatch = /^\/media\/([0-9a-f]{64})$/.exec(req.path);
+  if (mediaMatch && (req.method === "PUT" || req.method === "GET")) {
+    const auth = getBhttpHeader(req.headers, "authorization");
+    const cap = auth?.startsWith("Bearer ") ? auth.slice("Bearer ".length) : null;
+    if (!cap) return { status: 401, body: { error: "Missing session capability" } };
+    const verdict = await verifyCapability(env.SESSION_SIGNING_KEY, cap);
+    if (!verdict.valid) return { status: 401, body: { error: `Invalid session capability: ${verdict.reason}` } };
+
+    const mediaId = mediaMatch[1]!;
+    if (req.method === "PUT") {
+      const parsed = parseJsonBody(req.body);
+      if (!parsed.ok) return { status: 400, body: { error: "Invalid JSON body" } };
+      return coreMediaPut(env, mediaId, parsed.value);
+    }
+    return coreMediaGet(env, mediaId);
   }
   return { status: 404, body: { error: "Not found (via OHTTP gateway)" } };
 }

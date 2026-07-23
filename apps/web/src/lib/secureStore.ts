@@ -132,6 +132,25 @@ export async function clearFromStore(name: string): Promise<void> {
   await idbDelete(db, DATA_STORE, name);
 }
 
+/** Settings.tsx "Danger Zone" — deletes the ENTIRE `vorticity-vault` IndexedDB database in one shot
+ * (both object stores: the non-extractable vault key itself, and every sealed record under it —
+ * session capability, chat list + message history, every chat's ratchet identity/KEM/prekey pool,
+ * alias seed). Deliberately a full-database delete rather than enumerating every `sealToStore` key
+ * name used across the app (AuthContext, useQueueTransport, lib/chatList, lib/alias, lib/prekeys) —
+ * fewer places to update if a future pass adds another sealed key and forgets to list it here too.
+ * Caller is responsible for reloading afterward — this key powers all page's in-memory state built
+ * from what's now gone, and `getVaultKey`'s cached promise would otherwise still point at a deleted
+ * key. */
+export async function clearEntireVault(): Promise<void> {
+  vaultKeyPromise = null;
+  await new Promise<void>((resolve, reject) => {
+    const req = indexedDB.deleteDatabase(DB_NAME);
+    req.onsuccess = () => resolve();
+    req.onerror = () => reject(req.error ?? new Error("indexedDB.deleteDatabase failed"));
+    req.onblocked = () => resolve(); // another tab has it open — it'll finish clearing once that tab closes
+  });
+}
+
 /** For live verification only (not called in normal app flow): confirms the vault key is
  * STRUCTURALLY non-extractable — `exportKey` must reject, not just "we don't happen to call it". */
 export async function assertVaultKeyNonExtractable(): Promise<boolean> {

@@ -40,6 +40,48 @@ async function hashToField(label: string): Promise<bigint> {
   return n % FR_MODULUS;
 }
 
+/**
+ * Matches workers/messaging/src/bucketing.ts's `validateSizeBucket` (added in a LATER commit than
+ * this test file, `6a8d959` — the two full-round-trip tests below used to hardcode `"0"`, which only
+ * covers a 1-byte ciphertext; real bucketing.ts rejected every actual test payload as a "bucket too
+ * small" 400, unrelated to anything in this session's own change). Real clients derive this the same
+ * way — the DO enforces byteLength > 2^(b-1) && byteLength <= 2^b.
+ */
+function sizeBucketFor(byteLength: number): number {
+  return Math.max(0, Math.ceil(Math.log2(byteLength)));
+}
+
+function b64url(bytes: Uint8Array): string {
+  return Buffer.from(bytes).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/**
+ * /token/issue now requires an enrollment ticket minted by the REAL /oauth/callback (see
+ * workers/enrollment/src/ticket.ts, added 2026-07-23 to close an unauthenticated blind-signing
+ * oracle). This test suite has no real Xfeatures OAuth credentials to drive that endpoint, so —
+ * same "independent forger" philosophy this project already uses for PoW stamp tests (AliasDO) —
+ * this mints a ticket the exact same way ticket.ts does, using the real local-dev
+ * ENROLL_TICKET_SIGNING_KEY read straight out of workers/enrollment/.dev.vars (gitignored, never
+ * committed). This does NOT bypass the production check: it proves the check by exercising the
+ * identical HMAC construction an attacker without that key could not reproduce.
+ */
+async function forgeEnrollTicketForTest(ppid: string, expiresInMs = 10 * 60 * 1000): Promise<string> {
+  const devVars = fs.readFileSync(path.join(REPO_ROOT, "workers/enrollment/.dev.vars"), "utf8");
+  const match = devVars.match(/ENROLL_TICKET_SIGNING_KEY="([0-9a-f]+)"/);
+  if (!match) throw new Error("ENROLL_TICKET_SIGNING_KEY not found in workers/enrollment/.dev.vars");
+  const keyHex = match[1]!;
+  const keyBytes = new Uint8Array(keyHex.length / 2);
+  for (let i = 0; i < keyBytes.length; i++) keyBytes[i] = parseInt(keyHex.slice(i * 2, i * 2 + 2), 16);
+
+  const now = Date.now();
+  const payloadBytes = new TextEncoder().encode(
+    JSON.stringify({ ppid, jti: crypto.randomUUID(), iat: now, exp: now + expiresInMs }),
+  );
+  const key = await crypto.subtle.importKey("raw", keyBytes, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = new Uint8Array(await crypto.subtle.sign("HMAC", key, payloadBytes));
+  return `${b64url(payloadBytes)}.${b64url(sig)}`;
+}
+
 /** Mints one real session capability via the full RSABSSA + official-ceremony-Semaphore chain —
  * same sequence every other live E2E script in this project uses, reused rather than re-derived. */
 async function getRealCapability(): Promise<string> {
@@ -62,11 +104,13 @@ async function getRealCapability(): Promise<string> {
   const blindedMessage = blindingState.slice(0, MODULUS_BYTES);
   const randomizer = blindingState.slice(MODULUS_BYTES * 2, MODULUS_BYTES * 2 + RANDOMIZER_BYTES);
 
+  const ticket = await forgeEnrollTicketForTest(`test-ppid-${crypto.randomUUID()}`);
   const issueRes = await fetch(`${ENROLL}/token/issue`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ blinded: bytesToB64(blindedMessage) }),
+    body: JSON.stringify({ blinded: bytesToB64(blindedMessage), ticket }),
   });
+  if (!issueRes.ok) throw new Error(`/token/issue failed: ${JSON.stringify(await issueRes.json())}`);
   const { blindSig } = (await issueRes.json()) as { blindSig: string };
   const sig = blindsigFinalize(issuerPkPem, blindingState, b64ToBytes(blindSig), identityMsg);
 
@@ -250,7 +294,11 @@ describe.runIf(serversUp)("R25 live OHTTP over real wrangler dev (Client -> Rela
         scheme: "https",
         authority: "q.vort.xfeatures.net",
         path: `/queue/${encodeURIComponent(queueId)}/push`,
-        headers: [["authorization", `Bearer ${capability}`], ["x-ttl-ms", "60000"], ["x-size-bucket", "0"]],
+        headers: [
+          ["authorization", `Bearer ${capability}`],
+          ["x-ttl-ms", "60000"],
+          ["x-size-bucket", String(sizeBucketFor(new TextEncoder().encode(plaintextMarker).length))],
+        ],
         body: new TextEncoder().encode(plaintextMarker),
       });
       const relayRes = await fetch(`${RELAY}/ohttp/gateway`, {
@@ -291,6 +339,102 @@ describe.runIf(serversUp)("R25 live OHTTP over real wrangler dev (Client -> Rela
     expect(res.status).toBe(400);
   });
 
+  it("a real PUT /media/:mediaId reaches capability verification through OHTTP (401 on a bogus cap, not bypassed)", async () => {
+    const keyConfigBytes = new Uint8Array(await (await fetch(`${RELAY}/ohttp/keys`)).arrayBuffer());
+    const mediaId = crypto.randomUUID().replace(/-/g, "").padEnd(64, "0");
+    const handle = await encapsulateRequest(keyConfigBytes, {
+      method: "PUT",
+      scheme: "https",
+      authority: "q.vort.xfeatures.net",
+      path: `/media/${mediaId}`,
+      headers: [["authorization", "Bearer not-a-real-capability"], ["content-type", "application/json"]],
+      body: new TextEncoder().encode(JSON.stringify({ blob: bytesToB64(new Uint8Array([1, 2, 3])) })),
+    });
+    const relayRes = await fetch(`${RELAY}/ohttp/gateway`, {
+      method: "POST",
+      headers: { "Content-Type": "message/ohttp-req" },
+      body: handle.encapsulatedRequest as BodyInit,
+    });
+    const decoded = await handle.decapsulateResponse(new Uint8Array(await relayRes.arrayBuffer()));
+    expect(decoded.status).toBe(401);
+    const body = JSON.parse(new TextDecoder().decode(decoded.body)) as { error: string };
+    expect(body.error).toContain("Invalid session capability");
+  });
+
+  it(
+    "Phase C FULL real round trip: mints a real capability, uploads a real attachment blob to a real MEDIA " +
+      "R2 object through OHTTP, and downloads it back byte-for-byte identical — the actual media send/receive path",
+    async () => {
+      const capability = await getRealCapability();
+      const mediaId = crypto.randomUUID().replace(/-/g, "") + crypto.randomUUID().replace(/-/g, "").slice(0, 32);
+      const originalBytes = crypto.getRandomValues(new Uint8Array(4096)); // stand-in "encrypted attachment frame"
+      const keyConfigBytes = new Uint8Array(await (await fetch(`${RELAY}/ohttp/keys`)).arrayBuffer());
+
+      const putHandle = await encapsulateRequest(keyConfigBytes, {
+        method: "PUT",
+        scheme: "https",
+        authority: "q.vort.xfeatures.net",
+        path: `/media/${mediaId}`,
+        headers: [["authorization", `Bearer ${capability}`], ["content-type", "application/json"]],
+        body: new TextEncoder().encode(JSON.stringify({ blob: bytesToB64(originalBytes) })),
+      });
+      const putRelayRes = await fetch(`${RELAY}/ohttp/gateway`, {
+        method: "POST",
+        headers: { "Content-Type": "message/ohttp-req" },
+        body: putHandle.encapsulatedRequest as BodyInit,
+      });
+      expect(putRelayRes.status).toBe(200);
+      const putDecoded = await putHandle.decapsulateResponse(new Uint8Array(await putRelayRes.arrayBuffer()));
+      expect(putDecoded.status).toBe(200);
+      const putBody = JSON.parse(new TextDecoder().decode(putDecoded.body)) as { ok: boolean; size: number };
+      expect(putBody.ok).toBe(true);
+      expect(putBody.size).toBe(originalBytes.length);
+
+      const getHandle = await encapsulateRequest(keyConfigBytes, {
+        method: "GET",
+        scheme: "https",
+        authority: "q.vort.xfeatures.net",
+        path: `/media/${mediaId}`,
+        headers: [["authorization", `Bearer ${capability}`]],
+        body: new Uint8Array(0),
+      });
+      const getRelayRes = await fetch(`${RELAY}/ohttp/gateway`, {
+        method: "POST",
+        headers: { "Content-Type": "message/ohttp-req" },
+        body: getHandle.encapsulatedRequest as BodyInit,
+      });
+      expect(getRelayRes.status).toBe(200);
+      const getDecoded = await getHandle.decapsulateResponse(new Uint8Array(await getRelayRes.arrayBuffer()));
+      expect(getDecoded.status).toBe(200);
+      const getBody = JSON.parse(new TextDecoder().decode(getDecoded.body)) as { blob: string; size: number };
+      expect(b64ToBytes(getBody.blob)).toEqual(originalBytes);
+      expect(getBody.size).toBe(originalBytes.length);
+    },
+    20000,
+  );
+
+  it(
+    "rejects a media blob over the size cap with a 413, enforced BEFORE the R2 write",
+    async () => {
+      const capability = await getRealCapability();
+      const mediaId = crypto.randomUUID().replace(/-/g, "") + crypto.randomUUID().replace(/-/g, "").slice(0, 32);
+      // Just over MEDIA_MAX_BYTES (20 MiB) — direct fetch to the Gateway, not OHTTP-wrapped, purely to
+      // avoid BHTTP-framing a 20MB+1 payload in this test; the cap check itself is identical either path
+      // (both call the same `coreMediaPut`), and the OHTTP-wrapped auth gate is already covered above.
+      // Needs vitest's default 5s timeout raised — `bytesToB64`'s char-by-char loop over 20M+ bytes
+      // (a test-fixture-only cost, not anything real product code does at this size) is genuinely
+      // slow, not a hang; a real client never base64-encodes a whole file synchronously like this.
+      const oversized = new Uint8Array(20 * 1024 * 1024 + 1);
+      const res = await fetch(`${GATEWAY_DIRECT}/media/${mediaId}`, {
+        method: "PUT",
+        headers: { Authorization: `Bearer ${capability}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ blob: bytesToB64(oversized) }),
+      });
+      expect(res.status).toBe(413);
+    },
+    20000,
+  );
+
   it(
     "R26 FUNCTIONAL test: a WS subscribe proxied through the Relay still delivers a real-time message correctly. " +
       "NOT a proof the client IP is hidden (see docs/06's R26 entry — that specific property is unverifiable " +
@@ -316,7 +460,11 @@ describe.runIf(serversUp)("R25 live OHTTP over real wrangler dev (Client -> Rela
       const plaintextMarker = `real-ws-via-relay-${crypto.randomUUID()}`;
       const pushRes = await fetch(`${GATEWAY_DIRECT}/queue/${encodeURIComponent(queueId)}/push`, {
         method: "POST",
-        headers: { Authorization: `Bearer ${capability}`, "X-Ttl-Ms": "60000", "X-Size-Bucket": "0" },
+        headers: {
+          Authorization: `Bearer ${capability}`,
+          "X-Ttl-Ms": "60000",
+          "X-Size-Bucket": String(sizeBucketFor(new TextEncoder().encode(plaintextMarker).length)),
+        },
         body: new TextEncoder().encode(plaintextMarker),
       });
       expect(pushRes.status).toBe(201);

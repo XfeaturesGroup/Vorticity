@@ -5,6 +5,10 @@ import { ChatListItem } from "./ChatListItem";
 
 interface ChatListProps {
   chats: Chat[];
+  /** True only during the one-time vault restore on mount — shows a loading skeleton instead of the
+   * (potentially misleading) "No chats yet" empty state before the persisted list has a chance to
+   * arrive. */
+  isLoading?: boolean;
   activeChatId: string | null;
   onSelect: (id: string) => void;
   /** `label` is the optional cosmetic "Invited by: X" string — see lib/inviteLink.ts's header
@@ -18,7 +22,7 @@ interface ChatListProps {
   onAddByAlias: (nickname: string) => Promise<{ ok: true } | { ok: false; error: string }>;
 }
 
-export function ChatList({ chats, activeChatId, onSelect, onCreateInvite, onDelete, onAddByAlias }: ChatListProps) {
+export function ChatList({ chats, isLoading, activeChatId, onSelect, onCreateInvite, onDelete, onAddByAlias }: ChatListProps) {
   const [search, setSearch] = useState("");
   const [composerOpen, setComposerOpen] = useState(false);
   const [labelDraft, setLabelDraft] = useState("");
@@ -134,7 +138,19 @@ export function ChatList({ chats, activeChatId, onSelect, onCreateInvite, onDele
       </div>
 
       <div className="flex-1 min-h-0 overflow-y-auto vx-scrollbar">
-        {filtered.length === 0 ? (
+        {isLoading ? (
+          <div className="p-4 space-y-3" aria-hidden>
+            {[0, 1, 2, 3].map((i) => (
+              <div key={i} className="flex items-center gap-3 animate-pulse">
+                <div className="w-11 h-11 rounded-full bg-white/5 shrink-0" />
+                <div className="flex-1 min-w-0 space-y-2">
+                  <div className="h-3 w-2/3 rounded bg-white/5" />
+                  <div className="h-2.5 w-4/5 rounded bg-white/5" />
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : filtered.length === 0 ? (
           <div className="p-6 text-center text-white/30 text-sm">
             {chats.length === 0 ? (
               <>

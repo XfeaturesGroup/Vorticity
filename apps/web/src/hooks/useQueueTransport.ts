@@ -66,7 +66,7 @@ import {
   RatchetSession,
 } from "@vorticity/vortic-core";
 import { useAuth } from "../contexts/AuthContext";
-import { formatNow, type ChatMessage, type TransportRole } from "../lib/chat";
+import { formatNow, type AttachmentMeta, type MessagePayload, type TransportRole } from "../lib/chat";
 import { ohttpFetch } from "../lib/ohttp";
 import {
   consumeFromPool,
@@ -157,7 +157,8 @@ function shortHex(bytes: Uint8Array): string {
 
 // --- Sealed Sender++ padding: pad the JSON envelope up to the nearest size bucket, so a receipt is
 // not distinguishable from a real message by ciphertext length on the wire. ---
-const SIZE_BUCKETS = [256, 512, 1024, 2048, 4096, 8192, 16384];
+const MIN_SIZE_BUCKET = 8; // 2^8 = 256 bytes — smallest padding target
+const MAX_SIZE_BUCKET = 24; // 2^24 = 16 MiB — mirrors workers/messaging/src/bucketing.ts's own ceiling
 
 function padHex(byteLen: number): string {
   const raw = new Uint8Array(byteLen);
@@ -190,39 +191,72 @@ interface SessionInitEnvelope {
 }
 interface MessageEnvelope {
   type: "message";
-  wire: string; // base64(RatchetSession.encryptMessage output: header || AEAD ciphertext)
+  // base64(RatchetSession.encryptMessage output: header || AEAD ciphertext). The PLAINTEXT this
+  // encrypts is JSON.stringify(MessagePayload) (see lib/chat.ts), not raw text — extended 2026-07 to
+  // carry edit/delete/reaction kinds alongside plain text, all inside the same ratchet frame.
+  wire: string;
   timestamp: string;
 }
+// Both receipt kinds are MONOTONIC CURSORS ("everything up to and including this queue seq"), not
+// per-message flags — correct because a single ordered per-direction queue never reorders (QueueDO
+// delivers strictly in push order), so "I've delivered/read up to seq N" is unambiguous and simpler
+// than tracking one ack per message. "read" is a NEW signal (2026-07) layered on top of the
+// pre-existing padded/delayed/decoupled "receipt" (renamed field only, same wire behavior) — see
+// handleInboundMessage's focus-aware read logic below for why they can genuinely differ in time.
 interface ReceiptEnvelope {
-  type: "receipt";
-  ackSeq: number; // the queue seq of the message being acknowledged
+  type: "receipt"; // "delivered": this device decrypted the message, regardless of UI focus
+  upToSeq: number;
 }
-type Envelope = PrekeyOfferEnvelope | SessionInitEnvelope | MessageEnvelope | ReceiptEnvelope;
+interface ReadEnvelope {
+  type: "read"; // this device's chat window was actually focused when it decrypted up to this seq
+  upToSeq: number;
+}
+type Envelope = PrekeyOfferEnvelope | SessionInitEnvelope | MessageEnvelope | ReceiptEnvelope | ReadEnvelope;
 
 function isEnvelope(v: unknown): v is Envelope {
   const t = (v as { type?: unknown } | null)?.type;
-  return t === "prekey_offer" || t === "session_init" || t === "message" || t === "receipt";
+  return t === "prekey_offer" || t === "session_init" || t === "message" || t === "receipt" || t === "read";
 }
 
+/**
+ * `bucket` is the EXPONENT `b` such that the padded envelope is exactly `2^b` bytes — this MUST match
+ * `workers/messaging/src/bucketing.ts`'s `validateSizeBucket` convention exactly.
+ *
+ * REAL BUG found live (2026-07-23, via an actual two-party browser chat test, not a unit test): this
+ * function used to return the ARRAY INDEX into a fixed size table (`SIZE_BUCKETS = [256, 512, ...]`,
+ * so index 3 -> 2048 bytes) instead of the exponent. `validateSizeBucket` interprets its `sizeBucket`
+ * argument as a literal power-of-two exponent, so a 2048-byte envelope tagged with the index `3`
+ * (instead of the correct exponent `11`) failed server-side validation with 400 every time. This
+ * silently broke EVERY real push with non-trivial content (prekey_offer, session_init, any message,
+ * any receipt) from the actual browser client the moment `bucketing.ts` grew a real length check —
+ * no automated test caught it because every other caller in this repo already computed a correct
+ * exponent by hand (e.g. `packages/ohttp/src/live.e2e.test.ts`'s `sizeBucketFor`, fixed in this same
+ * session for the same reason); this was the only remaining caller still using the old scheme, and it
+ * happens to be the one actual chat clients go through.
+ */
 function padEnvelope(envelope: Envelope): { bytes: Uint8Array; bucket: number } {
   const withoutPad = JSON.stringify({ ...envelope, pad: "" });
   const overhead = new TextEncoder().encode(withoutPad).length;
-  for (let bucket = 0; bucket < SIZE_BUCKETS.length; bucket++) {
-    const bucketSize = SIZE_BUCKETS[bucket]!;
-    if (overhead <= bucketSize) {
-      const padded = JSON.stringify({ ...envelope, pad: padHex(bucketSize - overhead) });
-      return { bytes: new TextEncoder().encode(padded), bucket };
-    }
+  let bucket = MIN_SIZE_BUCKET;
+  while (overhead > 2 ** bucket && bucket < MAX_SIZE_BUCKET) bucket++;
+  const targetSize = 2 ** bucket;
+  if (overhead > targetSize) {
+    // Larger than the biggest bucket (shouldn't happen for chat text/receipts) — send unpadded rather
+    // than silently truncate real content; still tagged with the largest bucket, matching the
+    // previous fallback's intent.
+    return { bytes: new TextEncoder().encode(withoutPad), bucket };
   }
-  // Larger than the biggest bucket (shouldn't happen for chat text/receipts) — send unpadded rather
-  // than silently truncate real content; still tagged with the largest bucket index.
-  return { bytes: new TextEncoder().encode(withoutPad), bucket: SIZE_BUCKETS.length - 1 };
+  const padded = JSON.stringify({ ...envelope, pad: padHex(targetSize - overhead) });
+  return { bytes: new TextEncoder().encode(padded), bucket };
 }
 
 // R25 follow-up (2026-07): goes through real OHTTP now, not a plain `fetch()` — this is the highest-
 // frequency OHTTP-eligible call in the app (fires per message), higher priority in practice than the
 // three one-time enrollment calls the first R25 pass wired; see ../lib/ohttp.ts and docs/06's R25 entry.
-async function pushEnvelope(queueId: string, cap: string, envelope: Envelope, ttlMs: number): Promise<void> {
+/** Returns the QueueDO-assigned `seq` for this push (the backend always returns `{seq}` on 201,
+ * regardless of envelope kind) — needed by the sendX functions below so a locally-tracked message can
+ * later be matched against an inbound `receipt`/`read` cursor referencing that same seq. */
+async function pushEnvelope(queueId: string, cap: string, envelope: Envelope, ttlMs: number): Promise<number> {
   const { bytes, bucket } = padEnvelope(envelope);
   const res = await ohttpFetch(`/queue/${encodeURIComponent(queueId)}/push`, {
     method: "POST",
@@ -234,6 +268,8 @@ async function pushEnvelope(queueId: string, cap: string, envelope: Envelope, tt
     body: bytes,
   });
   if (!res.ok) throw new Error(`push to ${queueId} failed: HTTP ${res.status}`);
+  const { seq } = (await res.json()) as { seq: number };
+  return seq;
 }
 
 interface QueueWireMessage {
@@ -346,7 +382,8 @@ function queueIds(chatId: string, role: TransportRole): QueueIds {
 export function useQueueTransport(
   chatId: string | null,
   role: TransportRole,
-  onMessage: (chatId: string, message: ChatMessage) => void,
+  onEnvelope: (chatId: string, payload: MessagePayload, timestamp: string) => void,
+  onReceipt: (kind: "delivered" | "read", upToSeq: number) => void,
 ) {
   const { token: cap } = useAuth();
   // Device-linking pass: whether THIS device currently holds the live-session lease for this chat
@@ -370,11 +407,48 @@ export function useQueueTransport(
   const idsRef = useRef<QueueIds | null>(null);
   idsRef.current = chatId && hasLease ? queueIds(chatId, role) : null;
 
-  const onMessageRef = useRef(onMessage);
-  onMessageRef.current = onMessage;
+  const onEnvelopeRef = useRef(onEnvelope);
+  onEnvelopeRef.current = onEnvelope;
+  const onReceiptRef = useRef(onReceipt);
+  onReceiptRef.current = onReceipt;
 
   const chatIdRef = useRef(chatId);
   chatIdRef.current = chatId;
+
+  // Read-receipt bookkeeping (focus-aware — see handleInboundMessage below). `maxInboundSeqRef` is
+  // the highest inbound seq decrypted so far this mount; `pendingReadSeqRef` is the highest seq that
+  // arrived while the WINDOW was unfocused and so hasn't been marked "read" yet; `readUpToSentRef`
+  // dedupes so refocusing doesn't repeatedly resend the same cursor.
+  const maxInboundSeqRef = useRef(0);
+  const pendingReadSeqRef = useRef(0);
+  const readUpToSentRef = useRef(0);
+
+  const sendReadUpTo = useCallback(
+    (upToSeq: number) => {
+      if (upToSeq <= readUpToSentRef.current) return; // already sent an equal-or-later cursor
+      readUpToSentRef.current = upToSeq;
+      const delay = RECEIPT_DELAY_MIN_MS + Math.random() * (RECEIPT_DELAY_MAX_MS - RECEIPT_DELAY_MIN_MS);
+      setTimeout(() => {
+        const currentIds = idsRef.current;
+        if (!currentIds || !cap) return;
+        pushEnvelope(currentIds.outReceipt, cap, { type: "read", upToSeq }, RECEIPT_TTL_MS).catch((err) =>
+          console.warn("[Transport] read receipt push failed:", (err as Error).message),
+        );
+      }, delay);
+    },
+    [cap],
+  );
+
+  // Catches up on any reads that accumulated while the window was unfocused, the moment it refocuses.
+  useEffect(() => {
+    const onFocus = () => {
+      if (pendingReadSeqRef.current > readUpToSentRef.current) {
+        sendReadUpTo(pendingReadSeqRef.current);
+      }
+    };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [sendReadUpTo]);
 
   // Initiator side of the handshake, given a peer bundle from EITHER source: a queue-pushed
   // `prekey_offer` (fast path, both sides live at once) or a proactive PrekeyDO fetch on mount
@@ -501,48 +575,66 @@ export function useQueueTransport(
         return;
       }
 
-      if (envelope.type !== "message") return; // only "receipt" left, handled by the OTHER subscription
+      if (envelope.type !== "message") return; // only "receipt"/"read" left, handled by the OTHER subscription
       const session = ratchetSessionRef.current;
       if (!session) {
         console.warn("[Crypto] Dropped a message frame — no ratchet session yet (handshake incomplete)");
         return;
       }
-      let plaintext: string;
+      let plaintextJson: string;
       try {
-        plaintext = session.decryptMessage(b64ToBytes(envelope.wire), freshRatchetEntropy());
+        plaintextJson = session.decryptMessage(b64ToBytes(envelope.wire), freshRatchetEntropy());
       } catch (err) {
         console.warn("[Crypto] Dropped an undecryptable frame:", (err as Error).message);
         return;
       }
+      let payload: MessagePayload;
+      try {
+        payload = JSON.parse(plaintextJson) as MessagePayload;
+      } catch {
+        console.warn("[Crypto] Dropped a frame that decrypted but wasn't valid JSON — malformed peer or protocol mismatch");
+        return;
+      }
       console.log(
-        `[Crypto] Received ratchet frame seq ${seq} -> decrypted: "${plaintext}" (PQ remixes so far: ${session.pqRemixCount()})`,
+        `[Crypto] Received ratchet frame seq ${seq} -> decrypted "${payload.kind}" payload (PQ remixes so far: ${session.pqRemixCount()})`,
       );
-      onMessageRef.current(activeChatId, {
-        id: crypto.randomUUID(),
-        senderId: "them",
-        text: plaintext,
-        timestamp: envelope.timestamp ?? formatNow(),
-      });
+      onEnvelopeRef.current(activeChatId, payload, envelope.timestamp ?? formatNow());
+      maxInboundSeqRef.current = Math.max(maxInboundSeqRef.current, seq);
 
-      // Sealed Sender++ receipt: padded (same bucket scheme as messages, so it's not distinguishable
+      // Sealed Sender++ receipts: padded (same bucket scheme as messages, so neither is distinguishable
       // by size), delayed by a random jitter, and on a SEPARATE queue from the message path — see this
       // file's header comment for why this specific shape is the documented security property, not UX.
+      // "delivered" fires unconditionally (we successfully decrypted it); "read" only if this window
+      // was actually focused at that moment — the real Telegram/Signal distinction, made possible here
+      // because this hook only ever runs for the currently-OPEN chat (see the header comment), so
+      // "focused" is the one remaining signal that separates "arrived" from "actually seen."
+      const wasFocused = document.hasFocus();
       const delay = RECEIPT_DELAY_MIN_MS + Math.random() * (RECEIPT_DELAY_MAX_MS - RECEIPT_DELAY_MIN_MS);
       setTimeout(() => {
         const currentIds = idsRef.current;
         if (!currentIds || chatIdRef.current !== activeChatId) return; // chat changed under us — drop, not stale-deliver
-        pushEnvelope(currentIds.outReceipt, cap, { type: "receipt", ackSeq: seq }, RECEIPT_TTL_MS).catch((err) =>
+        pushEnvelope(currentIds.outReceipt, cap, { type: "receipt", upToSeq: seq }, RECEIPT_TTL_MS).catch((err) =>
           console.warn("[Transport] receipt push failed:", (err as Error).message),
         );
       }, delay);
+      if (wasFocused) {
+        sendReadUpTo(seq);
+      } else {
+        pendingReadSeqRef.current = Math.max(pendingReadSeqRef.current, seq);
+      }
     },
     [cap],
   );
 
-  // --- Inbound on the receipt queue: someone acknowledging a message WE sent ---
+  // --- Inbound on the receipt queue: someone acknowledging/reading a message WE sent ---
   const handleInboundReceipt = useCallback((envelope: Envelope) => {
-    if (envelope.type !== "receipt") return;
-    console.log(`[Transport] Receipt received for our message seq ${envelope.ackSeq}`);
+    if (envelope.type === "receipt") {
+      console.log(`[Transport] Delivered up to seq ${envelope.upToSeq}`);
+      onReceiptRef.current("delivered", envelope.upToSeq);
+    } else if (envelope.type === "read") {
+      console.log(`[Transport] Read up to seq ${envelope.upToSeq}`);
+      onReceiptRef.current("read", envelope.upToSeq);
+    }
   }, []);
 
   const msgStatus = useQueueSubscription(idsRef.current?.inMsg ?? null, cap, handleInboundMessage);
@@ -738,23 +830,68 @@ export function useQueueTransport(
     };
   }, [chatId, role, cap, hasLease, initiateHandshakeFromBundle]);
 
-  const sendMessage = useCallback(
-    (text: string) => {
+  // Common send path for every payload kind (text/edit/delete/reaction) — JSON-stringifies the
+  // payload, ratchet-encrypts it as one opaque frame (the ratchet has no idea these are different
+  // "kinds"; that's purely an application-layer distinction inside the plaintext), and returns the
+  // QueueDO-assigned seq so the caller can correlate a later `receipt`/`read` cursor back to it.
+  const sendPayload = useCallback(
+    async (payload: MessagePayload): Promise<{ ok: boolean; seq?: number }> => {
       const ids = idsRef.current;
       const session = ratchetSessionRef.current;
-      if (!ids || !cap) return false;
+      if (!ids || !cap) return { ok: false };
       if (!session) {
         console.warn("[Crypto] Not sending — PQXDH handshake not complete, no ratchet session yet");
-        return false;
+        return { ok: false };
       }
-      const wire = session.encryptMessage(text, freshRatchetEntropy());
-      console.log(`[Crypto] Sending ratchet frame (${wire.length} bytes, PQ remixes so far: ${session.pqRemixCount()})`);
-      pushEnvelope(ids.outMsg, cap, { type: "message", wire: bytesToB64(wire), timestamp: formatNow() }, MESSAGE_TTL_MS).catch((err) =>
-        console.warn("[Transport] message push failed:", (err as Error).message),
-      );
-      return true;
+      // Real bug found live (2026-07-23): a responder trying to send before receiving anything used
+      // to PANIC inside the wasm ratchet (a real Double Ratchet protocol constraint — see
+      // ratchet.rs's `ratchet_encrypt` doc comment — that used to be enforced via `.expect()` instead
+      // of a catchable error). Fixed crate-side to return a clean `Err`; this try/catch is the
+      // permanent handling for that (and any other) legitimate encrypt failure, not debug scaffolding.
+      let wire: Uint8Array;
+      try {
+        wire = session.encryptMessage(JSON.stringify(payload), freshRatchetEntropy());
+      } catch (err) {
+        console.warn("[Crypto] Cannot send:", (err as Error).message);
+        return { ok: false };
+      }
+      console.log(`[Crypto] Sending ratchet frame (${wire.length} bytes, "${payload.kind}", PQ remixes so far: ${session.pqRemixCount()})`);
+      try {
+        const seq = await pushEnvelope(ids.outMsg, cap, { type: "message", wire: bytesToB64(wire), timestamp: formatNow() }, MESSAGE_TTL_MS);
+        return { ok: true, seq };
+      } catch (err) {
+        console.warn("[Transport] message push failed:", (err as Error).message);
+        return { ok: false };
+      }
     },
     [cap],
+  );
+
+  // `id` is caller-supplied (not generated here) so the caller's own OPTIMISTIC local echo bubble can
+  // share the exact same id as what actually goes out on the wire — required for reply/edit/reaction
+  // references (built against a message's id) to resolve correctly against your own just-sent message.
+  const sendText = useCallback(
+    (id: string, text: string, opts?: { replyTo?: string; attachments?: AttachmentMeta[] }) =>
+      sendPayload({
+        kind: "text",
+        id,
+        text,
+        ...(opts?.replyTo !== undefined ? { replyTo: opts.replyTo } : {}),
+        ...(opts?.attachments !== undefined ? { attachments: opts.attachments } : {}),
+      }),
+    [sendPayload],
+  );
+  const editMessage = useCallback(
+    (targetId: string, text: string) => sendPayload({ kind: "edit", id: crypto.randomUUID(), targetId, text }),
+    [sendPayload],
+  );
+  const deleteMessage = useCallback(
+    (targetId: string) => sendPayload({ kind: "delete", id: crypto.randomUUID(), targetId }),
+    [sendPayload],
+  );
+  const reactToMessage = useCallback(
+    (targetId: string, emoji: string | null) => sendPayload({ kind: "reaction", id: crypto.randomUUID(), targetId, emoji }),
+    [sendPayload],
   );
 
   // Device-linking pass: exposes the LIVE ratchet session's state export (see ratchet.rs's
@@ -777,7 +914,10 @@ export function useQueueTransport(
 
   return {
     status: chatId ? msgStatus : "offline",
-    sendMessage,
+    sendText,
+    editMessage,
+    deleteMessage,
+    reactToMessage,
     hasLease,
     leaseHeldByOther,
     exportRatchetState,

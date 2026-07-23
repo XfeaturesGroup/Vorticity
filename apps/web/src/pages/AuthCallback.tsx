@@ -133,7 +133,7 @@ export function AuthCallback() {
   // creates the exchange promise and stores it in a ref; every later invocation (the StrictMode
   // twin, or a re-render) awaits that SAME promise instead of issuing a second request. Result:
   // one code, one exchange, no race — while the runId guard still decides which run drives the UI.
-  const exchangeRef = useRef<Promise<{ ok: boolean; error?: string }> | null>(null);
+  const exchangeRef = useRef<Promise<{ ok: boolean; error?: string; ticket?: string }> | null>(null);
 
   const code = searchParams.get("code");
   const oauthError = searchParams.get("error");
@@ -161,7 +161,7 @@ export function AuthCallback() {
 
     // Fire the single-use token exchange at most once per mount (see exchangeRef note above).
     if (!exchangeRef.current) {
-      exchangeRef.current = (async (): Promise<{ ok: boolean; error?: string }> => {
+      exchangeRef.current = (async (): Promise<{ ok: boolean; error?: string; ticket?: string }> => {
         let res: Response;
         try {
           res = await fetch(`${ENROLLMENT_API_URL}/oauth/callback`, {
@@ -180,8 +180,11 @@ export function AuthCallback() {
           return { ok: false, error: `Could not reach the Enrollment Worker at ${ENROLLMENT_API_URL}. Is it running?` };
         }
         if (res.ok) {
-          await res.json(); // { enrolled: true } — no capability token to store yet (Phase 2 TODO)
-          return { ok: true };
+          // { enrolled: true, ticket } — the ticket proves THIS oauth exchange happened; required by
+          // /token/issue below (real bug fixed 2026-07-23: that endpoint used to accept any caller
+          // with no proof of enrollment at all).
+          const { ticket } = (await res.json()) as { enrolled: boolean; ticket: string };
+          return { ok: true, ticket };
         }
         const body = (await res.json().catch(() => ({}))) as { error?: string };
         return { ok: false, error: body.error || `Enrollment request failed (HTTP ${res.status})` };
@@ -195,7 +198,7 @@ export function AuthCallback() {
 
       const result = await exchange;
       if (runId.current !== token) return;
-      if (!result.ok) {
+      if (!result.ok || !result.ticket) {
         setNetworkError(result.error ?? "Enrollment failed");
         return;
       }
@@ -217,7 +220,7 @@ export function AuthCallback() {
         issueRes = await fetch(`${ENROLLMENT_API_URL}/token/issue`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ blinded: bytesToB64(blindedMessage) }),
+          body: JSON.stringify({ blinded: bytesToB64(blindedMessage), ticket: result.ticket }),
         });
       } catch {
         if (runId.current === token) setNetworkError(`Could not reach the Enrollment Worker at ${ENROLLMENT_API_URL}.`);

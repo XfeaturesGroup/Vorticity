@@ -9,13 +9,16 @@
 // scope: this is local-device-only, not real multi-device sync — that still needs `ConvLogDO`'s
 // op-log wired in here, separate, not-yet-built work per docs/06 Phase 3.
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { ChatList } from "../components/chat/ChatList";
 import { ActiveChatPanel } from "../components/chat/ActiveChatPanel";
 import { useQueueTransport } from "../hooks/useQueueTransport";
 import { usePresence } from "../hooks/usePresence";
 import { useAliasInbox } from "../hooks/useAliasInbox";
 import { useAuth } from "../contexts/AuthContext";
-import { formatNow, type Chat, type ChatMessage } from "../lib/chat";
+import { useToast } from "../contexts/ToastContext";
+import { formatDateKey, formatNow, type AttachmentMeta, type Chat, type ChatMessage, type MessagePayload } from "../lib/chat";
+import { applyInboundPayload, applyOwnReaction } from "../lib/chatReducer";
 import { loadChatList, saveChatList } from "../lib/chatList";
 import { clearFromStore } from "../lib/secureStore";
 import {
@@ -38,73 +41,128 @@ import { buildAcceptedChat, resolveAlias, sendContactRequest, type PendingContac
 
 export function Chats() {
   const { token: cap } = useAuth();
+  const { showToast } = useToast();
+  const [searchParams, setSearchParams] = useSearchParams();
   const [chats, setChats] = useState<Chat[]>([]);
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
   const [pendingInvite, setPendingInvite] = useState<{ chatId: string; url: string } | null>(null);
   const [pendingDeviceLink, setPendingDeviceLink] = useState<{ chatId: string; url: string } | null>(null);
+  // chatId -> id of the first message that was still unread when that chat was last opened —
+  // recomputed on every `handleSelect` (see there), read by ActiveChatPanel to render a "New
+  // messages" divider. Kept here rather than on `Chat` itself since it's transient per-open UI
+  // state, not something that should get sealed into the persisted chat list.
+  const [unreadDividers, setUnreadDividers] = useState<Record<string, string>>({});
   // Gates the persist-on-change effect below until the initial restore has actually run — otherwise
   // the very first render's empty `chats` would get saved and clobber whatever was in the vault
   // before the restore even finishes loading it back.
   const hasRestoredRef = useRef(false);
+  // Real bug found live (2026-07-23, this pass): invite/link-hash consumption used to live in the
+  // SAME effect as the vault restore, keyed on `[cap]`. `cap` legitimately starts `null` and flips to
+  // the real token asynchronously (AuthContext's own vault-restore-on-mount), so THIS effect re-runs
+  // a second time for a real reason, not just StrictMode noise. The first run would consume the
+  // invite hash (clearing it) and locally mutate `restored`, then the SECOND run — cap now
+  // available — would call `loadChatList()` fresh again, get back the list WITHOUT the just-added
+  // invite chat (the persist-on-change effect hadn't necessarily flushed it to the vault yet), and
+  // `setChats(restored)` that stale snapshot, silently wiping the just-joined chat out from under the
+  // user. Reproduced live: joining an invite link before the vault-restore had resolved lost the chat
+  // every time. Fixed by (1) making the base restore genuinely mount-once (no `cap` dependency at
+  // all — it doesn't need one), and (2) moving hash consumption to its own effect that applies its
+  // result via a FUNCTIONAL `setChats(prev => ...)` update instead of a locally-mutated snapshot, so
+  // it composes correctly regardless of which effect's async work resolves first. `hashConsumedRef`
+  // additionally guards the INVITE half specifically against being processed twice even if this
+  // effect re-runs for the device-link half's sake (which genuinely does need to wait for `cap`).
+  const hashConsumedRef = useRef(false);
+  // Mirrors `hasRestoredRef` as real state (not a ref) purely so ChatList can render a loading
+  // skeleton instead of a premature "No chats yet" during the one-time vault restore on mount.
+  const [isRestoringChats, setIsRestoringChats] = useState(true);
 
   const activeChat = chats.find((c) => c.id === activeChatId) ?? null;
 
-  // Restore the persisted chat list, THEN (not in a separate/racing effect) merge in a pending
-  // invite if one exists — sequencing matters here: a separate effect for each would race (the
-  // invite-join could add a chat to the empty initial `[]`, then the restore's `setChats` would
-  // overwrite it with the persisted list, silently dropping the just-joined invite).
-  //
-  // Checks the URL hash FIRST, then a stashed invite from sessionStorage (2026-07 fix — see
-  // AuthGuard.tsx/lib/inviteLink.ts: someone opening an invite link while NOT yet authenticated gets
-  // redirected through SecurityGate -> OAuth -> AuthCallback and lands back here with no hash of its
-  // own; the invite survived that trip via the stash, not the URL).
+  // Base restore: mount-once, no `cap` dependency (loading the persisted list needs none). Merges
+  // rather than replaces `prev` — the hash-consumption effect below may have already appended a
+  // brand-new (not-yet-persisted) invite/link chat before this async load resolves; a plain
+  // `setChats(restored)` would silently drop it. Whichever of the two resolves second just layers
+  // cleanly on top of the other, regardless of ordering.
   useEffect(() => {
     let cancelled = false;
     (async () => {
       const restored = await loadChatList();
       if (cancelled) return;
+      setChats((prev) => {
+        const notYetPersisted = prev.filter((p) => !restored.some((r) => r.id === p.id));
+        return [...restored, ...notYetPersisted];
+      });
+      hasRestoredRef.current = true;
+      setIsRestoringChats(false);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Invite / device-link hash consumption — separate from the base restore above (see
+  // `hashConsumedRef`'s comment for exactly why). Checks the URL hash FIRST, then a stashed invite
+  // from sessionStorage (2026-07 fix — see AuthGuard.tsx/lib/inviteLink.ts: someone opening an invite
+  // link while NOT yet authenticated gets redirected through SecurityGate -> OAuth -> AuthCallback and
+  // lands back here with no hash of its own; the invite survived that trip via the stash, not the URL).
+  useEffect(() => {
+    if (hashConsumedRef.current) return; // invite half already handled — only device-link may still be pending `cap`
+    let cancelled = false;
+    (async () => {
       const invite = parseInviteFromLocation() ?? takeStashedPendingInvite();
       if (invite) {
+        hashConsumedRef.current = true;
         clearInviteHash();
-        if (!restored.some((c) => c.id === invite.chatId)) {
-          // Contact-bootstrap, joining side: someone opened a link generated by handleCreateInvite
-          // below. This side always takes the OPPOSITE role from whoever generated the link
-          // ("initiator": per PQXDH's one-sided handshake, useQueueTransport.ts's header comment,
-          // this side verifies + encapsulates in response to the responder's signed prekey bundle,
-          // which still flows over the queue itself — see lib/inviteLink.ts for why the bundle isn't
-          // also embedded in the URL). `invite.label`, if the inviter set one, is a purely cosmetic
-          // display name — see lib/inviteLink.ts's header comment for why it's not a public alias.
-          restored.push({
-            id: invite.chatId,
-            alias: invite.label ? `Invited by: ${invite.label}` : "New contact",
-            initials: invite.label ? invite.label.slice(0, 2).toUpperCase() : "IN",
-            role: "initiator",
-            online: false,
-            unreadCount: 0,
-            lastMessage: "Joined via invite link — waiting for handshake...",
-            lastMessageAt: formatNow(),
-            messages: [],
-            presenceEnabled: false,
-          });
-        }
+        setChats((prev) =>
+          prev.some((c) => c.id === invite.chatId)
+            ? prev
+            : [
+                ...prev,
+                // Contact-bootstrap, joining side: someone opened a link generated by
+                // handleCreateInvite below. This side always takes the OPPOSITE role from whoever
+                // generated the link ("initiator": per PQXDH's one-sided handshake,
+                // useQueueTransport.ts's header comment, this side verifies + encapsulates in
+                // response to the responder's signed prekey bundle, which still flows over the
+                // queue itself — see lib/inviteLink.ts for why the bundle isn't also embedded in the
+                // URL). `invite.label`, if the inviter set one, is a purely cosmetic display name —
+                // see lib/inviteLink.ts's header comment for why it's not a public alias.
+                {
+                  id: invite.chatId,
+                  alias: invite.label ? `Invited by: ${invite.label}` : "New contact",
+                  initials: invite.label ? invite.label.slice(0, 2).toUpperCase() : "IN",
+                  role: "initiator" as const,
+                  online: false,
+                  unreadCount: 0,
+                  lastMessage: "Joined via invite link — waiting for handshake...",
+                  lastMessageAt: formatNow(),
+                  messages: [],
+                  presenceEnabled: false,
+                },
+              ],
+        );
         setActiveChatId(invite.chatId);
+        return; // an invite and a device-link code never arrive in the same hash — mutually exclusive
       }
 
       // Device-linking pass: redeem a `#/device-link/<code>` hash the SAME way an invite hash is
       // read (parse-without-navigating, then clear) — see lib/deviceLink.ts's header comment for why
       // this is a materially higher-stakes secret than an invite code (full chat state, not just "may
       // start a session"). Requires `cap` (this device's own real session capability — DeviceLinkDO
-      // is capability-gated, see its header comment for why linking doesn't bypass account auth).
+      // is capability-gated, see its header comment for why linking doesn't bypass account auth) — so
+      // this branch alone legitimately waits for a real `cap` re-run, unlike the invite branch above.
       const linkSecret = parseLinkCodeFromLocation();
       if (linkSecret && cap) {
+        hashConsumedRef.current = true;
         clearInviteHash(); // generic hash-clear, not invite-specific despite the name — see its own doc comment
         try {
           const payload = await takeLinkPayload(linkSecret, cap);
           if (payload && !cancelled) {
             const linkedChat = await applyLinkPayload(payload);
-            const existingIdx = restored.findIndex((c) => c.id === linkedChat.id);
-            if (existingIdx >= 0) restored[existingIdx] = linkedChat;
-            else restored.push(linkedChat);
+            setChats((prev) => {
+              const existingIdx = prev.findIndex((c) => c.id === linkedChat.id);
+              if (existingIdx >= 0) return prev.map((c, i) => (i === existingIdx ? linkedChat : c));
+              return [...prev, linkedChat];
+            });
             setActiveChatId(linkedChat.id);
             console.log(`[DeviceLink] Redeemed a device-link code for chat ${linkedChat.id.slice(0, 12)}... — history + crypto state applied.`);
           } else if (!cancelled) {
@@ -114,9 +172,6 @@ export function Chats() {
           console.warn("[DeviceLink] Failed to redeem device-link code:", (err as Error).message);
         }
       }
-
-      setChats(restored);
-      hasRestoredRef.current = true;
     })();
     return () => {
       cancelled = true;
@@ -133,28 +188,70 @@ export function Chats() {
     saveChatList(chats).catch((err) => console.warn("[Chats] Failed to persist chat list:", (err as Error).message));
   }, [chats]);
 
-  // Appends a message pushed down the wire for `chatId` into that chat's history. Only the active
-  // chat ever has a live socket (see useQueueTransport's scoping note), so this always targets the
-  // conversation currently on screen — no unread-badge bump needed, it's already being read live.
-  const handleIncoming = useCallback((chatId: string, message: ChatMessage) => {
+  // Applies an inbound (decrypted) payload — text/edit/delete/reaction — to `chatId`'s history via the
+  // pure chatReducer. Only the active chat ever has a live socket (see useQueueTransport's scoping
+  // note), so this always targets the conversation currently on screen — no unread-badge bump needed,
+  // it's already being read live. List preview reflects the payload kind (a photo/edit/delete should
+  // read differently than a plain text last-message, same as any real messenger).
+  const handleIncoming = useCallback((chatId: string, payload: MessagePayload, timestamp: string) => {
     setChats((prev) =>
-      prev.map((c) =>
-        c.id === chatId
-          ? { ...c, messages: [...c.messages, message], lastMessage: message.text, lastMessageAt: message.timestamp }
-          : c,
-      ),
+      prev.map((c) => {
+        if (c.id !== chatId) return c;
+        const next = applyInboundPayload(c, payload, timestamp);
+        const preview =
+          payload.kind === "text"
+            ? payload.attachments?.length
+              ? `📎 ${payload.attachments[0]!.name}`
+              : payload.text
+            : payload.kind === "delete"
+              ? "Message deleted"
+              : payload.kind === "edit"
+                ? `${payload.text} (edited)`
+                : c.lastMessage;
+        return payload.kind === "reaction" ? next : { ...next, lastMessage: preview, lastMessageAt: timestamp };
+      }),
     );
   }, []);
+
+  // Updates the ACTIVE chat's own messages' delivery/read status by matching `outSeq` against the
+  // cursor the peer just acknowledged — see useQueueTransport.ts's header comment for why both
+  // "receipt"(delivered)/"read" are monotonic cursors, not per-message flags. Never downgrades an
+  // already-"read" message back to "delivered" if cursors arrive out of order.
+  const handleReceipt = useCallback(
+    (kind: "delivered" | "read", upToSeq: number) => {
+      setChats((prev) =>
+        prev.map((c) =>
+          c.id !== activeChatId
+            ? c
+            : {
+                ...c,
+                messages: c.messages.map((m) => {
+                  if (m.senderId !== "me" || m.outSeq === undefined || m.outSeq > upToSeq) return m;
+                  if (m.status === "read") return m; // terminal for this pass — never downgrades
+                  return { ...m, status: kind };
+                }),
+              },
+        ),
+      );
+    },
+    [activeChatId],
+  );
 
   // Per-chat role now (was a hardcoded "initiator" for every chat): the 4 mock contacts keep
   // defaulting to "initiator" (mockChats.ts), while invite-bootstrapped chats carry whichever role
   // they were actually assigned above / in handleCreateInvite below — a real two-party exchange needs
   // one side on each role, per PQXDH's one-sided handshake (useQueueTransport.ts's header comment).
-  const { status: socketStatus, sendMessage, hasLease, leaseHeldByOther, exportRatchetState, getTrustedPeerBundle } = useQueueTransport(
-    activeChatId,
-    activeChat?.role ?? "initiator",
-    handleIncoming,
-  );
+  const {
+    status: socketStatus,
+    sendText,
+    editMessage,
+    deleteMessage,
+    reactToMessage,
+    hasLease,
+    leaseHeldByOther,
+    exportRatchetState,
+    getTrustedPeerBundle,
+  } = useQueueTransport(activeChatId, activeChat?.role ?? "initiator", handleIncoming, handleReceipt);
 
   // Opt-in presence (docs/06 "Still open: PresenceDO", closed 2026-07) — only live for the active
   // chat, only connects when that chat's own `presenceEnabled` toggle is on. See usePresence.ts's
@@ -167,10 +264,38 @@ export function Chats() {
   const { pending: pendingRequests, markHandled } = useAliasInbox(cap);
 
   const handleSelect = (id: string) => {
+    // Capture where the "New messages" divider belongs BEFORE zeroing unreadCount below — unread
+    // messages are always the tail of `messages` while a chat sits inactive (only the active chat
+    // ever has a live socket, see useQueueTransport's scoping note), so the first unread one is
+    // simply `messages.length - unreadCount`.
+    const target = chats.find((c) => c.id === id);
+    if (target && target.unreadCount > 0) {
+      const firstUnread = target.messages[target.messages.length - target.unreadCount];
+      if (firstUnread) setUnreadDividers((prev) => ({ ...prev, [id]: firstUnread.id }));
+    }
     setActiveChatId(id);
     setChats((prev) => prev.map((c) => (c.id === id ? { ...c, unreadCount: 0 } : c)));
     if (pendingInvite && pendingInvite.chatId !== id) setPendingInvite(null);
   };
+
+  // CommandPalette.tsx hands off a selection this way (`?open=<chatId>`) rather than through a
+  // shared context — it reads the persisted chat list independently, so this page is what actually
+  // owns applying the selection once the id is confirmed to exist in ITS copy of `chats`.
+  useEffect(() => {
+    const openId = searchParams.get("open");
+    if (!openId) return;
+    if (chats.some((c) => c.id === openId)) {
+      handleSelect(openId);
+      setSearchParams(
+        (prev) => {
+          prev.delete("open");
+          return prev;
+        },
+        { replace: true },
+      );
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams, chats]);
 
   // Contact/chat deletion: removes the chat from the local list AND every piece of local crypto
   // state associated with it — a stale identity/prekey-pool/imported-ratchet-state record left
@@ -294,7 +419,10 @@ export function Chats() {
     ]);
     setActiveChatId(chatId);
     setPendingInvite({ chatId, url });
-    navigator.clipboard?.writeText(url).catch(() => {});
+    navigator.clipboard
+      ?.writeText(url)
+      .then(() => showToast("Invite link copied to clipboard", "success"))
+      .catch(() => {});
   };
 
   // Device-linking pass: seals the active chat's full state (identity/KEM/pool for a responder, the
@@ -311,24 +439,86 @@ export function Chats() {
       await putLinkPayload(secret, cap, payloadBytes);
       const url = buildLinkUrl(secret);
       setPendingDeviceLink({ chatId: activeChat.id, url });
-      navigator.clipboard?.writeText(url).catch(() => {});
+      navigator.clipboard
+        ?.writeText(url)
+        .then(() => showToast("Device-link code copied to clipboard", "success"))
+        .catch(() => {});
     } catch (err) {
       console.warn("[DeviceLink] Failed to create a device-link code:", (err as Error).message);
+      showToast("Failed to create a device-link code", "error");
     }
   };
 
-  const handleSend = (text: string) => {
+  // Optimistic local echo (instant feedback) with a REAL status lifecycle now (sending -> sent/failed
+  // -> delivered -> read, via handleReceipt above) rather than a fire-and-forget append — the id is
+  // generated HERE and threaded through to sendText so a later receipt/read cursor, or the user's own
+  // reply/edit/reaction against this exact message, all resolve against the same id the wire actually
+  // used.
+  const handleSend = async (text: string, opts?: { replyTo?: string; attachments?: AttachmentMeta[] }) => {
     if (!activeChatId) return;
-    // Optimistic local echo (instant feedback, standard messaging UX) *and* a real send over the
-    // wire — the mock endpoint won't echo it back, so without the local append the sent bubble
-    // would never appear. This is a deliberate Phase 5 scoping call, not a leftover mock.
-    const message: ChatMessage = { id: crypto.randomUUID(), senderId: "me", text, timestamp: formatNow() };
+    const id = crypto.randomUUID();
+    const message: ChatMessage = {
+      id,
+      senderId: "me",
+      text,
+      timestamp: formatNow(),
+      dateKey: formatDateKey(),
+      status: "sending",
+      ...(opts?.replyTo !== undefined ? { replyTo: opts.replyTo } : {}),
+      ...(opts?.attachments !== undefined ? { attachments: opts.attachments } : {}),
+    };
     setChats((prev) =>
       prev.map((c) =>
         c.id === activeChatId ? { ...c, messages: [...c.messages, message], lastMessage: text, lastMessageAt: message.timestamp } : c,
       ),
     );
-    sendMessage(text);
+    const result = await sendText(id, text, opts);
+    setChats((prev) =>
+      prev.map((c) =>
+        c.id !== activeChatId
+          ? c
+          : {
+              ...c,
+              messages: c.messages.map((m) =>
+                m.id === id ? { ...m, status: result.ok ? "sent" : "failed", ...(result.seq !== undefined ? { outSeq: result.seq } : {}) } : m,
+              ),
+            },
+      ),
+    );
+    if (!result.ok) showToast("Message failed to send", "error");
+  };
+
+  const handleEditMessage = async (targetId: string, text: string) => {
+    if (!activeChatId) return;
+    setChats((prev) =>
+      prev.map((c) => (c.id === activeChatId ? { ...c, messages: c.messages.map((m) => (m.id === targetId ? { ...m, text, edited: true } : m)) } : c)),
+    );
+    await editMessage(targetId, text);
+  };
+
+  const handleDeleteMessage = async (targetId: string) => {
+    if (!activeChatId) return;
+    setChats((prev) =>
+      prev.map((c) =>
+        c.id === activeChatId
+          ? {
+              ...c,
+              messages: c.messages.map((m) => {
+                if (m.id !== targetId) return m;
+                const { attachments: _attachments, reactions: _reactions, ...rest } = m;
+                return { ...rest, deleted: true, text: "" };
+              }),
+            }
+          : c,
+      ),
+    );
+    await deleteMessage(targetId);
+  };
+
+  const handleReact = async (targetId: string, emoji: string | null) => {
+    if (!activeChatId) return;
+    setChats((prev) => prev.map((c) => (c.id === activeChatId ? applyOwnReaction(c, targetId, emoji) : c)));
+    await reactToMessage(targetId, emoji);
   };
 
   const showInviteBanner = pendingInvite !== null && pendingInvite.chatId === activeChatId;
@@ -372,7 +562,12 @@ export function Chats() {
           />
           <button
             type="button"
-            onClick={() => navigator.clipboard?.writeText(pendingInvite!.url).catch(() => {})}
+            onClick={() =>
+              navigator.clipboard
+                ?.writeText(pendingInvite!.url)
+                .then(() => showToast("Invite link copied to clipboard", "success"))
+                .catch(() => {})
+            }
             className="shrink-0 px-3 py-1 text-xs rounded-lg bg-fluid-peach/90 hover:bg-fluid-peach text-black transition-colors"
           >
             Copy
@@ -395,7 +590,12 @@ export function Chats() {
           />
           <button
             type="button"
-            onClick={() => navigator.clipboard?.writeText(pendingDeviceLink!.url).catch(() => {})}
+            onClick={() =>
+              navigator.clipboard
+                ?.writeText(pendingDeviceLink!.url)
+                .then(() => showToast("Device-link code copied to clipboard", "success"))
+                .catch(() => {})
+            }
             className="shrink-0 px-3 py-1 text-xs rounded-lg bg-signal-danger/90 hover:bg-signal-danger text-black transition-colors"
           >
             Copy
@@ -406,25 +606,38 @@ export function Chats() {
         </div>
       )}
       <div className="flex-1 min-h-0 flex rounded-2xl border border-white/10 overflow-hidden vx-glass-dimmable">
-        <ChatList
-          chats={displayChats}
-          activeChatId={activeChatId}
-          onSelect={handleSelect}
-          onCreateInvite={handleCreateInvite}
-          onDelete={handleDeleteChat}
-          onAddByAlias={handleAddByAlias}
-        />
-        <ActiveChatPanel
-          chat={displayActiveChat}
-          socketStatus={socketStatus}
-          onSend={handleSend}
-          peerTyping={peerTyping}
-          onTypingDraft={sendTyping}
-          onTogglePresence={handleTogglePresence}
-          onLinkDevice={handleLinkDevice}
-          canLinkDevice={hasLease}
-          leaseHeldByOther={leaseHeldByOther}
-        />
+        {/* Mobile (below `md`): only one pane shows at a time, toggled by whether a chat is active —
+            list-then-conversation navigation with a back button, not a squeezed two-pane layout.
+            `md:flex` on both unconditionally restores the normal side-by-side desktop split. */}
+        <div className={activeChatId ? "hidden md:flex" : "flex"}>
+          <ChatList
+            chats={displayChats}
+            isLoading={isRestoringChats}
+            activeChatId={activeChatId}
+            onSelect={handleSelect}
+            onCreateInvite={handleCreateInvite}
+            onDelete={handleDeleteChat}
+            onAddByAlias={handleAddByAlias}
+          />
+        </div>
+        <div className={(!activeChatId ? "hidden md:flex" : "flex") + " flex-1 min-w-0"}>
+          <ActiveChatPanel
+            chat={displayActiveChat}
+            socketStatus={socketStatus}
+            onSend={handleSend}
+            onEditMessage={handleEditMessage}
+            onDeleteMessage={handleDeleteMessage}
+            onReact={handleReact}
+            onBack={() => setActiveChatId(null)}
+            unreadDividerMessageId={activeChatId ? (unreadDividers[activeChatId] ?? null) : null}
+            peerTyping={peerTyping}
+            onTypingDraft={sendTyping}
+            onTogglePresence={handleTogglePresence}
+            onLinkDevice={handleLinkDevice}
+            canLinkDevice={hasLease}
+            leaseHeldByOther={leaseHeldByOther}
+          />
+        </div>
       </div>
     </div>
   );
