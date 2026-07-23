@@ -31,6 +31,7 @@ import init, {
   identity_sign_bundle,
   identity_verify_bundle,
   RatchetSession,
+  MlsGroupSession,
   alias_lookup_key,
   alias_derive_record_key,
   pow_mint,
@@ -252,3 +253,13 @@ export function powMint(resource: string, minBits: number, epoch: number, salt: 
 export function powVerify(stamp: string, expectedResource: string, minBits: number): boolean {
   return pow_verify(stamp, expectedResource, minBits);
 }
+
+// --- MLS groups (RFC 9420, X-Wing hybrid PQ ciphersuite) — see group.rs's module doc for the full
+// design and docs/03 §5. Same opaque-handle convention as RatchetSession above: all group state
+// lives inside the WASM object, exportState()/importState() are the persistence pair (MUST be
+// sealed before touching disk — see group.rs's own doc comment on exportState, identical warning to
+// RatchetSession's). Passthrough only, no thin wrapper needed beyond re-exporting the class itself
+// (wasm-bindgen's generated methods are already the real API — see useGroupTransport.ts/lib/group.ts
+// for the JS-side conventions built on top: base64 framing, sealed persistence, invite exchange).
+
+export { MlsGroupSession };

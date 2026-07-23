@@ -44,16 +44,19 @@ function corsHeaders(origin: string | null): Record<string, string> {
 // silently forwarded, so this Worker can never be turned into an open proxy for arbitrary origins.
 const ALLOWED_PATHS = new Set(["/ohttp/keys", "/ohttp/gateway"]);
 
-// Matches exactly `/queue/{id}`, `/conv/{id}`, or `/presence/{id}` — the WS subscribe endpoints
-// QueueDO/ConvLogDO/PresenceDO expose (see workers/messaging/src/index.ts's `/queue/:queueId/*`,
-// `/conv/:convId/*`, and `/presence/:chatId/*` routes; the WS upgrade case is the SAME path as the
-// plain HTTP routes under those prefixes, distinguished only by the `Upgrade` header, not a different
-// sub-path). No trailing segment allowed (`/queue/{id}/push` — the OHTTP-wrapped send path — must NOT
-// match here; it's handled entirely by the `/ohttp/gateway` branch above and never needs raw WS
-// proxying). `presence` added alongside `queue`/`conv` (2026-07, PresenceDO pass) — same structural
+// Matches exactly `/queue/{id}`, `/conv/{id}`, `/presence/{id}`, or `/group/{id}` — the WS subscribe
+// endpoints QueueDO/ConvLogDO/PresenceDO/GroupDO expose (see workers/messaging/src/index.ts's
+// `/queue/:queueId/*`, `/conv/:convId/*`, `/presence/:chatId/*`, and `/group/:groupId/*` routes; the
+// WS upgrade case is the SAME path as the plain HTTP routes under those prefixes, distinguished only
+// by the `Upgrade` header, not a different sub-path). No trailing segment allowed (`/queue/{id}/push`
+// — the OHTTP-wrapped send path — must NOT match here; it's handled entirely by the `/ohttp/gateway`
+// branch above and never needs raw WS proxying). `presence` added alongside `queue`/`conv` (2026-07,
+// PresenceDO pass); `group` added (2026-07, first group-chat client pass) — GroupDO's `/push`/`/sync`
+// have no OHTTP-wrapped path yet (see GroupDO.ts's own header comment on that gap), but its WS
+// subscribe still needs the same real-IP-hiding proxy every other live socket gets — same structural
 // reasoning as R26's own note above: WS is single-shot-incompatible with OHTTP, so this is the same
 // plain network-level proxy, not a new mechanism.
-const WS_PROXY_PATTERN = /^\/(queue|conv|presence)\/[^/]+$/;
+const WS_PROXY_PATTERN = /^\/(queue|conv|presence|group)\/[^/]+$/;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
