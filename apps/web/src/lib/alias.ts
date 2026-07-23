@@ -206,6 +206,131 @@ export async function registerAlias(nickname: string, cap: string): Promise<OwnA
   return { nickname, introQueueId };
 }
 
+// --- Alias identity linking (2026-07): moves the @alias registration (seed + nickname + intro
+// queue id) to another of the user's OWN devices — requested live ("между устройствами разве @alias
+// не синхронизируется?"). Registration was purely per-device until now, with no way for a second
+// device to present the same identity. Reuses DeviceLinkDO's existing generic one-time dead-drop
+// server-side (see lib/deviceLink.ts's header comment: it's an opaque secret-derived key-value
+// store, not chat-specific — no backend changes needed), with its own domain-separated HKDF info
+// string and hash namespace (`#/alias-link/...` vs. `#/device-link/...`) so an alias-link code can
+// never be substituted for a chat-link code or vice versa even though they share the same DO. Same
+// trust model as lib/deviceLink.ts: whoever holds the code can read this identity for as long as the
+// drop is unclaimed — move it only between your OWN devices, never through any other channel.
+const ALIAS_LINK_SECRET_BYTES = 32;
+
+function bytesToB64Url(bytes: Uint8Array): string {
+  return bytesToB64(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function b64UrlToBytes(s: string): Uint8Array | null {
+  try {
+    const padded = s.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(s.length / 4) * 4, "=");
+    return b64ToBytes(padded);
+  } catch {
+    return null;
+  }
+}
+
+export function generateAliasLinkingSecret(): Uint8Array {
+  const secret = new Uint8Array(ALIAS_LINK_SECRET_BYTES);
+  crypto.getRandomValues(secret);
+  return secret;
+}
+export function buildAliasLinkUrl(secret: Uint8Array): string {
+  return `${location.origin}${location.pathname}#/alias-link/${bytesToB64Url(secret)}`;
+}
+/** Reads a pending alias-link code out of the current URL's hash, without navigating — same
+ * "parse without consuming" convention lib/inviteLink.ts's parseInviteFromLocation uses. */
+export function parseAliasLinkFromLocation(): Uint8Array | null {
+  const match = /^#\/alias-link\/([^/?#]+)$/.exec(location.hash);
+  if (!match) return null;
+  const bytes = b64UrlToBytes(decodeURIComponent(match[1]!));
+  return bytes && bytes.length === ALIAS_LINK_SECRET_BYTES ? bytes : null;
+}
+export function clearAliasLinkHash(): void {
+  history.replaceState(null, "", location.pathname + location.search);
+}
+
+async function aliasLinkIdFromSecret(secret: Uint8Array): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", secret as BufferSource);
+  return [...new Uint8Array(digest).slice(0, 16)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+async function deriveAliasLinkAeadKey(secret: Uint8Array): Promise<CryptoKey> {
+  const hkdfKey = await crypto.subtle.importKey("raw", secret as BufferSource, "HKDF", false, ["deriveKey"]);
+  return crypto.subtle.deriveKey(
+    { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(0), info: new TextEncoder().encode("vortic-alias-link-v1") },
+    hkdfKey,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt", "decrypt"],
+  );
+}
+async function sealAliasLink(secret: Uint8Array, plaintext: Uint8Array): Promise<Uint8Array> {
+  const key = await deriveAliasLinkAeadKey(secret);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ciphertext = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plaintext as BufferSource));
+  const out = new Uint8Array(iv.length + ciphertext.length);
+  out.set(iv, 0);
+  out.set(ciphertext, iv.length);
+  return out;
+}
+async function unsealAliasLink(secret: Uint8Array, sealed: Uint8Array): Promise<Uint8Array | null> {
+  if (sealed.length < 12) return null;
+  const key = await deriveAliasLinkAeadKey(secret);
+  try {
+    return new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv: sealed.slice(0, 12) }, key, sealed.slice(12) as BufferSource));
+  } catch {
+    return null; // wrong secret, or tampered/corrupt blob
+  }
+}
+
+interface AliasLinkPayload {
+  nickname: string;
+  introQueueId: string;
+  seedB64: string;
+}
+
+/** Publishing device's half: seals this device's alias identity and drops it at DeviceLinkDO. Throws
+ * if no alias is registered on this device yet — callers should gate the UI on `loadOwnAlias()`. */
+export async function publishAliasLink(secret: Uint8Array, cap: string): Promise<void> {
+  const own = await loadOwnAlias();
+  if (!own) throw new Error("No alias registered on this device yet");
+  const seed = await ownAliasSeed();
+  const payload: AliasLinkPayload = { nickname: own.nickname, introQueueId: own.introQueueId, seedB64: bytesToB64(seed) };
+  const sealed = await sealAliasLink(secret, new TextEncoder().encode(JSON.stringify(payload)));
+  const linkId = await aliasLinkIdFromSecret(secret);
+  const res = await ohttpFetch(`/device-link/${encodeURIComponent(linkId)}/put`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${cap}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ blob: bytesToB64(sealed) }),
+  });
+  if (!res.ok) throw new Error(`alias-link publish failed: HTTP ${res.status}`);
+}
+
+/** Receiving device's half: fetches+unseals the payload and writes it into THIS device's own alias
+ * storage (the exact same keys registerAlias/loadOwnAlias already use), overwriting anything already
+ * there. Returns `null` if nothing's there yet (not yet published, already claimed, expired, or the
+ * ciphertext failed to authenticate under this secret) — all treated the same by the caller, same
+ * "not ready yet" convention lib/deviceLink.ts's takeLinkPayload already uses. */
+export async function claimAliasLink(secret: Uint8Array, cap: string): Promise<OwnAlias | null> {
+  const linkId = await aliasLinkIdFromSecret(secret);
+  const res = await ohttpFetch(`/device-link/${encodeURIComponent(linkId)}/take`, {
+    method: "GET",
+    headers: { Authorization: `Bearer ${cap}` },
+  });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`alias-link claim failed: HTTP ${res.status}`);
+  const { blob } = (await res.json()) as { blob: string };
+  const plain = await unsealAliasLink(secret, b64ToBytes(blob));
+  if (!plain) return null;
+  const payload = JSON.parse(new TextDecoder().decode(plain)) as AliasLinkPayload;
+  await Promise.all([
+    sealToStore(OWN_SEED_KEY, b64ToBytes(payload.seedB64)),
+    sealToStore(OWN_NICKNAME_KEY, new TextEncoder().encode(payload.nickname)),
+    sealToStore(OWN_INTRO_QUEUE_KEY, new TextEncoder().encode(payload.introQueueId)),
+  ]);
+  return { nickname: payload.nickname, introQueueId: payload.introQueueId };
+}
+
 export interface ResolvedAlias {
   introQueueId: string;
   aliasPub: Uint8Array;
