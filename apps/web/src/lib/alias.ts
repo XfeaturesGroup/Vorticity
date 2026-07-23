@@ -77,8 +77,18 @@ async function unsealWithRecKey(rawKey: Uint8Array, sealed: Uint8Array): Promise
 }
 
 // --- Padding: same size-bucket scheme useQueueTransport.ts's Sealed Sender++ padding uses, so a
-// contact-request blob isn't distinguishable from an ordinary queue message by ciphertext length. ---
-const SIZE_BUCKETS = [256, 512, 1024, 2048, 4096, 8192, 16384];
+// contact-request blob isn't distinguishable from an ordinary queue message by ciphertext length.
+//
+// REAL BUG found + fixed (2026-07, live use): `bucket` below used to be an ARRAY INDEX into a
+// `SIZE_BUCKETS = [256, 512, ...]` table, but every server-side check (workers/messaging/src/
+// bucketing.ts's `validateSizeBucket`) treats the value as a literal power-of-two EXPONENT — the
+// exact same index-vs-exponent mismatch already found and fixed in useQueueTransport.ts's
+// `padEnvelope` earlier this session, just never propagated to this file. This meant every real
+// `/alias/introduce` contact-request send failed with a 400 ("ciphertext length N does not match
+// declared size_bucket B") the instant the payload was non-trivially sized — i.e. always, since a
+// real sealed contact-request payload never fits in the smallest bucket by coincidence at index 0.
+const MIN_SIZE_BUCKET = 8; // 2^8 = 256 bytes
+const MAX_SIZE_BUCKET = 24; // 2^24 = 16 MiB — mirrors bucketing.ts's ceiling
 
 function bytesToHex(bytes: Uint8Array): string {
   return Array.from(bytes)
@@ -95,14 +105,12 @@ function padHex(byteLen: number): string {
 function padJson(obj: unknown): { bytes: Uint8Array; bucket: number } {
   const withoutPad = JSON.stringify({ ...(obj as object), pad: "" });
   const overhead = new TextEncoder().encode(withoutPad).length;
-  for (let bucket = 0; bucket < SIZE_BUCKETS.length; bucket++) {
-    const bucketSize = SIZE_BUCKETS[bucket]!;
-    if (overhead <= bucketSize) {
-      const padded = JSON.stringify({ ...(obj as object), pad: padHex(bucketSize - overhead) });
-      return { bytes: new TextEncoder().encode(padded), bucket };
-    }
-  }
-  return { bytes: new TextEncoder().encode(withoutPad), bucket: SIZE_BUCKETS.length - 1 };
+  let bucket = MIN_SIZE_BUCKET;
+  while (overhead > 2 ** bucket && bucket < MAX_SIZE_BUCKET) bucket++;
+  const targetSize = 2 ** bucket;
+  if (overhead > targetSize) return { bytes: new TextEncoder().encode(withoutPad), bucket };
+  const padded = JSON.stringify({ ...(obj as object), pad: padHex(targetSize - overhead) });
+  return { bytes: new TextEncoder().encode(padded), bucket };
 }
 
 // --- PoW mining, off the main thread (apps/web/src/workers/powMiner.worker.ts) ---

@@ -11,9 +11,11 @@ import { useToast } from "../contexts/ToastContext";
 import { useGroupTransport } from "../hooks/useGroupTransport";
 import {
   buildGroupInviteUrl,
+  checkAndProcessJoinRequest,
   clearGroupInviteHash,
   createGroup,
   generateInviteId,
+  loadGroupSession,
   parseGroupInviteFromLocation,
   pollForWelcome,
   requestToJoinGroup,
@@ -88,6 +90,7 @@ export function GroupChats() {
                       lastMessage: "You joined this group",
                       lastMessageAt: formatNow(),
                       messages: [],
+                      pendingInviteIds: [],
                     },
                   ],
             );
@@ -114,37 +117,81 @@ export function GroupChats() {
     );
   };
 
-  const { status: socketStatus, hasSession, sendMessage, processJoinRequest } = useGroupTransport(activeGroupId, cap, handleIncomingMessage);
+  const { status: socketStatus, hasSession, sendMessage, refreshSession, processJoinRequest } = useGroupTransport(
+    activeGroupId,
+    cap,
+    handleIncomingMessage,
+  );
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
   }, [activeGroupId, activeGroup?.messages.length]);
 
-  // While an invite is pending, poll for the prospective member's KeyPackage and process it the
-  // moment it arrives — same interval-poll shape as the invitee side above.
+  // Durable background poll for ALL outstanding invites across ALL groups — NOT scoped to whichever
+  // group happens to be active or whether a specific "Invite" banner is still mounted. Real bug found
+  // live: the original design only checked the invite that was still showing in an ephemeral React
+  // state variable, so navigating to another group (or a reload) silently stranded the invitee's
+  // KeyPackage in the queue forever, with nothing on the creator's side ever coming back to look for
+  // it again. `pendingInviteIds` (lib/groupList.ts) persists which invites are still outstanding, so
+  // this poll resumes correctly across reloads/navigation as long as the app is open at some point.
+  const groupsRef = useRef(groups);
+  groupsRef.current = groups;
+  const activeGroupIdRef = useRef(activeGroupId);
+  activeGroupIdRef.current = activeGroupId;
+  const processJoinRequestRef = useRef(processJoinRequest);
+  processJoinRequestRef.current = processJoinRequest;
   useEffect(() => {
-    if (!pendingInvite) return;
+    if (!cap || !hasRestored) return;
     const timer = setInterval(async () => {
-      try {
-        const added = await processJoinRequest(pendingInvite.inviteId);
-        if (!added) return;
-        clearInterval(timer);
-        setGroups((prev) => prev.map((g) => (g.id === pendingInvite.groupId ? { ...g, memberCount: g.memberCount + 1 } : g)));
-        setPendingInvite(null);
-        showToast("Someone joined the group", "success");
-      } catch (err) {
-        console.warn("[GroupChats] Failed to process a join request:", (err as Error).message);
+      for (const group of groupsRef.current) {
+        if (group.pendingInviteIds.length === 0) continue;
+        // The ACTIVE group already has a live `MlsGroupSession` object inside useGroupTransport
+        // (kept up to date as messages/commits arrive) — route through its own `processJoinRequest`
+        // rather than loading a second, possibly-stale copy from disk, which could otherwise fork the
+        // group's state if the live session had unsaved-yet progress at the moment of the poll.
+        // Every OTHER group has no live session to conflict with, so loading fresh here is safe.
+        const isActive = group.id === activeGroupIdRef.current;
+        for (const inviteId of group.pendingInviteIds) {
+          try {
+            const added = isActive
+              ? await processJoinRequestRef.current(inviteId)
+              : await (async () => {
+                  const session = await loadGroupSession(group.id);
+                  return session ? checkAndProcessJoinRequest(group.id, inviteId, cap, session) : false;
+                })();
+            if (!added) continue;
+            setGroups((prev) =>
+              prev.map((g) =>
+                g.id === group.id ? { ...g, memberCount: g.memberCount + 1, pendingInviteIds: g.pendingInviteIds.filter((id) => id !== inviteId) } : g,
+              ),
+            );
+            showToast(`Someone joined ${group.name}`, "success");
+          } catch (err) {
+            console.warn(`[GroupChats] Failed to process a join request for ${group.id}:`, (err as Error).message);
+          }
+        }
       }
     }, JOIN_POLL_INTERVAL_MS);
     return () => clearInterval(timer);
-  }, [pendingInvite, processJoinRequest, showToast]);
+  }, [cap, hasRestored, showToast]);
+
+  // Purely cosmetic: auto-dismiss the "here's your invite link" banner once the background poll
+  // above has actually claimed that invite (removed it from the group's persisted pending list).
+  useEffect(() => {
+    if (!pendingInvite) return;
+    const group = groups.find((g) => g.id === pendingInvite.groupId);
+    if (group && !group.pendingInviteIds.includes(pendingInvite.inviteId)) setPendingInvite(null);
+  }, [groups, pendingInvite]);
 
   const handleCreateGroup = async () => {
     const name = nameDraft.trim();
     if (!name) return;
     try {
       const { groupId } = await createGroup();
-      setGroups((prev) => [...prev, { id: groupId, name, memberCount: 1, lastMessage: "You created this group", lastMessageAt: formatNow(), messages: [] }]);
+      setGroups((prev) => [
+        ...prev,
+        { id: groupId, name, memberCount: 1, lastMessage: "You created this group", lastMessageAt: formatNow(), messages: [], pendingInviteIds: [] },
+      ]);
       setActiveGroupId(groupId);
       setCreating(false);
       setNameDraft("");
@@ -157,6 +204,7 @@ export function GroupChats() {
     if (!activeGroup) return;
     const inviteId = generateInviteId();
     const url = buildGroupInviteUrl(activeGroup.id, inviteId, activeGroup.name);
+    setGroups((prev) => prev.map((g) => (g.id === activeGroup.id ? { ...g, pendingInviteIds: [...g.pendingInviteIds, inviteId] } : g)));
     setPendingInvite({ groupId: activeGroup.id, inviteId, url });
     navigator.clipboard?.writeText(url).then(() => showToast("Invite link copied to clipboard", "success")).catch(() => {});
   };

@@ -22,6 +22,13 @@ export interface GroupChat {
   lastMessage: string;
   lastMessageAt: string;
   messages: GroupMessage[];
+  /** Outstanding invite ids this device has generated for this group and not yet seen claimed —
+   * durable (survives navigating away/reloading), so processing a join request doesn't depend on
+   * the "Invite" banner still being open in memory. See GroupChats.tsx's background poll, which
+   * checks every group's list here, not just whichever one happens to be active. Real bug found
+   * live: the original design only polled while a specific ephemeral UI banner was mounted — closing
+   * it (or just navigating to another group) silently stranded the invitee polling forever. */
+  pendingInviteIds: string[];
 }
 
 const STORE_KEY = "group-chat-list";
@@ -43,6 +50,7 @@ export async function loadGroupList(): Promise<GroupChat[]> {
       lastMessage: g.lastMessage ?? "",
       lastMessageAt: g.lastMessageAt ?? "",
       messages: Array.isArray(g.messages) ? g.messages : [],
+      pendingInviteIds: Array.isArray(g.pendingInviteIds) ? g.pendingInviteIds : [],
     }));
   } catch {
     return [];
