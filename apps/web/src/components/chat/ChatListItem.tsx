@@ -17,12 +17,12 @@ export function ChatListItem({ chat, isActive, onClick, onDelete }: ChatListItem
       onClick={onClick}
       onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && onClick()}
       className={cn(
-        "group w-full flex items-center gap-3 px-4 py-3 text-left transition-colors border-b border-white/5 cursor-pointer",
-        isActive ? "bg-white/5" : "hover:bg-white/[0.03]",
+        "group w-full flex items-center gap-3.5 px-4 py-3.5 text-left transition-colors border-b border-white/5 cursor-pointer",
+        isActive ? "bg-white/[0.06]" : "hover:bg-white/[0.04]",
       )}
     >
       <div className="relative shrink-0">
-        <div className="w-11 h-11 rounded-full bg-fluid-peach/15 border border-fluid-peach/20 flex items-center justify-center text-sm font-semibold text-fluid-peach">
+        <div className="w-12 h-12 rounded-full bg-fluid-peach/15 border border-fluid-peach/20 flex items-center justify-center text-sm font-semibold text-fluid-peach">
           {chat.initials}
         </div>
         {chat.online && (
@@ -34,7 +34,7 @@ export function ChatListItem({ chat, isActive, onClick, onDelete }: ChatListItem
           <span className="text-sm font-medium text-white truncate">{chat.alias}</span>
           <span className="text-[10px] text-white/40 shrink-0">{chat.lastMessageAt}</span>
         </div>
-        <div className="flex items-center justify-between gap-2 mt-0.5">
+        <div className="flex items-center justify-between gap-2 mt-1">
           <span className="text-xs text-white/50 truncate">{chat.lastMessage}</span>
           {chat.unreadCount > 0 && (
             <span className="shrink-0 min-w-[18px] h-[18px] px-1 rounded-full bg-fluid-peach/20 text-fluid-peach text-[10px] font-bold flex items-center justify-center">

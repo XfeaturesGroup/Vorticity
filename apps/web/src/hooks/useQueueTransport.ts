@@ -393,6 +393,12 @@ export function useQueueTransport(
   // queue ids means every subscription/publish effect naturally no-ops, without touching each one.
   const [hasLease, setHasLease] = useState(false);
   const [leaseHeldByOther, setLeaseHeldByOther] = useState(false);
+  // Reactive mirror of "does ratchetSessionRef.current exist" (a plain ref, so a component can't
+  // read it reactively on its own) — exists purely so the UI can show a clear "waiting for your
+  // contact to join" state instead of a silent/confusing send failure before the PQXDH handshake
+  // completes (a real, common state: the responder side of an invite link before the other party
+  // has opened it, or the initiator before the responder's first prekey bundle arrives).
+  const [hasSession, setHasSession] = useState(false);
   // Own long-term-for-this-chat identity + hybrid prekey material — only meaningful for the
   // "responder" role (only Bob publishes a bundle in PQXDH's one-sided handshake). Persisted per
   // `chatId` via lib/secureStore.ts (see this file's header comment) — stable across reloads, not
@@ -510,6 +516,7 @@ export function useQueueTransport(
         return;
       }
       ratchetSessionRef.current = session;
+      setHasSession(true);
       trustedPeerBundleRef.current = { verifyingKey: bundle.verifyingKey, bundle: bundle.bundle };
       console.log(
         `[Crypto] PQXDH handshake initiated${oneTimePrekeyId ? " (one-time-prekey strengthened)" : ""}, verified peer bundle ${shortHex(b64ToBytes(bundle.verifyingKey))}...`,
@@ -571,6 +578,7 @@ export function useQueueTransport(
           console.log("[Crypto] Received a NEW session_init while a session was already active — decapsulated successfully against our stable keypair, accepting as a legitimate re-handshake (peer likely reloaded).");
         }
         ratchetSessionRef.current = session;
+        setHasSession(true);
         console.log(`[Crypto] PQXDH handshake completed (responder side)${envelope.oneTimePrekeyId ? " (one-time-prekey strengthened)" : ""} — ratchet session ready`);
         return;
       }
@@ -649,6 +657,7 @@ export function useQueueTransport(
   // their own dependency changes would silently discard a just-imported session.
   useEffect(() => {
     ratchetSessionRef.current = null;
+    setHasSession(false);
     identitySeedRef.current = null;
     kemKeypairBytesRef.current = null;
     trustedPeerBundleRef.current = null;
@@ -696,6 +705,7 @@ export function useQueueTransport(
                 trustedPeerBundle: { verifyingKey: string; bundle: string } | null;
               };
               ratchetSessionRef.current = RatchetSession.importState(b64ToBytes(imported.ratchetStateB64));
+              setHasSession(true);
               trustedPeerBundleRef.current = imported.trustedPeerBundle;
               await clearFromStore(`ratchet-imported-state:${chatId}`);
               console.log("[Crypto] Hydrated ratchet session from an imported device-link payload — continuing the existing conversation.");
@@ -920,6 +930,7 @@ export function useQueueTransport(
     reactToMessage,
     hasLease,
     leaseHeldByOther,
+    hasSession,
     exportRatchetState,
     getTrustedPeerBundle,
   };

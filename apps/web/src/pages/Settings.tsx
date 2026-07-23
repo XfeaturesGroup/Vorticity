@@ -1,15 +1,13 @@
-// Phase D reorg (2026-07): grouped into clear sections — Security (unchanged, just moved under a
-// section heading), Notifications (new, purely local: browser permission + sound toggle, no server
-// concept at all), Danger Zone (new: clear all local data — fitting for a paranoid-security product
-// where per-chat delete already existed but a full local wipe didn't). Deliberately NOT adding a
-// server-held "profile" section — that would cut against the zero-knowledge identity model this
-// whole app is built on (see docs/02's threat model).
+// Phase D reorg (2026-07), Security/Contacts later promoted to their own top-level nav tabs
+// (2026-07 redesign pass — see Security.tsx/Contacts.tsx): Settings itself now just holds
+// Notifications (purely local: browser permission + sound toggle, no server concept at all) and
+// Danger Zone (clear all local data — fitting for a paranoid-security product where per-chat delete
+// already existed but a full local wipe didn't). Deliberately NOT adding a server-held "profile"
+// section — that would cut against the zero-knowledge identity model this whole app is built on
+// (see docs/02's threat model).
 import { useState } from "react";
 import { AlertTriangle, Bell, BellOff, Loader2, Shield, Volume2, VolumeX } from "lucide-react";
 import { useNavigate } from "react-router-dom";
-import { useSecurityScan } from "../hooks/useSecurityScan";
-import { SecureScorePanel } from "../components/SecureScorePanel";
-import { AliasPanel } from "../components/AliasPanel";
 import { useAuth } from "../contexts/AuthContext";
 import { useToast } from "../contexts/ToastContext";
 import { clearEntireVault } from "../lib/secureStore";
@@ -153,21 +151,11 @@ function DangerZoneSection() {
 }
 
 export function Settings() {
-  const scan = useSecurityScan();
-
   return (
     <div className="space-y-10 pb-8">
       <div>
         <h1 className="text-3xl font-bold tracking-tight text-white font-sans">Settings</h1>
       </div>
-
-      <section>
-        <SectionHeading icon={Shield} title="Security" />
-        <div className="space-y-6">
-          <SecureScorePanel scan={scan} compact />
-          <AliasPanel />
-        </div>
-      </section>
 
       <section>
         <SectionHeading icon={Bell} title="Notifications" />

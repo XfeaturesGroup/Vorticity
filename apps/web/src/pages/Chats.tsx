@@ -249,6 +249,7 @@ export function Chats() {
     reactToMessage,
     hasLease,
     leaseHeldByOther,
+    hasSession,
     exportRatchetState,
     getTrustedPeerBundle,
   } = useQueueTransport(activeChatId, activeChat?.role ?? "initiator", handleIncoming, handleReceipt);
@@ -485,7 +486,12 @@ export function Chats() {
             },
       ),
     );
-    if (!result.ok) showToast("Message failed to send", "error");
+    if (!result.ok) {
+      showToast(
+        hasSession ? "Message failed to send" : "Can't send yet — waiting for your contact to join this chat",
+        "error",
+      );
+    }
   };
 
   const handleEditMessage = async (targetId: string, text: string) => {
@@ -499,18 +505,7 @@ export function Chats() {
   const handleDeleteMessage = async (targetId: string) => {
     if (!activeChatId) return;
     setChats((prev) =>
-      prev.map((c) =>
-        c.id === activeChatId
-          ? {
-              ...c,
-              messages: c.messages.map((m) => {
-                if (m.id !== targetId) return m;
-                const { attachments: _attachments, reactions: _reactions, ...rest } = m;
-                return { ...rest, deleted: true, text: "" };
-              }),
-            }
-          : c,
-      ),
+      prev.map((c) => (c.id === activeChatId ? { ...c, messages: c.messages.filter((m) => m.id !== targetId) } : c)),
     );
     await deleteMessage(targetId);
   };
@@ -636,6 +631,7 @@ export function Chats() {
             onLinkDevice={handleLinkDevice}
             canLinkDevice={hasLease}
             leaseHeldByOther={leaseHeldByOther}
+            hasSession={hasSession}
           />
         </div>
       </div>

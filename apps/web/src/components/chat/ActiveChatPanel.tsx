@@ -48,6 +48,10 @@ interface ActiveChatPanelProps {
   /** True when another of the user's own linked devices currently holds the lease — this device is
    * read-only for live send/receive until that device releases it or its lease expires. */
   leaseHeldByOther: boolean;
+  /** False until the PQXDH handshake with the peer has completed — a real, common state (waiting
+   * for an invite link to be opened, or for the responder's prekey bundle) that used to just show a
+   * generic "message failed to send" with no explanation. See useQueueTransport.ts's `hasSession`. */
+  hasSession: boolean;
 }
 
 const SOCKET_STATUS_META: Record<SocketStatus, { label: string; dot: string; pulse: boolean }> = {
@@ -76,6 +80,7 @@ export function ActiveChatPanel({
   onLinkDevice,
   canLinkDevice,
   leaseHeldByOther,
+  hasSession,
 }: ActiveChatPanelProps) {
   const { token: cap } = useAuth();
   const [draft, setDraft] = useState("");
@@ -87,6 +92,7 @@ export function ActiveChatPanel({
   const [isDraggingFile, setIsDraggingFile] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const scrollTickingRef = useRef(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const messagesById = useMemo(() => {
@@ -116,6 +122,19 @@ export function ActiveChatPanel({
 
   const scrollToBottom = (behavior: ScrollBehavior = "smooth") => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior });
+  };
+
+  // Raw scroll events fire far faster than once per frame — capping the resulting state update to
+  // one per animation frame (React already no-ops a same-value primitive setState, but the
+  // isNearBottom() computation itself plus the surrounding re-render churn was visible as jank
+  // while actively scrolling a long history) keeps this smooth without losing responsiveness.
+  const handleScroll = () => {
+    if (scrollTickingRef.current) return;
+    scrollTickingRef.current = true;
+    requestAnimationFrame(() => {
+      setShowScrollButton(!isNearBottom());
+      scrollTickingRef.current = false;
+    });
   };
 
   useEffect(() => {
@@ -319,13 +338,19 @@ export function ActiveChatPanel({
           This chat is currently active on another linked device — read-only here until it's released.
         </div>
       )}
+      {!leaseHeldByOther && !hasSession && (
+        <div className="shrink-0 px-5 py-2 bg-fluid-peach/10 border-b border-fluid-peach/20 text-xs text-fluid-peach flex items-center gap-2">
+          <span className="w-1.5 h-1.5 rounded-full bg-fluid-peach animate-pulse shrink-0" />
+          Waiting for your contact to join — messages sent now won't go through until they do.
+        </div>
+      )}
 
       {/* Messages */}
       <div className="relative flex-1 min-h-0">
         <div
           ref={scrollRef}
-          onScroll={() => setShowScrollButton(!isNearBottom())}
-          className="h-full overflow-y-auto vx-scrollbar px-5 py-4"
+          onScroll={handleScroll}
+          className="h-full overflow-y-auto vx-scrollbar px-6 py-5"
         >
           {chat.messages.map((m, i) => {
             const prev = chat.messages[i - 1];
@@ -347,7 +372,7 @@ export function ActiveChatPanel({
                     <div className="flex-1 h-px bg-signal-danger/30" />
                   </div>
                 )}
-                <div className="py-1">
+                <div className="py-1.5">
                   <MessageBubble
                     message={m}
                     replyToMessage={m.replyTo ? messagesById.get(m.replyTo) ?? null : undefined}

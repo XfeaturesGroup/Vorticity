@@ -7,6 +7,9 @@ import { ToastViewport } from "./components/Toast";
 import { SecurityGate } from "./pages/SecurityGate";
 import { AuthCallback } from "./pages/AuthCallback";
 import { Chats } from "./pages/Chats";
+import { GroupChats } from "./pages/GroupChats";
+import { Contacts } from "./pages/Contacts";
+import { Security } from "./pages/Security";
 import { Settings } from "./pages/Settings";
 
 export function App() {
@@ -32,6 +35,9 @@ export function App() {
               }
             >
               <Route path="/chats" element={<Chats />} />
+              <Route path="/groups" element={<GroupChats />} />
+              <Route path="/contacts" element={<Contacts />} />
+              <Route path="/security" element={<Security />} />
               <Route path="/settings" element={<Settings />} />
             </Route>
           </Routes>

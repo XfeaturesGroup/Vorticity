@@ -2,12 +2,14 @@ import { Outlet } from "react-router-dom";
 import { NoiseOverlay } from "@vorticity/ui";
 import { Sidebar } from "./Sidebar";
 import { CommandPalette } from "../CommandPalette";
+import { AliasOnboardingModal } from "../AliasOnboardingModal";
 
 export function AppLayout() {
   return (
     <div className="relative flex h-screen bg-black overflow-hidden">
       <NoiseOverlay className="z-50" />
       <CommandPalette />
+      <AliasOnboardingModal />
       <Sidebar />
       <main className="flex-1 overflow-y-auto vx-scrollbar">
         {/* h-full here (not just the parent's implicit height) is what lets a page like Chats

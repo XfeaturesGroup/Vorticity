@@ -5,7 +5,7 @@
 // placeholder rather than a real user record — fittingly, since the whole point of this app is
 // that the server (and this sidebar) never holds a real identity to show.
 import { NavLink } from "react-router-dom";
-import { Shield, MessageSquare, Settings, LogOut } from "lucide-react";
+import { Shield, MessageSquare, Users, AtSign, ShieldCheck, Settings, LogOut } from "lucide-react";
 import { cn } from "@vorticity/ui";
 import { useAuth } from "../../contexts/AuthContext";
 
@@ -26,11 +26,18 @@ type NavGroup = {
 const navGroups: NavGroup[] = [
   {
     label: "Messenger",
-    items: [{ path: "/chats", label: "Chats", icon: MessageSquare, exact: true }],
+    items: [
+      { path: "/chats", label: "Chats", icon: MessageSquare, exact: true },
+      { path: "/groups", label: "Group Chats", icon: Users },
+    ],
   },
   {
     label: "Workspace",
-    items: [{ path: "/settings", label: "Settings", icon: Settings }],
+    items: [
+      { path: "/contacts", label: "Contacts", icon: AtSign },
+      { path: "/security", label: "Security", icon: ShieldCheck },
+      { path: "/settings", label: "Settings", icon: Settings },
+    ],
   },
 ];
 

@@ -8,6 +8,13 @@ import { formatDateKey, type Chat, type ChatMessage, type MessagePayload } from 
 export function applyInboundPayload(chat: Chat, payload: MessagePayload, timestamp: string): Chat {
   switch (payload.kind) {
     case "text": {
+      // Defensive de-dup by id: a WS reconnect can race the server-side ack cursor (this socket's
+      // "ack" for seq N may not have been durably recorded yet when a new connection re-flushes the
+      // backlog) and redeliver the same envelope — `payload.id` is a UUID the SENDER generated once,
+      // so a duplicate delivery of the same message always carries the same id. Silently a no-op
+      // rather than an error: this is an expected, harmless consequence of at-least-once delivery,
+      // not a sign of something wrong.
+      if (chat.messages.some((m) => m.id === payload.id)) return chat;
       const message: ChatMessage = {
         id: payload.id,
         senderId: "them",
@@ -25,14 +32,10 @@ export function applyInboundPayload(chat: Chat, payload: MessagePayload, timesta
         messages: chat.messages.map((m) => (m.id === payload.targetId && !m.deleted ? { ...m, text: payload.text, edited: true } : m)),
       };
     case "delete":
-      return {
-        ...chat,
-        messages: chat.messages.map((m) => {
-          if (m.id !== payload.targetId) return m;
-          const { attachments: _attachments, reactions: _reactions, ...rest } = m;
-          return { ...rest, deleted: true, text: "" };
-        }),
-      };
+      // Removed entirely, not tombstoned — a reply that pointed at this message resolves to
+      // "Original message deleted" via MessageBubble's `replyToMessage === null` branch (the id no
+      // longer exists in `messages` to look up), same as real deletion in Telegram/Signal.
+      return { ...chat, messages: chat.messages.filter((m) => m.id !== payload.targetId) };
     case "reaction":
       return {
         ...chat,
