@@ -5,8 +5,18 @@ import { corsHeaders, errorResp, jsonResp } from "./response";
 import { computePpid } from "./ppid";
 import { exchangeCodeForUserInfo } from "./oauth";
 import { blindSign } from "./blindsig-wasm";
+import { mintEnrollTicket, verifyEnrollTicket } from "./ticket";
 
 const router = Router();
+
+// R11 (docs/06): bounds how many redemption tickets ONE real Xfeatures account can ever be issued.
+// enroll_count now increments 1:1 with ticket issuance (see /oauth/callback below), so this is a
+// genuine lifetime cap on anonymous personas per account, not just a login counter. Deliberately
+// generous (covers many devices/reinstalls over a long lifetime) — the point is bounding a
+// botnet-driven flood through one compromised/rented OAuth account to double digits, not limiting
+// ordinary multi-device use. A placeholder judgment call, not derived from usage data; revisit once
+// real traffic patterns exist.
+const ENROLL_QUOTA_MAX = 20;
 
 // --- base64 <-> bytes for the RSABSSA wire (blinded message in, blind signature out) ---
 function b64ToBytes(b64: string): Uint8Array {
@@ -70,11 +80,18 @@ router.post("/oauth/callback", async (request: IRequest, env: Env) => {
   const ppid = await computePpid(userInfo.sub, env.PPID_HMAC_SECRET);
   const epoch = Math.floor(Date.now() / 1000 / 3600);
 
-  // Sybil guard only — see docs/03 §2. This upsert is the ONLY write this whole request makes.
+  // Sybil guard + quota (R11) — see docs/03 §2. `enroll_count` is a lifetime counter of tickets
+  // issued to this ppid (incremented exactly once per ticket minted below); reject BEFORE the
+  // upsert once the quota is hit, so a capped account can't keep bumping the counter forever.
   const existing = await env.DB_ENROLL.prepare("SELECT enroll_count FROM enroll_ppid WHERE ppid = ?")
     .bind(ppid)
     .first<{ enroll_count: number }>();
 
+  if (existing && existing.enroll_count >= ENROLL_QUOTA_MAX) {
+    return errorResp("Enrollment quota exceeded for this account", origin, 403);
+  }
+
+  // This upsert + the ticket mint below are the ONLY writes/effects this whole request makes.
   if (existing) {
     await env.DB_ENROLL.prepare("UPDATE enroll_ppid SET enroll_count = enroll_count + 1, last_epoch = ? WHERE ppid = ?")
       .bind(epoch, ppid)
@@ -87,10 +104,13 @@ router.post("/oauth/callback", async (request: IRequest, env: Env) => {
       .run();
   }
 
-  // TODO(Phase 2): issue a VOPRF blind-signature token here (see docs/03 §2, vortic-core's
-  // oprf::evaluate) instead of returning success alone. The client then redeems that token
-  // against the Messaging Plane's MerkleTreeDO — this Worker never sees that redemption.
-  return jsonResp({ enrolled: true }, origin);
+  // Real bug found+fixed 2026-07-23: /token/issue used to accept ANY caller-supplied blinded
+  // message with zero proof this OAuth exchange ever happened — an unauthenticated blind-signing
+  // oracle that let anyone mint unlimited anonymous membership tokens, defeating R11/G8 entirely.
+  // Mint a short-lived, single-use ticket bound to nothing but "this ppid passed the quota check
+  // just now" (see ticket.ts) — /token/issue below requires and spends it.
+  const ticket = await mintEnrollTicket(env.ENROLL_TICKET_SIGNING_KEY, ppid);
+  return jsonResp({ enrolled: true, ticket }, origin);
 });
 
 // Step 2 of docs/04 Flow 1: the RSABSSA Plane Bridge (RFC 9474). Replaces the earlier VOPRF-based
@@ -112,7 +132,7 @@ router.post("/oauth/callback", async (request: IRequest, env: Env) => {
 // PUBLIC key (workers/messaging/src/issuer-keys.ts) — that token is what `/membership/insert` redeems.
 router.post("/token/issue", async (request: IRequest, env: Env) => {
   const origin = request.headers.get("Origin");
-  let body: { blinded?: string };
+  let body: { blinded?: string; ticket?: string };
   try {
     body = await request.json();
   } catch {
@@ -120,6 +140,29 @@ router.post("/token/issue", async (request: IRequest, env: Env) => {
   }
   if (!body.blinded) {
     return errorResp("Missing blinded message", origin, 400);
+  }
+  if (!body.ticket) {
+    return errorResp("Missing enrollment ticket (call /oauth/callback first)", origin, 401);
+  }
+
+  const verdict = await verifyEnrollTicket(env.ENROLL_TICKET_SIGNING_KEY, body.ticket);
+  if (!verdict.valid) {
+    return errorResp(`Invalid enrollment ticket: ${verdict.reason}`, origin, 401);
+  }
+
+  // Single-use spend: rely on the D1 PRIMARY KEY constraint itself (not a check-then-insert), since
+  // this Worker has no per-request serialization the way a Durable Object does — two concurrent
+  // requests racing the same ticket must not both pass a SELECT-then-INSERT check. Plain INSERT
+  // throwing on the second attempt is the atomic guarantee; catch and treat as "already spent".
+  try {
+    await env.DB_ENROLL.prepare("INSERT INTO spent_enroll_tickets (jti, spent_at) VALUES (?, ?)")
+      .bind(verdict.payload.jti, Date.now())
+      .run();
+  } catch (err) {
+    if ((err as Error).message.includes("UNIQUE constraint")) {
+      return errorResp("Enrollment ticket already used", origin, 409);
+    }
+    throw err;
   }
 
   let blindedMsg: Uint8Array;

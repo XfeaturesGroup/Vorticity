@@ -18,3 +18,9 @@ PPID_HMAC_SECRET="replace-with-a-long-random-string"
 ISSUER_SIGNING_KEY_PEM="-----BEGIN PRIVATE KEY-----
 replace-with-a-real-PKCS8-PEM-private-key
 -----END PRIVATE KEY-----"
+
+# 32+ random bytes, hex — HMAC key for the enrollment ticket (ticket.ts) that gates /token/issue on
+# a real, recent /oauth/callback completion. Independent of PPID_HMAC_SECRET and of Messaging's
+# SESSION_SIGNING_KEY; rotating it just forces every in-flight enrollment (max 10 min old) to redo
+# /oauth/callback — not a destructive rotation like PPID_HMAC_SECRET.
+ENROLL_TICKET_SIGNING_KEY="replace-with-a-long-random-hex-string"

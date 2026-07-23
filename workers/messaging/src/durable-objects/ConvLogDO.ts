@@ -44,7 +44,22 @@ interface WireEntry {
   enqueuedAt: number;
 }
 
+interface DepthRow {
+  cnt: number;
+  bytes: number;
+  [key: string]: SqlStorageValue;
+}
+
 const MAX_BATCH_SIZE = 500; // defensive cap on a single /append call, not a protocol limit
+
+// R10 (docs/06): unlike QueueDO this log has no TTL/eviction by design (durable history) — which
+// means, unmitigated, it can grow toward Cloudflare's real 10 GB per-DO storage ceiling with
+// nothing ever reclaiming space. This cap is an honest, generous STOPGAP (not a design limit): it
+// converts an eventual hard, unrecoverable storage failure into an early, clean 507 a client can at
+// least report. The real fix — archiving old entries to R2 once a conversation is long-lived — is
+// separate, larger work (out of scope for this backpressure pass, tracked in docs/06).
+const MAX_LOG_ENTRIES = 500_000;
+const MAX_LOG_BYTES = 256 * 1024 * 1024; // 256 MiB
 
 function rowToWire(row: LogEntryRow): WireEntry {
   return { seq: row.seq, blob: bufToBase64(row.blob), enqueuedAt: row.enqueued_at };
@@ -115,6 +130,17 @@ export class ConvLogDO extends DurableObject<Env> {
       });
     } catch {
       return new Response("every entry in body.blobs must be a non-empty base64 string", { status: 400 });
+    }
+
+    const incomingBytes = blobs.reduce((sum, b) => sum + b.byteLength, 0);
+    const depth = this.ctx.storage.sql
+      .exec<DepthRow>("SELECT COUNT(*) AS cnt, COALESCE(SUM(LENGTH(blob)), 0) AS bytes FROM entries")
+      .one();
+    if (depth.cnt + blobs.length > MAX_LOG_ENTRIES || depth.bytes + incomingBytes > MAX_LOG_BYTES) {
+      return new Response(
+        `conversation log has reached its defensive storage ceiling (${depth.cnt} entries, ${depth.bytes} bytes) — see docs/06 R10`,
+        { status: 507 },
+      );
     }
 
     // Bucketed at write time, not just when returned — see bucketing.ts's header comment for why

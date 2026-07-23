@@ -19,6 +19,7 @@ pub mod pow;
 #[cfg(feature = "client-full")]
 pub mod ratchet;
 pub mod ring;
+#[cfg(feature = "client-full")]
 pub mod seal;
 #[cfg(feature = "client-full")]
 pub mod symmetric;

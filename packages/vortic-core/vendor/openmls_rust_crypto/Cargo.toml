@@ -1,0 +1,35 @@
+# Vendored, minimally-patched fork of openmls_rust_crypto v0.5.1 — see README.md in this directory
+# for exactly what changed (2 match-arm additions in src/provider.rs, nothing else) and why.
+# Dependency versions below are copied from the upstream crate's own published manifest, unchanged.
+[package]
+name = "openmls_rust_crypto"
+version = "0.5.1"
+edition = "2021"
+description = "A crypto backend for OpenMLS implementing openmls_traits using RustCrypto primitives. LOCALLY VENDORED + PATCHED for X-Wing KEM wiring — see README.md."
+license = "MIT"
+
+[features]
+test-utils = ["openmls_memory_storage/test-utils"]
+
+[dependencies]
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
+ed25519-dalek = { version = "2.0", features = ["rand_core"] }
+hkdf = "0.12"
+hmac = "0.12"
+hpke = { package = "hpke-rs", version = "0.6.0", default-features = false, features = ["hazmat", "serialization"] }
+hpke-rs-crypto = "0.6.0"
+# "experimental" is REQUIRED for X-Wing: hpke-rs-rust-crypto gates its `x-wing`/`ml-kem` deps (and
+# therefore its XWingDraft06/MlKem768/MlKem1024 KemAlgorithm implementations) behind this feature.
+# Found by an actual runtime failure (MlsGroup::new -> CryptoLibraryError), not by reading feature
+# docs in advance — see ../README.md.
+hpke-rs-rust-crypto = { version = "0.6.0", features = ["experimental"] }
+openmls_memory_storage = "0.5.0"
+openmls_traits = "0.5.0"
+p256 = "0.13"
+rand = "0.8"
+rand_chacha = "0.3"
+serde = { version = "^1.0", features = ["derive"] }
+sha2 = "0.10"
+thiserror = "2.0"
+tls_codec = { version = "0.4.2", features = ["derive", "serde", "mls"] }

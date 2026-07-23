@@ -155,6 +155,9 @@ js-sys = { version = "0.3.103", optional = true }
 serde_json = { version = "1.0.151", optional = true }
 openmls_traits = { version = "0.5.0", optional = true }
 openmls_basic_credential = { version = "0.5.0", optional = true }
+# PATCHED locally — see `[patch.crates-io]` below and vendor/openmls_rust_crypto/README.md for why
+# (v0.5.1's own X-Wing KEM wiring is a literal `unimplemented!()`, even though the underlying
+# hpke-rs-rust-crypto primitive it would call already exists) and exactly what changed (2 match arms).
 openmls_rust_crypto = { version = "0.5.1", optional = true }
 
 [dev-dependencies]
@@ -162,6 +165,14 @@ ark-relations = { version = "0.6.0", default-features = false }
 ark-snark = { version = "0.6.0", default-features = false }
 ark-std = "0.6.0"
 wasm-bindgen-test = "0.3"
+
+[patch.crates-io]
+# R7 PQ-ciphersuite pass (2026-07-23): wires X-Wing (hybrid ML-KEM-768+X25519) into MLS groups by
+# fixing a 2-match-arm gap in openmls_rust_crypto 0.5.1 (its own X-Wing wiring was a literal
+# `unimplemented!()`, despite the underlying hpke-rs-rust-crypto primitive already existing — see
+# vendor/openmls_rust_crypto/README.md for the full diff and exactly why this is a vendor+patch, not
+# new cryptography). REMOVE once upstream ships this fix in a released version.
+openmls_rust_crypto = { path = "vendor/openmls_rust_crypto" }
 
 [profile.release]
 opt-level = "z"

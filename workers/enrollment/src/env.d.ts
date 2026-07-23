@@ -15,4 +15,10 @@ export interface Env {
    * wrangler.toml [vars] — this is the entire bridge's secret. The matching PUBLIC key is hardcoded
    * (not secret) in workers/messaging/src/issuer-keys.ts; Messaging never sees this value. */
   ISSUER_SIGNING_KEY_PEM: string;
+  /** HMAC-SHA256 key (hex) for the enrollment ticket (ticket.ts) — proves /oauth/callback's OAuth
+   * exchange + quota check actually ran before /token/issue will blind-sign anything. Set via
+   * `wrangler secret put ENROLL_TICKET_SIGNING_KEY`; local dev in `.dev.vars`. Independent of
+   * PPID_HMAC_SECRET (different purpose: this signs a bearer-style ticket, that hashes an identity)
+   * and of messaging's SESSION_SIGNING_KEY (different plane). NEVER in wrangler.toml [vars]. */
+  ENROLL_TICKET_SIGNING_KEY: string;
 }

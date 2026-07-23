@@ -57,7 +57,20 @@ interface WireEntry {
   enqueuedAt: number;
 }
 
+interface DepthRow {
+  cnt: number;
+  bytes: number;
+  [key: string]: SqlStorageValue;
+}
+
 const MAX_BATCH_SIZE = 500; // defensive cap on a single /push call, not a protocol limit
+
+// R10 (docs/06): same reasoning as ConvLogDO.ts — no TTL/eviction here either (a group's log is
+// durable history, same as a 1:1 conversation's), so an unbounded push flood could otherwise grow
+// toward Cloudflare's real 10 GB per-DO storage ceiling. Honest stopgap, not a design limit — real
+// fix is R2 archival for long-lived groups, out of scope here.
+const MAX_LOG_ENTRIES = 500_000;
+const MAX_LOG_BYTES = 256 * 1024 * 1024; // 256 MiB
 
 function rowToWire(row: GroupEntryRow): WireEntry {
   return {
@@ -159,6 +172,17 @@ export class GroupDO extends DurableObject<Env> {
       return new Response(`invalid body.blobs entry: ${(err as Error).message}`, { status: 400 });
     }
 
+    const incomingBytes = entries.reduce((sum, e) => sum + e.blob.byteLength, 0);
+    const depth = this.ctx.storage.sql
+      .exec<DepthRow>("SELECT COUNT(*) AS cnt, COALESCE(SUM(LENGTH(blob)), 0) AS bytes FROM entries")
+      .one();
+    if (depth.cnt + entries.length > MAX_LOG_ENTRIES || depth.bytes + incomingBytes > MAX_LOG_BYTES) {
+      return new Response(
+        `group log has reached its defensive storage ceiling (${depth.cnt} entries, ${depth.bytes} bytes) — see docs/06 R10`,
+        { status: 507 },
+      );
+    }
+
     const now = Date.now();
     const bucketedEnqueuedAt = bucketTimestamp(now); // see bucketing.ts — coarsened before it's ever stored
     const seqs: number[] = [];
@@ -234,7 +258,17 @@ export class GroupDO extends DurableObject<Env> {
   }
 
   override async webSocketClose(ws: WebSocket, code: number, reason: string, _wasClean: boolean): Promise<void> {
-    ws.close(code, reason);
+    // Real bug found while adding the backpressure cap above (not hypothetical — this is the THIRD
+    // time this exact class of bug has been found in this project; see QueueDO.ts's and
+    // ConvLogDO.ts's own webSocketClose comments): calling `ws.close()` unconditionally throws in
+    // workerd once the close handshake has already happened, which it always has by the time this
+    // callback fires. Left uncaught here (unlike its two siblings), this would throw on essentially
+    // every disconnect. Same tolerance as the rest of this file's socket handling.
+    try {
+      ws.close(code, reason);
+    } catch {
+      // Already closed/closing — nothing left to acknowledge.
+    }
   }
 
   override async webSocketError(_ws: WebSocket, _error: unknown): Promise<void> {

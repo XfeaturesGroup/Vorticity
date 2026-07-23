@@ -4,23 +4,22 @@
 //! blind Delivery Service (docs/03 §5): it orders and fans out the opaque ciphertext this module
 //! produces, and never holds group state or decryption keys itself.
 //!
-//! CIPHERSUITE — HONEST GAP, FOUND BY A REAL TEST RUN, NOT ASSUMED: the original intent here was
+//! CIPHERSUITE — REAL X-WING PQ, WIRED 2026-07-23 (closes the gap this comment used to describe):
 //! `MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519` (X-Wing, hybrid ML-KEM-768 + X25519), matching
-//! this crate's hybrid-PQ commitment for 1:1 (`kem.rs`). `hpke-rs-rust-crypto`'s lower-level HPKE
-//! backend genuinely DOES implement X-Wing (confirmed by reading its source, `pq_kem.rs`, before
-//! writing any of this module) — but the FIRST real test run against `openmls_rust_crypto` 0.5.1
-//! panicked: `"not implemented: XWingKemDraft6 is not supported by the RustCrypto provider"`. The
-//! X-Wing support exists in the ecosystem but isn't wired through `openmls_rust_crypto`'s own
-//! `OpenMlsCrypto` implementation yet — a gap between two layers of the same provider stack that
-//! only showed up by actually running the code, not by reading dependency lists. Fell back to
-//! `MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519` — the EXACT ciphersuite `openmls`'s own
-//! official `examples/large-groups.rs` uses, chosen for maximum confidence it's genuinely supported
-//! end-to-end, not guessed. **Real consequence, stated plainly: group messages are NOT
-//! post-quantum-resistant with the current provider, unlike 1:1 messages (`kem.rs`'s hybrid
-//! ML-KEM+X25519).** Revisit if/when `openmls_rust_crypto` wires up `XWingKemDraft6` (the primitive
-//! is already there, per the source read above) or `libcrux-provider` is reconsidered (rejected in
-//! this pass for pulling `rayon` into a wasm32 target with no real OS threads — a separate,
-//! independent risk from this ciphersuite gap, not re-litigated here).
+//! this crate's hybrid-PQ commitment for 1:1 (`kem.rs`). The original blocker, found by an actual
+//! test run (not assumed): `openmls_rust_crypto` 0.5.1's `kem_mode()` panicked
+//! `"not implemented: XWingKemDraft6 is not supported by the RustCrypto provider"` — even though
+//! `hpke-rs-rust-crypto` (an existing dependency of that very crate) already fully implements the
+//! X-Wing KEM primitive (confirmed by reading its source, `pq_kem.rs`, before writing anything).
+//! The gap was two missing match arms in the GLUE between those two layers, not a missing
+//! primitive — fixed by vendoring a minimally-patched `openmls_rust_crypto` (see
+//! `vendor/openmls_rust_crypto/README.md` for the exact 2-arm diff and this crate's Cargo.toml's
+//! `[patch.crates-io]`), not by writing any new cryptography. **This is a vendored fork of a
+//! security-sensitive dependency — a real maintenance liability, flagged prominently in both
+//! places above, not just here — remove it and switch back to a real upstream release the moment
+//! `openmls_rust_crypto` ships this fix itself.** Group messages ARE now post-quantum-resistant
+//! (hybrid, same as `kem.rs`'s 1:1 leg) — verified by an actual two-member group round trip under
+//! the real X-Wing ciphersuite (this module's own tests), not merely "the enum variant compiles."
 //!
 //! ARCHITECTURE: openmls's own state model is stateful-by-design (a "provider" holding a
 //! keystore, an `MlsGroup` handle reloaded from it by `group_id`) — this module wraps that as a
@@ -51,7 +50,7 @@ use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use wasm_bindgen::prelude::*;
 
-const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519;
+const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519;
 
 // `use_ratchet_tree_extension(true)`: without it, a Welcome carries no ratchet tree at all, and a
 // joiner has no other way to reconstruct the group's tree structure — a real failure caught by

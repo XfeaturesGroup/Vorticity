@@ -59,6 +59,12 @@ interface MinExpiresRow {
   [key: string]: SqlStorageValue;
 }
 
+interface DepthRow {
+  cnt: number;
+  bytes: number;
+  [key: string]: SqlStorageValue;
+}
+
 interface WireMessage {
   type: "message";
   seq: number;
@@ -69,6 +75,16 @@ interface WireMessage {
 
 const MAX_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days — a defensive cap, not a protocol limit
 const DEFAULT_PULL_LIMIT = 100;
+
+// R10 (docs/06): nothing previously capped how many undelivered messages one queue could accumulate
+// — a flood of pushes (a bug, or abuse of a validly-issued capability against an offline/slow
+// recipient) could grow one DO's SQLite storage without bound toward Cloudflare's real 10 GB DO
+// storage ceiling, at which point the queue stops working for everyone, not just the attacker.
+// These are deliberately generous relative to any legitimate backlog (a recipient offline for the
+// full MAX_TTL_MS) so no real usage pattern should ever hit them — this is a defensive ceiling, not
+// a protocol limit, same framing as MAX_TTL_MS above.
+const MAX_QUEUE_MESSAGES = 10_000;
+const MAX_QUEUE_BYTES = 64 * 1024 * 1024; // 64 MiB
 
 function rowToWire(row: QueueMessageRow): WireMessage {
   return {
@@ -143,6 +159,20 @@ export class QueueDO extends DurableObject<Env> {
     // defeating the padding this field exists to provide.
     if (!validateSizeBucket(ciphertext.byteLength, sizeBucket)) {
       return new Response(`ciphertext length ${ciphertext.byteLength} does not match declared size_bucket ${sizeBucket}`, { status: 400 });
+    }
+
+    // Evict stale entries FIRST so a recipient who is merely offline (not gone) isn't penalized by
+    // messages that were already past their own TTL anyway — only a genuinely undelivered backlog
+    // counts against the cap below.
+    this.evictExpired();
+    const depth = this.ctx.storage.sql
+      .exec<DepthRow>("SELECT COUNT(*) AS cnt, COALESCE(SUM(LENGTH(ciphertext)), 0) AS bytes FROM messages")
+      .one();
+    if (depth.cnt >= MAX_QUEUE_MESSAGES || depth.bytes + ciphertext.byteLength > MAX_QUEUE_BYTES) {
+      return new Response(
+        `queue is full (${depth.cnt} undelivered messages, ${depth.bytes} bytes) — recipient hasn't consumed pending messages`,
+        { status: 429 },
+      );
     }
 
     const now = Date.now();
